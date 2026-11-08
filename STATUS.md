@@ -20,7 +20,7 @@ Bütün 7870 adresleri WSL `~/j7prime-kernels/kernel_Exynos7870/` kaynağından:
 | `tools/mkadt_a5xelte.py` + `tools/mkadt.py` | a51 sürümü; GIC 7870'e göre düzeltildi. ADT üretimi test edildi (9500 bayt) |
 | `shim/on7xelte/` | a5xelte shim'i; 7870 PMU/CMU/ekran gücü adresleri düzeltildi. WSL'de `aarch64-linux-gnu-gcc 15.2` ile `-Werror` derlendi: `outxnu/Image` 9760 B, `out4k/Image` 20480 B, Samsung header OK |
 | XNU build | ✅ İlk başarılı CI derlemesi: github.com/theson45/ios-on7xelte run 42520539658 (macos-15, Xcode 16, 6m42s). `kernel.development.a5xelte` Mach-O, SHA-256 `10482d4b…dedafe4`. LSE taramasındaki tek eşleşme `K256` (SHA-256 sabit tablosu, veri; gerçek talimat değil) |
-| Donanım testi | ✅ probe4k + probe4kc + xnu1b + **xnu2** (2026-11-09): XNU telefonda açılıp HFS+ RAM diski kök olarak bağladı (`hfs: mounted ON7RAMDISK`) |
+| Donanım testi | ✅ probe4k + probe4kc + xnu1b + xnu2 + **xnu3** (2026-11-09): XNU HFS+ RAM diski kök olarak bağladı ve ilk kullanıcı programı PID 1 olarak çalıştı (`*** SWEET userspace: init running as PID 1 ***`) |
 
 ## 7580 → 7870 adres düzeltmeleri
 
@@ -130,6 +130,43 @@ Sıradaki adım: kök dosya sistemi. A5'te önce `rd=md0` ile boş bir HFS+ RAM 
   - `load_init_program: attempting to load /usr/appleinternal/sbin/launchd.development` ve ardından `/sbin/launchd`
   - **`panic(cpu 0 …): Process 1 exec of /sbin/launchd failed, errno 2 @kern_exec.c:6929`**: A5'in md0 kontrol noktasıyla birebir aynı. devfs hatası `/dev` dizini olmamasından geliyor, userland ile birlikte çözülür.
 - Sonuç: XNU md0'ı kök dosya sistemi olarak bağlıyor. Sıradaki adım iOS userland'ini (launchd, dyld, shared cache) bir kök diske koymak. RAM disk bunun için en fazla ~20 MB sığdırabiliyor (S-Boot'un toplam sınırı 0x3D7FF00), bu yüzden büyük kök eMMC'den okunmalı. USERDATA'da Android verisi var, karar kullanıcıya ait.
+
+### ✅ xnu3 telefonda: kullanıcı modu çalışıyor, PID 1 (2026-11-09)
+
+- `candidates/xnu3/xnu3-boot.img`, SHA-256 `d89a4ee1…2047e`. xnu2 ile aynı kernel, ADT ve boot-args. Sadece RAM disk farklı: CI `init-root` run 42523636903 (`.github/workflows/init-root.yml`) tarafından üretilen 8 MiB HFS+ `ON7INIT`. İçinde `/sbin/launchd` = `tools/sweet-init.S` (statik, ad-hoc imzalı Mach-O) ve `/dev` var.
+- BOOT p10'a yazıldı ve geri okunarak doğrulandı. Kullanıcı ekranda `*** SWEET userspace: init running as PID 1 ***` satırını gördüğünü bildirdi.
+- Böylece exec, Mach-O yükleme, ad-hoc kod imzası, EL0↔EL1 syscall'ları, devfs ve `/dev/console` J7'de çalışıyor. A5'in "HFS+ root → PID 1" kilometre taşına ulaşıldı.
+- Sıradaki adım gerçek iOS userland'i: dyld, dyld shared cache, launchd. Bunun için birkaç GB gerekiyor. RAM disk yetmez (S-Boot sınırı yaklaşık 20 MB), bu yüzden eMMC'de bir yer seçilmeli. USERDATA'da Android verisi var, karar kullanıcıya ait.
+
+### ✅ xnu4 telefonda: A5 eMMC sürücüsü J7'de GPT'yi okuyor (2026-11-09)
+
+- `candidates/xnu4/xnu4-boot.img`, SHA-256 `3075153e…f1a4`. xnu3 ile aynı, boot-args'a yalnızca `emmcprobe=1 emmcroot=USERDATA` eklendi. Salt-okunur.
+- Ekran (`candidates/xnu4/screen-xnu4-emmc-gpt.webp`):
+  - `A5XELTE eMMC: host ctrl=10 status=… clk=1 hcon=…`
+  - **`A5XELTE eMMC: GPT USERDATA first=15112192 sectors=15665119 read-only`**: değerler yedekteki GPT ile birebir aynı.
+  - Ardından md0 kökü ve `*** SWEET userspace: init running as PID 1 ***` + heartbeat geldi.
+- Sonuç: patch 0104'ün PIO CMD17 yolu, CRC kontrolü ve GPT ayrıştırması 7870'te çalışıyor. Sıradaki adım yeniden bölümleme.
+
+## Kök disk planı (2026-11-09, kullanıcıyla kararlaştırıldı)
+
+Hedef günlük kullanılabilir bir cihaz. Telefonda kullanıcı verisi yok, Android silinebilir. **Bootloader, download mode, RECOVERY ve EFS'e dokunulmayacak.**
+
+eMMC 16 GB. GPT'de 128 giriş var, son kullanılabilir LBA 30777310:
+
+| # | Bölüm | Başlangıç | Sektör | Boyut |
+|---|---|---|---|---|
+| 1–20 | BOTA0 … RESERVED2 | 8192 | – | ~250 MB (**değişmez**) |
+| 21 | SYSTEM | 507904 | 13414400 | 6,40 GiB |
+| 22 | VENDOR | 13922304 | 1048576 | 0,50 GiB |
+| 23 | CACHE | 14970880 | 131072 | 0,06 GiB |
+| 24 | CP_DEBUG | 15101952 | 10240 | 5 MB |
+| 25 | USERDATA | 15112192 | 15665119 | 7,47 GiB |
+
+Adımlar:
+1. **xnu4**: salt-okunur eMMC testi (`emmcprobe=1 emmcroot=USERDATA`, kök hâlâ md0). Patch 0104 sürücüsü 7870'te GPT'yi okuyor mu?
+2. ✅ **2026-11-09'da uygulandı:** p21 = USERDATA, 507904–30777310 (30269407 sektör, 14,43 GiB), `--verify` OK. Yedek `backup-on7xelte-2026-11-08/pre-repart/`. **Yeniden bölümleme (TWRP, sgdisk):** 21–25 silinir. 507904'ten 30777310'a tek bir `USERDATA` açılır (~14,4 GiB). 1–20'nin yeri, adı ve içeriği aynı kalır. Önce GPT'nin başı ve sonu yedeklenir. Sürücü yalnızca `SYSTEM` ve `USERDATA` adlarını kabul ettiği için yeni bölümün adı `USERDATA` olmalı. Giriş sayısı 128 kalmalı.
+3. **Kırpılmış iOS 16 kökü:** `ios-root` workflow'u kullanılır. Diller, kullanılmayan uygulamalar ve iPhone X'e özel donanım paketleri çıkarılır; hedef ≤ 13 GiB.
+4. Kök imajı USERDATA'ya yazılır (USB ile `adb exec-in` akışı). Sonra `rd=emmcroot0 emmcroot=USERDATA` ile Apple launchd başlatılır.
 
 ## J7 Prime'a özel donanım (A5'ten farklı, sürücü yazılmalı)
 

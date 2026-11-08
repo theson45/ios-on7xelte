@@ -1,0 +1,83 @@
+name: root-sizes
+
+# Read-only size report of the iOS 16 IPSW root components (OS volume and
+# the SystemOS/AppOS cryptexes). It is used to choose what to trim from the
+# on7xelte root, which has a 14.4 GiB USERDATA partition. Writes nothing
+# except the report.
+
+on:
+  workflow_dispatch:
+    inputs:
+      ipsw_url:
+        description: "iPhone X (D22AP) iOS 16 IPSW URL"
+        default: "https://updates.cdn-apple.com/2025FallFCS/fullrestores/122-77006/1158E502-D76D-4226-AA06-ED5E30CD1111/iPhone10,3,iPhone10,6_16.7.16_20H392_Restore.ipsw"
+
+jobs:
+  sizes:
+    runs-on: macos-15
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Components
+        run: |
+          set -euo pipefail
+          mkdir -p work
+          python3 tools/remotezip.py "${{ inputs.ipsw_url }}" BuildManifest.plist work >/dev/null
+          python3 - work/BuildManifest.plist > work/components.txt <<'PY'
+          import plistlib, sys
+          m = plistlib.load(open(sys.argv[1], "rb"))
+          want = {"OS": "os", "Cryptex1,SystemOS": "sysos", "Cryptex1,AppOS": "appos"}
+          found = {}
+          for data in m.get("BuildIdentities", []):
+              for k, v in data.get("Manifest", {}).items():
+                  p = v.get("Info", {}).get("Path", "")
+                  if k in want and k not in found and p.endswith(".dmg"):
+                      found[k] = p
+          for k, a in want.items():
+              print(a, found[k])
+          PY
+          cat work/components.txt
+
+      - name: Size report
+        run: |
+          set -uo pipefail
+          report=work/root-sizes.txt
+          : > "$report"
+          while read -r alias dmg; do
+            python3 tools/remotezip.py "${{ inputs.ipsw_url }}" "$dmg" work >/dev/null
+            mnt="work/mnt-$alias"; mkdir -p "$mnt"
+            hdiutil attach -owners on -nobrowse -readonly -mountpoint "$mnt" "work/$dmg" >/dev/null
+            {
+              echo "===== $alias ($dmg) ====="
+              ls -la "work/$dmg"
+              df -k "$mnt" | tail -1
+              echo "--- depth 1 (KiB) ---"
+              sudo du -kxd 1 "$mnt" 2>/dev/null | sort -rn | head -40
+              for d in System/Library usr usr/lib usr/libexec usr/share Applications \
+                       System/Library/PrivateFrameworks System/Library/Frameworks \
+                       System/Library/Caches System/Library/Caches/com.apple.dyld \
+                       System/Library/LinguisticData System/Library/PreinstalledAssets \
+                       System/Library/Audio System/Library/Fonts System/Library/TextInput \
+                       System/Library/AssetsV2 System/Library/Assistant System/Library/Health \
+                       System/Library/Wallpaper System/Library/PrivateFrameworks/TextInput.framework \
+                       System/Library/CoreServices System/Library/Accessibility; do
+                [ -d "$mnt/$d" ] || continue
+                echo "--- $d (KiB, top 40) ---"
+                sudo du -kxd 1 "$mnt/$d" 2>/dev/null | sort -rn | head -40 | sed "s#$mnt/##"
+              done
+              echo "--- largest 120 files (KiB) ---"
+              sudo find "$mnt" -xdev -type f -size +4M -exec du -k {} + 2>/dev/null | sort -rn | head -120 | sed "s#$mnt/##"
+              echo "--- .lproj total (KiB) and non-English share ---"
+              sudo find "$mnt" -xdev -type d -name '*.lproj' -prune -exec du -sk {} + 2>/dev/null |
+                awk '{t+=$1; n=$2; sub(/.*\//,"",n); if (n!="en.lproj" && n!="English.lproj" && n!="Base.lproj") o+=$1} END {print "all", t, "non-en", o}'
+            } >> "$report" 2>&1
+            hdiutil detach "$mnt" >/dev/null
+            rm -f "work/$dmg"
+          done < work/components.txt
+          cat "$report"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: root-sizes
+          path: work/root-sizes.txt
