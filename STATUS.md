@@ -147,6 +147,17 @@ Sıradaki adım: kök dosya sistemi. A5'te önce `rd=md0` ile boş bir HFS+ RAM 
   - Ardından md0 kökü ve `*** SWEET userspace: init running as PID 1 ***` + heartbeat geldi.
 - Sonuç: patch 0104'ün PIO CMD17 yolu, CRC kontrolü ve GPT ayrıştırması 7870'te çalışıyor. Sıradaki adım yeniden bölümleme.
 
+### ✅ xnu5 telefonda: iOS 16.7 kökü eMMC'den bağlandı (2026-11-09)
+
+- Kırpılmış kök (`root.yml` run 42526101397, `TRIM=on7xelte`, 14,43 GiB HFSX, 9,9 GiB dolu) USERDATA p21'e TWRP'de 128 MiB'lık gzip parçalarla `adb push` + `dd seek=` ile yazıldı (adb stdin bu PC'de ikili güvenli değil, `adb exec-in` TWRP'de çalışmıyor). Telefonda tüm bölümün SHA-256'sı `52fec8bc…2689`, CI ile aynı.
+- Ekran (`candidates/xnu5/screen-xnu5-launchd-wrong-platform.webp`): `GPT USERDATA first=507904 sectors=30269407` → `BSD root: emmcroot0` → `hfs: mounted iOSRoot` → `load_init_program: /sbin/launchd` → panic `unexpected SIGKILL of launchd (CS_KILLED) … namespace 9 code 0xe` = `EXEC_EXIT_REASON_WRONG_PLATFORM` (macOS yapılandırmalı çekirdek iOS ikililerini yabancı sayıyor; donörde 0029u ile aynı).
+
+### ✅ xnu6 telefonda: Apple launchd çalışıyor (2026-11-09)
+
+- xnu5 + `unentitled_ios_sim_launch=1 ignition_level=1 launchd_unsecure_cache=1 wdt=-1 wdt_test=no_user_checkin` (yalnız komut satırı farklı). BOOT SHA-256 `ea39133e…5fee`.
+- Ekran (`candidates/xnu6/screen-xnu6-launchd-mount-ro.webp`): dyld shared cache eşlendi (`not in trust cache` uyarıları), `A5XELTE Sandbox: launchd op 4`, launchd `hello`, `Darwin Bootstrapper Version 7.0.0`, boot görevleri (fsck, mount) çalıştı. `mount_hfs: Read-only file system` → `mount: / failed with 1` → panic `mount[3] exited`.
+- Çözüm: patch **0124** (`0124-a5xelte-read-write-root.patch`) donörün `rootrw=1` desteğini (0031, yalnız SWEET) A5XELTE'ye açar. Sonraki aday xnu7: `rootrw=1 emmcwrite=1` (sürücü yazmayı yalnız USERDATA aralığında yapar, patch 0108).
+
 ## Kök disk planı (2026-11-09, kullanıcıyla kararlaştırıldı)
 
 Hedef günlük kullanılabilir bir cihaz. Telefonda kullanıcı verisi yok, Android silinebilir. **Bootloader, download mode, RECOVERY ve EFS'e dokunulmayacak.**

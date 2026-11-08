@@ -1,0 +1,16 @@
+--- a/bsd/vfs/vfs_subr.c
++++ b/bsd/vfs/vfs_subr.c
+@@ -1258,9 +1258,12 @@
+ 		mp = vfs_rootmountalloc_internal(vfsp, "root_device");
+ 		mp->mnt_devvp = rootvp;
+-#if defined(ARM64_BOARD_CONFIG_SWEET)
++#if defined(ARM64_BOARD_CONFIG_SWEET) || defined(ARM64_BOARD_CONFIG_A5XELTE)
+ 		/*
+ 		 * SWEET has no data volume: /private/var lives on the root, so
+ 		 * boot-arg rootrw=1 mounts it read-write from the start.
++		 * A5XELTE (on7xelte) is the same; the eMMC driver also needs
++		 * emmcroot=USERDATA emmcwrite=1 or the read-write open fails with
++		 * EROFS.
+ 		 */
+ 		{
+ 			uint32_t rootrw = 0;
