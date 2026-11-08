@@ -20,7 +20,7 @@ Bütün 7870 adresleri WSL `~/j7prime-kernels/kernel_Exynos7870/` kaynağından:
 | `tools/mkadt_a5xelte.py` + `tools/mkadt.py` | a51 sürümü; GIC 7870'e göre düzeltildi. ADT üretimi test edildi (9500 bayt) |
 | `shim/on7xelte/` | a5xelte shim'i; 7870 PMU/CMU/ekran gücü adresleri düzeltildi. WSL'de `aarch64-linux-gnu-gcc 15.2` ile `-Werror` derlendi: `outxnu/Image` 9760 B, `out4k/Image` 20480 B, Samsung header OK |
 | XNU build | ✅ İlk başarılı CI derlemesi: github.com/theson45/ios-on7xelte run 42520539658 (macos-15, Xcode 16, 6m42s). `kernel.development.a5xelte` Mach-O, SHA-256 `10482d4b…dedafe4`. LSE taramasındaki tek eşleşme `K256` (SHA-256 sabit tablosu, veri; gerçek talimat değil) |
-| Donanım testi | ✅ probe4k + probe4kc + **xnu1b** (2026-11-08): XNU telefonda açılıp BSD kök disk beklemesine (`Waiting on … IOMedia Apple_HFS`) kadar geldi |
+| Donanım testi | ✅ probe4k + probe4kc + xnu1b + **xnu2** (2026-11-09): XNU telefonda açılıp HFS+ RAM diski kök olarak bağladı (`hfs: mounted ON7RAMDISK`) |
 
 ## 7580 → 7870 adres düzeltmeleri
 
@@ -115,6 +115,21 @@ Sıradaki adım: kök dosya sistemi. A5'te önce `rd=md0` ile boş bir HFS+ RAM 
   - eMMC okuma `emmcprobe=1` ya da `rd=emmcroot0` olmadan çalışmıyor.
   - Yazma `emmcwrite` ya da `a5log` olmadan çalışmıyor.
   - PMIC ve dokunmatik (0x10430000 dahil) `a5touchprobe=1`, tuşlar `a5keys=1` olmadan çalışmıyor.
+
+### ✅ xnu2 telefonda: HFS+ RAM disk kök olarak bağlandı (2026-11-09)
+
+- `candidates/xnu2/xnu2-boot.img`, SHA-256 `d22807fd…dcb9c`. Payload içinde 8 MiB'lık boş HFS+ disk (`ON7RAMDISK`, PA 0x824a0000) var. boot-args xnu1b ile aynı, sadece başına `rd=md0` eklendi. eMMC'ye erişim yok.
+- BOOT p10'a yazıldı ve geri okunarak doğrulandı.
+- Ekranda **`hfs: mounted ON7RAMDISK on device b(1,0)`** görüldü, ardından panic geldi. Disk boş olduğu için panic beklenen sonuç: `/sbin/launchd` yok.
+- Fotoğraf: `candidates/xnu2/screen-xnu2-launchd-panic.webp`. Satırlar sırasıyla:
+  - `Added memory device md0/rmd0 … at 0xffffff…`
+  - `BSD root: md0, major 1, minor 0`
+  - `hfs: mounted ON7RAMDISK`
+  - `devfs_kernel_mount: kernel_mount failed: 2`
+  - `Serial keyboard started`, `VM Swap Subsystem is ON`
+  - `load_init_program: attempting to load /usr/appleinternal/sbin/launchd.development` ve ardından `/sbin/launchd`
+  - **`panic(cpu 0 …): Process 1 exec of /sbin/launchd failed, errno 2 @kern_exec.c:6929`**: A5'in md0 kontrol noktasıyla birebir aynı. devfs hatası `/dev` dizini olmamasından geliyor, userland ile birlikte çözülür.
+- Sonuç: XNU md0'ı kök dosya sistemi olarak bağlıyor. Sıradaki adım iOS userland'ini (launchd, dyld, shared cache) bir kök diske koymak. RAM disk bunun için en fazla ~20 MB sığdırabiliyor (S-Boot'un toplam sınırı 0x3D7FF00), bu yüzden büyük kök eMMC'den okunmalı. USERDATA'da Android verisi var, karar kullanıcıya ait.
 
 ## J7 Prime'a özel donanım (A5'ten farklı, sürücü yazılmalı)
 
