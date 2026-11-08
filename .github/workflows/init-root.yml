@@ -1,0 +1,59 @@
+name: init-root
+
+# Small HFS+ RAM disk root for the first userspace test (rd=md0):
+#   /sbin/launchd = tools/sweet-init.S as a static, ad-hoc signed Mach-O
+#   /dev          = empty mount point for devfs
+# Linux has no iOS-target assembler or a way to populate HFS+ without root,
+# so this runs on macOS. The image is tiny and goes into the BOOT payload.
+
+on:
+  workflow_dispatch:
+    inputs:
+      size_mib:
+        description: "HFS+ image size in MiB"
+        default: "8"
+
+jobs:
+  init-root:
+    runs-on: macos-15
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build sweet-init
+        run: |
+          set -euxo pipefail
+          mkdir -p work
+          xcrun clang -target arm64-apple-ios16.0 -c tools/sweet-init.S -o work/sweet-init.o
+          python3 tools/mkinit.py work/sweet-init.o work/sweet-init
+          otool -hl work/sweet-init | head -40
+          codesign -dvvv work/sweet-init 2>&1 || true
+
+      - name: Build HFS+ image
+        run: |
+          set -euxo pipefail
+          mkfile -n "${{ inputs.size_mib || '8' }}m" work/root-init.hfs
+          dev=$(hdiutil attach -owners on -imagekey diskimage-class=CRawDiskImage -nomount work/root-init.hfs | awk 'NR==1{print $1}')
+          sudo "$(command -v newfs_hfs)" -v ON7INIT "$dev"
+          hdiutil detach "$dev"
+          mkdir -p work/mnt
+          hdiutil attach -owners on -imagekey diskimage-class=CRawDiskImage -mountpoint work/mnt work/root-init.hfs
+          sudo mkdir -p work/mnt/sbin work/mnt/dev
+          sudo cp work/sweet-init work/mnt/sbin/launchd
+          sudo chown -R 0:0 work/mnt/sbin work/mnt/dev
+          sudo chmod 0755 work/mnt/sbin work/mnt/dev work/mnt/sbin/launchd
+          ls -lnR work/mnt | grep -v '^\.\(fseventsd\|Trashes\)' || true
+          sudo rm -rf work/mnt/.fseventsd work/mnt/.Trashes work/mnt/.Spotlight-V100 || true
+          hdiutil detach work/mnt
+          dev=$(hdiutil attach -imagekey diskimage-class=CRawDiskImage -nomount work/root-init.hfs | awk 'NR==1{print $1}')
+          sudo "$(command -v fsck_hfs)" -f -n "$dev"
+          hdiutil detach "$dev"
+          shasum -a 256 work/sweet-init work/root-init.hfs | tee work/SHA256SUMS
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: init-root
+          path: |
+            work/sweet-init
+            work/root-init.hfs
+            work/SHA256SUMS
