@@ -20,7 +20,7 @@ Bütün 7870 adresleri WSL `~/j7prime-kernels/kernel_Exynos7870/` kaynağından:
 | `tools/mkadt_a5xelte.py` + `tools/mkadt.py` | a51 sürümü; GIC 7870'e göre düzeltildi. ADT üretimi test edildi (9500 bayt) |
 | `shim/on7xelte/` | a5xelte shim'i; 7870 PMU/CMU/ekran gücü adresleri düzeltildi. WSL'de `aarch64-linux-gnu-gcc 15.2` ile `-Werror` derlendi: `outxnu/Image` 9760 B, `out4k/Image` 20480 B, Samsung header OK |
 | XNU build | ✅ İlk başarılı CI derlemesi: github.com/theson45/ios-on7xelte run 42520539658 (macos-15, Xcode 16, 6m42s). `kernel.development.a5xelte` Mach-O, SHA-256 `10482d4b…dedafe4`. LSE taramasındaki tek eşleşme `K256` (SHA-256 sabit tablosu, veri; gerçek talimat değil) |
-| Donanım testi | ✅ probe4k + probe4kc (2026-11-08): EL1 girişi, geçerli FDT, 4 KiB MMU açık yürütme ve framebuffer 0x67000000 çıktısı telefonda doğrulandı |
+| Donanım testi | ✅ probe4k + probe4kc + **xnu1b** (2026-11-08): XNU telefonda açılıp BSD kök disk beklemesine (`Waiting on … IOMedia Apple_HFS`) kadar geldi |
 
 ## 7580 → 7870 adres düzeltmeleri
 
@@ -93,7 +93,20 @@ XNU'nun kendisi. `xnu.yml` workflow'u GitHub macOS runner'ında çalıştırılm
   - `align(kernel)+align(ramdisk)+0x1000(+dt) ≤ 0x3D7FF00`
   - Kernel 0x40080000'e, ramdisk 0x43000000'e kopyalanıyor.
 - Çözüm `xnu1b`: payload Image'ın +0x10000 ofsetine ekleniyor (`on7xelte-pack-probe.py --embed`).
-  Shim `_start+0x10000`'da SWEETXNU arıyor, bulamazsa FDT initrd'e düşüyor. SHA-256 `1e9486fd…256f4d`. Henüz yazılmadı.
+  Shim `_start+0x10000`'da SWEETXNU arıyor, bulamazsa FDT initrd'e düşüyor. SHA-256 `1e9486fd…256f4d`.
+
+### ✅ xnu1b telefonda: XNU kök disk beklemesine kadar açıldı (2026-11-08)
+
+BOOT p10'a yazıldı ve geri okunarak doğrulandı. Kullanıcının ekran fotoğrafında (konsol alttan başa sarıyor, en yeni satırlar üstte) şunlar görülüyor:
+- `SWEET FB: AppleCLCD 1080x1920 stride 4320 at 0x67000000` — XNU'nun framebuffer'ı S-Boot taramasıyla çalışıyor.
+- AMFI ve Sandbox politikaları yüklendi, `hfs-627.100.6 registered`, `mcache: 1 CPU(s)`, `mbinit: done [64 MB]`.
+- DLIL ve Skywalk self-test'lerinin hepsi PASSED. Çekirdek thread'leri zamanlanıyor, yani timer ve scheduler çalışıyor.
+- `bsd_autoconf: calling kminit`, lo0/gif0/stf0 ağ arayüzleri bağlandı.
+- `A5XELTE KEYS: disabled`.
+- **`Waiting on <dict>…IOProviderClass IOMedia…Content Apple_HFS…`** — kök disk verilmediği için beklenen durma noktası. A5'in RAM disk öncesi kontrol noktasıyla aynı.
+- `Failed to write boot-picker-bringup-reason to NVRAM` (NVRAM yok, beklenen).
+
+Sıradaki adım: kök dosya sistemi. A5'te önce `rd=md0` ile boş bir HFS+ RAM disk denendi; bunun için payload'a `mkpayload.py --ramdisk` ile eklenmesi gerekiyor (`--embed` ile toplam ≤ 0x3D7FF00).
 
 - `candidates/xnu1/xnu1-boot.img`, SHA-256 `8742f2fe…902cf0`. CI kernel'ı, `xnu_boot` shim'i ve ADT ile paketlendi.
 - Shim artık `ON7_KEEP_SBOOT_SCANOUT=1` ile derleniyor. A5'in 7580 DECON/DSIM yeniden programlama sırası atlanıyor ve sadece FB RAM'ine yazılıyor; probe4kc bunun yeterli olduğunu gösterdi.
