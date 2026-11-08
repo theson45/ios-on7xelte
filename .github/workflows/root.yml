@@ -7,8 +7,11 @@ on:
         description: "iPhone X (D22AP) iOS 16 IPSW URL"
         default: "https://updates.cdn-apple.com/2025FallFCS/fullrestores/122-77006/1158E502-D76D-4226-AA06-ED5E30CD1111/iPhone10,3,iPhone10,6_16.7.16_20H392_Restore.ipsw"
       size:
-        description: "HFS+ root image size"
+        description: "HFS+ root image size (on7xelte USERDATA p21 = 15497936384 bytes)"
         default: "20G"
+      trim:
+        description: "Trim profile passed as TRIM to mkiosroot-staged.sh (on7xelte or empty)"
+        default: ""
 
 # The root image is several GiB: the download of the APFS components plus the
 # output has to fit on the runner disk, so this job runs alone.
@@ -36,7 +39,7 @@ jobs:
         run: |
           set -eux
           mkdir -p work
-          bash tools/mkiosroot-staged.sh work "${{ inputs.ipsw_url }}" work/ios-root.img "${{ inputs.size }}"
+          TRIM="${{ inputs.trim }}" bash tools/mkiosroot-staged.sh work "${{ inputs.ipsw_url }}" work/ios-root.img "${{ inputs.size }}"
           ls -la work/ios-root.img
 
       - name: Verify ownership and content

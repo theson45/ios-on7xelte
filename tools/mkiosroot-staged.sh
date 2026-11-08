@@ -140,6 +140,32 @@ for c in OS App; do
     done
 done
 
+# --- 4b) optional trim (TRIM=on7xelte) --------------------------------------
+# The on7xelte root partition is 14.4 GiB and the untrimmed root is ~7.6 GiB
+# (root-sizes run 42525538965). Only data the J7 can never use is removed:
+#   usr/standalone        iPhone X OTA ramdisk + baseband firmware (170 MiB)
+#   usr/share/firmware    iPhone X Wi-Fi/BT firmware
+#   LinguisticData        keyboard/NLP models, kept: en, tr (~540 MiB freed)
+#   *.lproj               UI translations, kept: en*, English, Base, tr*
+# Code (dyld shared cache, frameworks, daemons) is never touched.
+if [ "${TRIM:-}" = on7xelte ]; then
+    echo "--- trim (on7xelte) ---"
+    sudo du -sk "$work/root"
+    sudo rm -rf "$work/root/usr/standalone" "$work/root/usr/share/firmware"
+    for b in "$work/root/System/Library/LinguisticData"/RequiredAssets_*.bundle; do
+        [ -d "$b" ] || continue
+        case "${b##*/}" in
+            RequiredAssets_en.bundle|RequiredAssets_tr.bundle) ;;
+            *) sudo rm -rf "$b" ;;
+        esac
+    done
+    sudo find "$work/root" -xdev -type d -name '*.lproj' \
+        ! -name 'en.lproj' ! -name 'en_*.lproj' ! -name 'English.lproj' \
+        ! -name 'Base.lproj' ! -name 'tr.lproj' ! -name 'tr_*.lproj' \
+        ! -name 'Turkish.lproj' -prune -exec rm -rf {} +
+    sudo du -sk "$work/root"
+fi
+
 # --- 5) logd migration markers + system keybag ------------------------------
 db="$work/root/private/var/db"
 sudo install -d -m 0751 "$db/diagnostics"
