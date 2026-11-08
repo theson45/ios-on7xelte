@@ -14,6 +14,9 @@ from pathlib import Path
 import struct
 
 HW_REV = 3  # androidboot.hw_rev on the lab SM-G610F
+EMBED_OFFSET = 0x10000  # must match shim/on7xelte/xnu_boot.c
+SBOOT_RAMDISK_MAX = 0xE00000  # S-Boot: align(ramdisk) > 0xE00000 -> "invalid ramdisk length"
+SBOOT_TOTAL_MAX = 0x3D7FF00  # S-Boot: align(kernel)+align(ramdisk)+0x1000 (+dt) limit
 
 
 def main():
@@ -23,6 +26,9 @@ def main():
     ap.add_argument("output_boot", type=Path)
     ap.add_argument("--ramdisk", type=Path,
                     help="replace the reference ramdisk with an XNU payload")
+    ap.add_argument("--embed", type=Path,
+                    help="append an XNU payload to the Image at +0x10000 "
+                         "(S-Boot G610FDDU1CSB3 rejects ramdisks > 0xE00000)")
     args = ap.parse_args()
     if args.output_boot.exists():
         raise SystemExit("output exists; choose a new private path")
@@ -41,6 +47,15 @@ def main():
         raise SystemExit("probe lacks the observed legacy Image header")
     if struct.unpack_from("<Q", probe, 16)[0] != 0:
         raise SystemExit("probe Image has an unexpected runtime size")
+    if args.embed:
+        if args.ramdisk:
+            raise SystemExit("--embed and --ramdisk are exclusive")
+        if len(probe) > EMBED_OFFSET:
+            raise SystemExit("Image overlaps the embed offset")
+        payload = args.embed.read_bytes()
+        if payload[:8] != b"SWEETXNU":
+            raise SystemExit("embed payload lacks SWEETXNU magic")
+        probe = probe + b"\0" * (EMBED_OFFSET - len(probe)) + payload
     align = lambda size: (size + page - 1) // page * page
     ramdisk_off = page + align(kernel_size)
     dt_off = ramdisk_off + align(ramdisk_size)
@@ -50,6 +65,8 @@ def main():
                ref[ramdisk_off:ramdisk_off + ramdisk_size])
     if not ramdisk:
         raise SystemExit("empty ramdisk")
+    if align(len(ramdisk)) > SBOOT_RAMDISK_MAX:
+        raise SystemExit("ramdisk exceeds S-Boot's 0xE00000 limit; use --embed")
     dt = ref[dt_off:dt_off + dt_size]
     if dt[:4] != b"DTBH" or struct.unpack_from("<I", dt, 4)[0] != 2:
         raise SystemExit("reference DTBH version is not the observed format")
@@ -59,6 +76,8 @@ def main():
     entries = [struct.unpack_from("<8I", dt, 12 + i * 32) for i in range(count)]
     if not any(e[0] == 7870 and e[3] <= HW_REV <= e[4] for e in entries):
         raise SystemExit(f"DTBH has no Exynos7870 hardware revision {HW_REV} entry")
+    if align(len(probe)) + align(len(ramdisk)) + 0x1000 + align(dt_size) > SBOOT_TOTAL_MAX:
+        raise SystemExit("kernel+ramdisk+dt exceed S-Boot's total limit")
     header = bytearray(ref[:page])
     struct.pack_into("<I", header, 8, len(probe))
     struct.pack_into("<I", header, 16, len(ramdisk))

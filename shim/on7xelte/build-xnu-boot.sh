@@ -20,5 +20,6 @@ p = Path('outxnu/Image').read_bytes()
 assert p[56:60] == b'ARMd'
 assert struct.unpack_from('<Q', p, 8)[0] == 0x205000
 assert struct.unpack_from('<Q', p, 16)[0] == 0
+assert len(p) <= 0x10000, 'Image overlaps EMBED_OFFSET'
 print(f'outxnu/Image: {len(p)} bytes; Samsung legacy Image header OK')
 PY

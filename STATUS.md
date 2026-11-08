@@ -85,7 +85,15 @@ Shell kullanıcısı `log` grubunda, bu yüzden `/proc/last_kmsg` root olmadan o
 
 XNU'nun kendisi. `xnu.yml` workflow'u GitHub macOS runner'ında çalıştırılmalı (push gerekli). Çıkan Mach-O, `mkpayload.py` ve `xnu_boot` shim ile BOOT'a paketlenir.
 
-## İlk XNU BOOT adayı (xnu1, 2026-11-08, henüz yazılmadı)
+## İlk XNU BOOT adayı (xnu1, 2026-11-08)
+
+- **xnu1 S-Boot'ta reddedildi:** `Could not do normal boot.(invalid ramdisk length)`.
+  S-Boot (mmcblk0boot0 0x5d0e0–0x5d184) şu sınırları uyguluyor:
+  - `align(ramdisk) ≤ 0xE00000`
+  - `align(kernel)+align(ramdisk)+0x1000(+dt) ≤ 0x3D7FF00`
+  - Kernel 0x40080000'e, ramdisk 0x43000000'e kopyalanıyor.
+- Çözüm `xnu1b`: payload Image'ın +0x10000 ofsetine ekleniyor (`on7xelte-pack-probe.py --embed`).
+  Shim `_start+0x10000`'da SWEETXNU arıyor, bulamazsa FDT initrd'e düşüyor. SHA-256 `1e9486fd…256f4d`. Henüz yazılmadı.
 
 - `candidates/xnu1/xnu1-boot.img`, SHA-256 `8742f2fe…902cf0`. CI kernel'ı, `xnu_boot` shim'i ve ADT ile paketlendi.
 - Shim artık `ON7_KEEP_SBOOT_SCANOUT=1` ile derleniyor. A5'in 7580 DECON/DSIM yeniden programlama sırası atlanıyor ve sadece FB RAM'ine yazılıyor; probe4kc bunun yeterli olduğunu gösterdi.

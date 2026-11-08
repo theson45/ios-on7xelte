@@ -88,14 +88,48 @@ static uintptr_t align_page(uintptr_t value)
     return (value + PAGE_SIZE - 1) & ~(PAGE_SIZE - 1);
 }
 
+/*
+ * on7xelte: S-Boot G610FDDU1CSB3 rejects a ramdisk larger than 0xE00000
+ * ("invalid ramdisk length"); the XNU payload is ~16 MiB. The kernel area
+ * has no such limit (stock Linux is 18.7 MiB), so the packer may append the
+ * payload to this Image at EMBED_OFFSET. Used when its magic is present;
+ * otherwise the FDT initrd is used as before.
+ */
+#define EMBED_OFFSET 0x10000UL
+#define EMBED_MAX    0x2000000UL
+extern char _start[], _end[];
+_Static_assert(EMBED_OFFSET % 4096 == 0, "embed alignment");
+
+static uint64_t embedded_length(const struct payload *p)
+{
+    if (!magic_ok(p->magic) || p->version != 1 || !p->nsegs || p->nsegs > 32)
+        return 0;
+    uint64_t end = __builtin_offsetof(struct payload, segs) +
+                   p->nsegs * sizeof(struct payload_seg);
+    if (p->adt_off + p->adt_size > end)
+        end = p->adt_off + p->adt_size;
+    for (uint32_t i = 0; i < p->nsegs; ++i)
+        if (p->segs[i].file_off + p->segs[i].file_size > end)
+            end = p->segs[i].file_off + p->segs[i].file_size;
+    return end <= EMBED_MAX ? end : 0;
+}
+
 /* Returns entry PA or zero. Status is kept in reserved RAM for TWRP. */
 uintptr_t a5_prepare_xnu(uintptr_t fdt, volatile uint64_t *log)
 {
     uint64_t rd_start, rd_end;
     log[10] = (uint64_t)-1;
-    if (!fdt_chosen_u64(fdt, "linux,initrd-start", &rd_start) ||
-        !fdt_chosen_u64(fdt, "linux,initrd-end", &rd_end) ||
-        rd_start < 0x40000000ULL || rd_end > RAM_END || rd_end <= rd_start)
+    uintptr_t embed = (uintptr_t)_start + EMBED_OFFSET;
+    uint64_t embed_len = (uintptr_t)_end <= embed ?
+        embedded_length((const struct payload *)embed) : 0;
+    if (embed_len) {
+        rd_start = embed;
+        rd_end = embed + embed_len;
+        log[19] = 0x454d424544ULL; /* "DEBME": embedded payload */
+    } else if (!fdt_chosen_u64(fdt, "linux,initrd-start", &rd_start) ||
+               !fdt_chosen_u64(fdt, "linux,initrd-end", &rd_end))
+        return 0;
+    if (rd_start < 0x40000000ULL || rd_end > RAM_BASE || rd_end <= rd_start)
         return 0;
     log[11] = rd_start;
     log[12] = rd_end;
