@@ -25,6 +25,9 @@
  * Verified on on7xelte: S-Boot G610FDDU1CSB3 passes s3cfb.bootloaderfb=0x67000000
  * (kernel command line in last_kmsg); panel TD4300 FHD 1080x1920, "LCD ON UBOOT".
  */
+#ifndef ON7_KEEP_SBOOT_SCANOUT
+#define ON7_KEEP_SBOOT_SCANOUT 1
+#endif
 #define FB_BASE 0x67000000UL
 #define FB_WIDTH 1080U
 #define FB_HEIGHT 1920U
@@ -262,7 +265,7 @@ int a5_display_console_start(volatile uint64_t *log)
 {
     log[DISP_STATE] = 1;
     log[DISP_POWER_BEFORE] = rd(DISP_POWER + 4);
-    if ((log[DISP_POWER_BEFORE] & 0xf) != 0xf) return -1;
+    if (!ON7_KEEP_SBOOT_SCANOUT && (log[DISP_POWER_BEFORE] & 0xf) != 0xf) return -1;
     log[DISP_DSIM_STATUS_BEFORE] = rd(DSIM + 4);
     log[DISP_DSIM_CONFIG_BEFORE] = rd(DSIM + 0x18);
     log[DISP_DSIM_SIZE_BEFORE] = rd(DSIM + 0x20);
@@ -270,6 +273,31 @@ int a5_display_console_start(volatile uint64_t *log)
     log[DISP_FB_START_BEFORE] = rd(DECON + FB_START);
     log[DISP_SYSMMU_BEFORE] = rd(SYSMMU);
     log[DISP_CLOCK_GATE_BEFORE] = rd(DISP_CMU + 0x81c); /* DECON_INT_VCLK gate */
+#if ON7_KEEP_SBOOT_SCANOUT
+    /*
+     * on7xelte: probe4kc (2026-11-08) proved that plain stores to FB_BASE
+     * appear on the TD4300 panel after S-Boot hands over, with no DECON,
+     * DSIM or clock writes. The A5 reprogramming below uses 7580 panel
+     * timings and DSIM commands that are untested on 7870 and could blank
+     * the only output channel, so keep S-Boot's scanout and draw only.
+     */
+    log[DISP_STATE] = 4;
+    {
+        volatile uint32_t *keep = (volatile uint32_t *)(uintptr_t)FB_BASE;
+        for (unsigned i = 0; i < FB_WIDTH * FB_HEIGHT; ++i)
+            keep[i] = 0xff000000U;
+    }
+    draw_text(0, "ON7XELTE XNU");
+    draw_text(1, "SBOOT SCANOUT KEPT");
+    draw_text(2, "XNU ENTRY:");
+    draw_text(3, "MMU ON:");
+    draw_text(4, "EL1 FP ENABLE:");
+    draw_text(5, "CPU TUNABLES:");
+    draw_text(6, "ARM INIT JUMP:");
+    clean_fb();
+    log[DISP_STATE] = 6;
+    return 2;
+#endif
     if (!(log[DISP_DSIM_STATUS_BEFORE] & BIT(31)) ||
         (log[DISP_DSIM_CONFIG_BEFORE] & BIT(25)) ||
         (log[DISP_DSIM_SIZE_BEFORE] & 0xfff) != FB_WIDTH ||

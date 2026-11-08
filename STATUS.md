@@ -85,6 +85,16 @@ Shell kullanıcısı `log` grubunda, bu yüzden `/proc/last_kmsg` root olmadan o
 
 XNU'nun kendisi. `xnu.yml` workflow'u GitHub macOS runner'ında çalıştırılmalı (push gerekli). Çıkan Mach-O, `mkpayload.py` ve `xnu_boot` shim ile BOOT'a paketlenir.
 
+## İlk XNU BOOT adayı (xnu1, 2026-11-08, henüz yazılmadı)
+
+- `candidates/xnu1/xnu1-boot.img`, SHA-256 `8742f2fe…902cf0`. CI kernel'ı, `xnu_boot` shim'i ve ADT ile paketlendi.
+- Shim artık `ON7_KEEP_SBOOT_SCANOUT=1` ile derleniyor. A5'in 7580 DECON/DSIM yeniden programlama sırası atlanıyor ve sadece FB RAM'ine yazılıyor; probe4kc bunun yeterli olduğunu gösterdi.
+- boot-args: `debug=0xc serial=3 cpus=1 keepsyms=1 -enable_kprintf_spam -noprogress`. Kök disk ve eMMC parametresi yok.
+  Kontrol edildi:
+  - eMMC okuma `emmcprobe=1` ya da `rd=emmcroot0` olmadan çalışmıyor.
+  - Yazma `emmcwrite` ya da `a5log` olmadan çalışmıyor.
+  - PMIC ve dokunmatik (0x10430000 dahil) `a5touchprobe=1`, tuşlar `a5keys=1` olmadan çalışmıyor.
+
 ## J7 Prime'a özel donanım (A5'ten farklı, sürücü yazılmalı)
 
 - **Tuşlar:** Power GPA0-0, Vol- GPA2-1, Vol+ GPA2-0, Home GPA1-7 (A5: hepsi GPA2'de). A5 tuş kodu kapalı (`a5keys=1` ile açılır, ama J7'de yanlış pinleri okur).
