@@ -41,13 +41,15 @@ jobs:
 
       - name: Size report
         run: |
-          set -uo pipefail
+          set +e -ux   # report only: du/head pipelines may exit non-zero (SIGPIPE, unreadable files)
           report=work/root-sizes.txt
           : > "$report"
-          while read -r alias dmg; do
-            python3 tools/remotezip.py "${{ inputs.ipsw_url }}" "$dmg" work >/dev/null
+          exec 3< work/components.txt
+          while read -r alias dmg <&3; do
+            python3 tools/remotezip.py "${{ inputs.ipsw_url }}" "$dmg" work </dev/null
+            ls -la "work/$dmg"
             mnt="work/mnt-$alias"; mkdir -p "$mnt"
-            hdiutil attach -owners on -nobrowse -readonly -mountpoint "$mnt" "work/$dmg" >/dev/null
+            hdiutil attach -owners on -nobrowse -readonly -mountpoint "$mnt" "work/$dmg" </dev/null
             {
               echo "===== $alias ($dmg) ====="
               ls -la "work/$dmg"
@@ -74,10 +76,11 @@ jobs:
             } >> "$report" 2>&1
             hdiutil detach "$mnt" >/dev/null
             rm -f "work/$dmg"
-          done < work/components.txt
+          done
           cat "$report"
 
       - uses: actions/upload-artifact@v4
+        if: always()
         with:
           name: root-sizes
           path: work/root-sizes.txt
