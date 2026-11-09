@@ -1,0 +1,90 @@
+--- a/bsd/dev/a5xelte_dvfs.c
++++ b/bsd/dev/a5xelte_dvfs.c
+@@ -9,6 +9,11 @@
+  *   temp           TMU reading (read only)
+  *   pmic [REG [N]] S2MPU05 register reads over HSI2C (read only). INT1-3
+  *                  (0x01-0x03) are refused: reading them clears them.
++ *   pmic mode HS RD10   bus mode: HS 1 = 2.5 MHz high speed (as Linux, with
++ *                  master code 0x08), 0 = 400 kHz fast mode (bootloader).
++ *                  RD10 1 = Linux's read form (10-bit/EXT_ADDR), 0 = plain.
++ *                  Default 0 0. xnu14 (HS, master code 0) got NO_DEV_ACK.
++ *   pmic probe     read the ID register in all four modes, report each
+  *   cpufreq        show both cluster PLLs, BUCK1 and the temperature
+  *   cpufreq MHZ    set both clusters to a stock ECT level (343..1586). The
+  *                  BUCK1 voltage is the highest one of the stock ASV table
+@@ -76,6 +81,7 @@
+ 	vm_offset_t i2c, cmu[2], sysreg[2], tmu;
+ 	uint32_t    cmd_buf, cmd_idx, cmd_ptr, desc;
+ 	uint32_t    int_en;         /* batcher interrupt enable during a transfer */
++	uint32_t    hs, rd10;       /* bus mode, see "pmic mode" */
+ 	uint32_t    cur_khz;        /* last level set here, 0 = bootloader's */
+ 	uint32_t    boot_khz, ticks;
+ 	bool        mapped;
+@@ -175,6 +181,9 @@
+ 			wr32(dv.i2c, HSI2C_BATCHER_STATE, BAT_COMPLETE);
+ 		}
+ 		wr32(dv.i2c, HSI2C_SMRELEASE, 1);
++		/* exynos5_i2c_reset(): pulse SW_RST in CTL */
++		wr32(dv.i2c, 0x00, rd32(dv.i2c, 0x00) | (1u << 31));
++		wr32(dv.i2c, 0x00, rd32(dv.i2c, 0x00) & ~(1u << 31));
+ 		printf("USB> pmic: batcher reset, semaphore released\n");
+ 	} else {
+ 		wr32(dv.i2c, HSI2C_BATCHER_CON, 0);
+@@ -204,12 +213,14 @@
+ 	pm_batch((0xfu << 16) | (19u << 24) | (38u << 8) | 38u, 0x64);
+ 	pm_batch((1u << 16) | 76u, 0x68);
+ 	pm_batch(0x2ff, 0x08);                                  /* TRAILING */
+-	pm_batch((rd ? (1u << 30) : 0) | (1u << 29) | (1u << 31) | (3u << 16) | (3u << 13) |
++	bool ten = rd && dv.rd10;
++	pm_batch((ten ? (1u << 30) : 0) | (dv.hs ? (1u << 29) : 0) | (1u << 31) | (3u << 16) | (3u << 13) |
+ 	    (1u << 28) | (1u << 27) | 0xff, 0x40);              /* CONF */
+ 	pm_batch(0, 0x48);                                      /* TIMEOUT */
+ 	pm_batch(1u | 2u | (8u << 16) | (len << 4), 0x04);      /* FIFO_CTL */
+-	pm_batch((1u << 3) | (rd ? ((1u << 6) | (1u << 30)) : (1u << 7)), 0x00);    /* CTL */
+-	pm_batch(rd ? ((PMIC_ADDR & 0x3fffu) << 10) : ((PMIC_ADDR & 0x7fu) << 10), 0x70);
++	pm_batch((1u << 3) | (rd ? ((1u << 6) | (ten ? (1u << 30) : 0)) : (1u << 7)), 0x00);    /* CTL */
++	pm_batch((dv.hs ? (0x08u << 24) : 0) |
++	    (ten ? ((PMIC_ADDR & 0x3fffu) << 10) : ((PMIC_ADDR & 0x7fu) << 10)), 0x70);   /* ADDR */
+ 	pm_batch(len | (rd ? (1u << 16) : 0) | (stop ? (1u << 17) : 0) | (1u << 31), 0x44);
+ 	wr32(r, HSI2C_BATCHER_INT_STAT, rd32(r, HSI2C_BATCHER_INT_STAT));
+ 	pm_batch(rd ? (1u << 1) : ((1u << 0) | (1u << 7)), 0x20); /* INT_ENABLE */
+@@ -234,8 +245,9 @@
+ 		delay(10);
+ 	}
+ 	if (!(st & BAT_COMPLETE) || (st & BAT_UNEXPECTED)) {
+-		printf("USB> pmic: %s failed, state 0x%x fifo 0x%x int 0x%x\n", rd ? "read" : "write",
+-		    st, rd32(r, HSI2C_BATCHER_FIFO), rd32(r, HSI2C_BATCHER_INT_STAT));
++		printf("USB> pmic: %s failed (hs %u rd10 %u), state 0x%x fifo 0x%x int 0x%x, i2c trans 0x%x fifo 0x%x\n",
++		    rd ? "read" : "write", dv.hs, dv.rd10, st, rd32(r, HSI2C_BATCHER_FIFO),
++		    rd32(r, HSI2C_BATCHER_INT_STAT), rd32(r, 0x50), rd32(r, 0x30));
+ 		pm_recover(st & ~BAT_UNEXPECTED);
+ 		return -1;
+ 	}
+@@ -506,6 +518,27 @@
+ 		printf("USB> temp: %d C (TMU 0x%08x, trim 0x%08x)\n", dv_temp(),
+ 		    rd32(dv.tmu, 0x40), rd32(dv.tmu, 0x0));
+ 	} else if (!strcmp(cmd, "pmic")) {
++		if (!strncmp(arg, "mode ", 5)) {
++			const char *s = arg + 5;
++			dv.hs = dv_num(&s) ? 1 : 0;
++			dv.rd10 = dv_num(&s) ? 1 : 0;
++			printf("USB> pmic: mode hs %u rd10 %u\n", dv.hs, dv.rd10);
++			return true;
++		}
++		if (!strcmp(arg, "probe")) {
++			uint32_t hs0 = dv.hs, rd0 = dv.rd10;
++			for (uint32_t m = 0; m < 4; m++) {
++				uint8_t id = 0xee;
++				dv.hs = m >> 1;
++				dv.rd10 = m & 1;
++				int e = pm_read(PMIC_ID, &id);
++				printf("USB> pmic probe: hs %u rd10 %u -> %s id 0x%02x\n", dv.hs, dv.rd10,
++				    e ? "FAIL" : "ok", id);
++			}
++			dv.hs = hs0;
++			dv.rd10 = rd0;
++			return true;
++		}
+ 		if (!strncmp(arg, "int ", 4)) {
+ 			const char *s = arg + 4;
+ 			dv.int_en = dv_num(&s) ? 1 : 0;
