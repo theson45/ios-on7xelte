@@ -1,0 +1,74 @@
+--- a/bsd/dev/a5xelte_usb.c
++++ b/bsd/dev/a5xelte_usb.c
+@@ -941,6 +941,51 @@
+ 	}
+ }
+ 
++/*
++ * 0141: services for hardware this phone does not have (or the port does not
++ * drive yet): Wi-Fi, Bluetooth, audio, the modem, NFC. They only crash, get
++ * respawned and keep launchd busy (mediaserverd alone kept launchd ~75% busy
++ * in a loop). kern_exec.c asks here and refuses the spawn with EACCES; their
++ * clients get an error at once instead of waiting.
++ * Boot-arg on7deny=NAME[,NAME] replaces the list, on7deny=- allows all.
++ */
++static const char ud_deny_default[] =
++    "mediaserverd,audioclocksyncd,audiomxd,UARPUpdaterServiceLegacyAudio,"
++    "bluetoothd,bluetoothuserd,BlueTool,BTLEServer,"
++    "wifid,wifip2pd,wifianalyticsd,wifivelocityd,WiFiCloudAssetsClient,"
++    "CommCenter,CommCenterMobileHelper,CommCenterRootHelper,WirelessRadioManagerd,"
++    "nfcd,carkitd";
++static char ud_deny_arg[512];
++static int ud_deny_state;       /* 0 not read, 1 default, 2 boot-arg, 3 off */
++static uint32_t ud_deny_count;
++
++bool a5xelte_exec_denied(const char *name);
++
++bool
++a5xelte_exec_denied(const char *name)
++{
++	int st = __atomic_load_n(&ud_deny_state, __ATOMIC_ACQUIRE);
++	if (st == 0) {
++		if (PE_parse_boot_argn("on7deny", ud_deny_arg, sizeof(ud_deny_arg))) {
++			st = (ud_deny_arg[0] == '-' || ud_deny_arg[0] == '\0') ? 3 : 2;
++		} else {
++			st = 1;
++		}
++		__atomic_store_n(&ud_deny_state, st, __ATOMIC_RELEASE);
++	}
++	if (st == 3 || name == NULL) {
++		return false;
++	}
++	if (!ud_name_in(st == 2 ? ud_deny_arg : ud_deny_default, name)) {
++		return false;
++	}
++	uint32_t n = __atomic_add_fetch(&ud_deny_count, 1, __ATOMIC_RELAXED);
++	if (n <= 64 || (n % 64) == 0) {
++		printf("exec %s denied (on7deny, %u so far)\n", name, n);
++	}
++	return true;
++}
++
+ static int ud_ps_count;
+ 
+ static int
+--- a/bsd/kern/kern_exec.c
++++ b/bsd/kern/kern_exec.c
+@@ -7414,7 +7414,17 @@
+ 			}
+ #if defined(ARM64_BOARD_CONFIG_SWEET) || defined(ARM64_BOARD_CONFIG_A5XELTE)
+ 			/* A short line keeps the persistent console ring useful. */
+ 			printf("exec %s\n", p->p_name);
++#if defined(ARM64_BOARD_CONFIG_A5XELTE)
++			{
++				/* 0141: no Wi-Fi/BT/audio/modem services (bsd/dev/a5xelte_usb.c, on7deny=) */
++				extern bool a5xelte_exec_denied(const char *name);
++				if (a5xelte_exec_denied(p->p_name)) {
++					error = EACCES;
++					goto done;
++				}
++			}
++#endif
+ #else
+ 			printf("Allowing spawn of iOS binary %s since it has "
+ 			    "com.apple.private.security.no-sandbox entitlement or unentitled_ios_sim_launch "
