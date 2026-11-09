@@ -1,0 +1,232 @@
+--- a/bsd/dev/a5xelte_dvfs.c
++++ b/bsd/dev/a5xelte_dvfs.c
+@@ -14,6 +14,13 @@
+  *                  RD10 1 = Linux's read form (10-bit/EXT_ADDR), 0 = plain.
+  *                  Default 0 0. xnu14 (HS, master code 0) got NO_DEV_ACK.
+  *   pmic probe     read the ID register in all four modes, report each
++ *                  (with the direct path: one plain read)
++ *   pmic path direct|batch   direct (default since 0132) = the controller's
++ *                  own auto mode, polled, as the bootloader and Linux's
++ *                  HSI2C_POLLING path; batch = the batcher (shared with the
++ *                  CP through a hardware semaphore)
++ *   pmic regs      dump the HSI2C_0 registers (read only)
++ *   pmic trace 0|1 per-transfer log lines (default 1)
+  *   cpufreq        show both cluster PLLs, BUCK1 and the temperature
+  *   cpufreq MHZ    set both clusters to a stock ECT level (343..1586). The
+  *                  BUCK1 voltage is the highest one of the stock ASV table
+@@ -24,6 +31,10 @@
+  * PMIC transfer step is logged, and HSI2C_0's GIC lines (SPI 371/372, no
+  * handler here) are checked and masked before the first transfer.
+  *
++ * 0132: the batcher run froze the whole system in xnu15 and xnu16 (after
++ * "started", about 3 s, every CPU), with HSI2C_0's GIC lines off. The direct
++ * path does not use the batcher or its semaphore at all.
++ *
+  * Boot-arg a5cpufreq=MHZ applies a level once, 20 s after USB start.
+  * A thermal guard drops back to 902 MHz at 85 C (checked every second).
+  *
+@@ -55,6 +66,23 @@
+ #define HSI2C_PAYLOAD           0x1000
+ #define HSI2C_PAYLOAD_END       0x1060
+ #define HSI2C_SMRELEASE         0x200
++/* HSI2C direct (non-batcher) registers */
++#define I2C_CTL                 0x00
++#define I2C_FIFO_CTL            0x04
++#define I2C_TRAILING            0x08
++#define I2C_INT_EN              0x20
++#define I2C_INT_STAT            0x24
++#define I2C_FIFO_STAT           0x30
++#define I2C_TX                  0x34
++#define I2C_RX                  0x38
++#define I2C_CONF                0x40
++#define I2C_AUTO                0x44
++#define I2C_TIMEOUT             0x48
++#define I2C_TRANS               0x50
++#define I2C_FS1                 0x60
++#define I2C_SLA                 0x6c
++#define I2C_ADDR                0x70
++#define I2C_TRANS_ERR           ((1u << 4) | (1u << 3) | (1u << 2) | (1u << 1))   /* TIMEOUT NO_DEV NO_DEV_ACK ABORT */
+ #define BAT_RESET               (1u << 31)
+ #define BAT_START               (1u << 4)
+ #define BAT_DEDICATE            (1u << 1)
+@@ -95,6 +123,9 @@
+ 	uint32_t    cmd_buf, cmd_idx, cmd_ptr, desc;
+ 	uint32_t    int_en;         /* batcher interrupt enable during a transfer */
+ 	uint32_t    hs, rd10;       /* bus mode, see "pmic mode" */
++	uint32_t    batch, quiet;   /* "pmic path", "pmic trace" */
++	bool        dinit, dsaved;
++	uint32_t    dtim[4], dconf; /* FS1..FS3, SLA and CONF as the bootloader left them */
+ 	uint32_t    cur_khz;        /* last level set here, 0 = bootloader's */
+ 	uint32_t    boot_khz, ticks;
+ 	bool        mapped;
+@@ -205,9 +236,126 @@
+ 	wr32(dv.i2c, HSI2C_BATCHER_INT_EN, 0);
+ }
+ 
+-/* One i2c message to the PMIC. Returns 0 or -1. */
++static void
++pm_regs(const char *why)
++{
++	vm_offset_t r = dv.i2c;
++	printf("USB> pmic regs (%s): ctl 0x%x fifo_ctl 0x%x trailing 0x%x int_en 0x%x int 0x%x fifo 0x%x\n", why,
++	    rd32(r, I2C_CTL), rd32(r, I2C_FIFO_CTL), rd32(r, I2C_TRAILING), rd32(r, I2C_INT_EN),
++	    rd32(r, I2C_INT_STAT), rd32(r, I2C_FIFO_STAT));
++	printf("USB> pmic regs: conf 0x%x auto 0x%x timeout 0x%x trans 0x%x addr 0x%x fs 0x%x 0x%x 0x%x sla 0x%x\n",
++	    rd32(r, I2C_CONF), rd32(r, I2C_AUTO), rd32(r, I2C_TIMEOUT), rd32(r, I2C_TRANS), rd32(r, I2C_ADDR),
++	    rd32(r, I2C_FS1), rd32(r, I2C_FS1 + 4), rd32(r, I2C_FS1 + 8), rd32(r, I2C_SLA));
++	printf("USB> pmic regs: batcher con 0x%x state 0x%x int_en 0x%x fifo 0x%x int 0x%x\n",
++	    rd32(r, HSI2C_BATCHER_CON), rd32(r, HSI2C_BATCHER_STATE), rd32(r, HSI2C_BATCHER_INT_EN),
++	    rd32(r, HSI2C_BATCHER_FIFO), rd32(r, HSI2C_BATCHER_INT_STAT));
++}
++
++/* exynos5_i2c_reset() + exynos5_i2c_init(), fast mode, with the bootloader's timing */
++static void
++pm_dinit(void)
++{
++	vm_offset_t r = dv.i2c;
++
++	if (!dv.dsaved) {
++		for (int i = 0; i < 4; i++) {
++			dv.dtim[i] = rd32(r, I2C_FS1 + 4 * i);
++		}
++		dv.dconf = rd32(r, I2C_CONF);
++		if (dv.dtim[2] == 0) {
++			/* not set up: 400 kHz values of the 0129 batcher sequence */
++			dv.dtim[0] = (38u << 24) | (38u << 16) | (38u << 8);
++			dv.dtim[1] = (0xfu << 16) | (19u << 24) | (38u << 8) | 38u;
++			dv.dtim[2] = (1u << 16) | 76u;
++			dv.dtim[3] = 19;
++		}
++		dv.dsaved = true;
++		printf("USB> pmic: direct timing fs 0x%x 0x%x 0x%x sla 0x%x conf 0x%x\n",
++		    dv.dtim[0], dv.dtim[1], dv.dtim[2], dv.dtim[3], dv.dconf);
++	}
++	wr32(r, HSI2C_BATCHER_INT_EN, 0);
++	wr32(r, HSI2C_BATCHER_CON, 0);
++	wr32(r, I2C_CTL, rd32(r, I2C_CTL) | (1u << 31));        /* SW_RST */
++	wr32(r, I2C_CTL, rd32(r, I2C_CTL) & ~(1u << 31));
++	for (int i = 0; i < 4; i++) {
++		wr32(r, I2C_FS1 + 4 * i, dv.dtim[i]);
++	}
++	wr32(r, I2C_CTL, 1u << 3);                              /* MASTER */
++	wr32(r, I2C_TRAILING, 0xf);
++	wr32(r, I2C_ADDR, 0);
++	wr32(r, I2C_CONF, (dv.dconf | (1u << 31)) & ~((1u << 30) | (1u << 29)));   /* AUTO, 7-bit, FS */
++	dv.dinit = true;
++}
++
++/* One i2c message, Linux's HSI2C_POLLING path of exynos5_i2c_xfer_msg(). */
+ static int
+-pm_xfer(bool rd, uint8_t *buf, uint32_t len, bool stop)
++pm_xfer_direct(bool rd, uint8_t *buf, uint32_t len, bool stop)
++{
++	vm_offset_t r = dv.i2c;
++	uint32_t got = 0, ts = 0, is = 0;
++	bool ok;
++
++	if (!dv.dinit) {
++		pm_dinit();
++	}
++	if (!dv.quiet) {
++		printf("USB> pmic: direct %s %u byte(s)%s, trans 0x%x fifo 0x%x\n", rd ? "read" : "write", len,
++		    stop ? " +stop" : "", rd32(r, I2C_TRANS), rd32(r, I2C_FIFO_STAT));
++	}
++	wr32(r, I2C_TIMEOUT, rd32(r, I2C_TIMEOUT) & ~(1u << 31));
++	wr32(r, I2C_FIFO_CTL, 1u | 2u | (8u << 4) | (8u << 16));
++	wr32(r, I2C_INT_EN, 0);
++	wr32(r, I2C_INT_STAT, rd32(r, I2C_INT_STAT));
++	uint32_t ctl = rd32(r, I2C_CTL) & ~((1u << 6) | (1u << 7));
++	ctl |= rd ? (1u << 6) : (1u << 7);                      /* RXCHON / TXCHON */
++	uint32_t au = rd32(r, I2C_AUTO) & ~((1u << 31) | (1u << 17) | (1u << 16) | 0xffffu);
++	au |= (rd ? (1u << 16) : 0) | (stop ? (1u << 17) : 0) | len;
++	wr32(r, I2C_ADDR, (PMIC_ADDR & 0x7fu) << 10);
++	wr32(r, I2C_CTL, ctl);
++	if (!rd) {
++		for (uint32_t i = 0; i < len; i++) {
++			wr32(r, I2C_TX, buf[i]);
++		}
++	}
++	wr32(r, I2C_AUTO, au);
++	wr32(r, I2C_AUTO, au | (1u << 31));                     /* MASTER_RUN */
++
++	for (int i = 0; i < 50000; i++) {                       /* 500 ms */
++		ts = rd32(r, I2C_TRANS);
++		if (rd) {
++			while (got < len && !(rd32(r, I2C_FIFO_STAT) & (1u << 24))) {
++				buf[got++] = (uint8_t)rd32(r, I2C_RX);
++			}
++			if (got == len) {
++				break;
++			}
++		} else if (rd32(r, I2C_INT_STAT) & (1u << 7)) {   /* TRANSFER_DONE */
++			break;
++		}
++		if (ts & I2C_TRANS_ERR) {
++			break;
++		}
++		delay(10);
++	}
++	is = rd32(r, I2C_INT_STAT);
++	ok = (rd ? got == len : (is & (1u << 7)) != 0) && !(ts & I2C_TRANS_ERR);
++	wr32(r, I2C_INT_STAT, is);
++	if (!ok) {
++		printf("USB> pmic: direct %s failed, trans 0x%x int 0x%x, got %u/%u\n", rd ? "read" : "write",
++		    ts, is, got, len);
++		pm_regs("fail");
++		pm_dinit();
++		return -1;
++	}
++	if (!dv.quiet) {
++		printf("USB> pmic: direct ok, trans 0x%x\n", rd32(r, I2C_TRANS));
++	}
++	return 0;
++}
++
++/* One i2c message to the PMIC through the batcher. Returns 0 or -1. */
++static int
++pm_xfer_batch(bool rd, uint8_t *buf, uint32_t len, bool stop)
+ {
+ 	vm_offset_t r = dv.i2c;
+ 	uint32_t rd_first, st = 0;
+@@ -290,6 +438,12 @@
+ }
+ 
+ static int
++pm_xfer(bool rd, uint8_t *buf, uint32_t len, bool stop)
++{
++	return dv.batch ? pm_xfer_batch(rd, buf, len, stop) : pm_xfer_direct(rd, buf, len, stop);
++}
++
++static int
+ pm_read(uint8_t reg, uint8_t *val)
+ {
+ 	if (pm_xfer(false, &reg, 1, false) || pm_xfer(true, val, 1, true)) {
+@@ -548,6 +702,28 @@
+ 			printf("USB> pmic: mode hs %u rd10 %u\n", dv.hs, dv.rd10);
+ 			return;
+ 		}
++		if (!strcmp(arg, "path direct") || !strcmp(arg, "path batch")) {
++			dv.batch = arg[5] == 'b';
++			dv.dinit = false;
++			printf("USB> pmic: path %s\n", dv.batch ? "batch" : "direct");
++			return;
++		}
++		if (!strcmp(arg, "regs")) {
++			pm_regs("now");
++			return;
++		}
++		if (!strncmp(arg, "trace ", 6)) {
++			const char *s = arg + 6;
++			dv.quiet = dv_num(&s) ? 0 : 1;
++			printf("USB> pmic: trace %u\n", !dv.quiet);
++			return;
++		}
++		if (!strcmp(arg, "probe") && !dv.batch) {
++			uint8_t id = 0xee;
++			int e = pm_read(PMIC_ID, &id);
++			printf("USB> pmic probe: direct -> %s id 0x%02x\n", e ? "FAIL" : "ok", id);
++			return;
++		}
+ 		if (!strcmp(arg, "probe")) {
+ 			uint32_t hs0 = dv.hs, rd0 = dv.rd10;
+ 			for (uint32_t m = 0; m < 4; m++) {
