@@ -1,0 +1,375 @@
+--- a/bsd/dev/a5xelte_usb.c
++++ b/bsd/dev/a5xelte_usb.c
+@@ -12,6 +12,15 @@
+  *      ring (bsd/dev/a5xelte_emmc.c, which records even when the screen
+  *      console is muted) to the bulk IN endpoint, from the start of the
+  *      boot. Nothing is read from the host (bulk OUT data is dropped).
++ *   3  as 2, and lines the host writes to the port are kernel commands
++ *      (0128): help, info, replay, ps, sample, kill, rd, reboot, recovery.
++ *      Answers are console lines "USB> ...", so they reach the PC in the
++ *      same stream and land in the console ring too. There is no command
++ *      for download mode and none that writes registers or storage.
++ *
++ * Boot-arg a5sample=NAME[,NAME...] (a5usb 2 or 3): print user backtraces
++ * of those processes 90 s after USB start, then every 120 s, ten times
++ * (the donor's sweet_sample.c thread is SWEET-only).
+  *
+  * Hardware (Samsung kernel for SM-G610F, exynos7870.dtsi, pwrcal S5E7870,
+  * phy-exynos-usbdrd.c, phy-samsung-usb3-cal.c, dwc3/core.c):
+@@ -43,6 +52,15 @@
+ extern uint32_t a5xelte_log_copy(uint64_t *pos, uint64_t limit, char *out, uint32_t max);
+ void a5xelte_usb_start(void);
+ 
++#include <sys/proc.h>
++#include <sys/proc_internal.h>
++#include <sys/signalvar.h>
++#include <kern/task.h>
++extern task_t proc_task(proc_t);
++extern void sweet_sample_task(const char *name, int pid, task_t task);  /* osfmk/kern/exception.c */
++struct sync_args;
++extern int sync(proc_t p, struct sync_args *uap, int32_t *retval);   /* bsd/vfs/vfs_syscalls.c */
++
+ /* ---- registers ---- */
+ #define CMU_FSYS_PA             0x13730000
+ #define   USB_PLL_CON0          0x0100          /* 31 enable, 29 locked, M 25:16, P 13:8, S 2:0 */
+@@ -148,6 +166,11 @@
+ 	uint16_t    line_state;     /* DTR bit 0, RTS bit 1 */
+ 	uint8_t     line_coding[7];
+ 	uint64_t    log_pos, tx_bytes;
++	bool        commands;       /* a5usb=3 */
++	char        cmd[128];       /* line being received */
++	uint32_t    cmd_len;
++	bool        cmd_ready;
++	uint32_t    rx_bytes;
+ } ud = {
+ 	.line_coding = { 0x00, 0xc2, 0x01, 0x00, 0, 0, 8 },     /* 115200 8N1 */
+ };
+@@ -589,6 +612,8 @@
+ 	}
+ }
+ 
++static void ud_rx_done(void);
++
+ static void
+ ud_event(uint32_t ev)
+ {
+@@ -620,7 +645,7 @@
+ 	unsigned status = (ev >> 12) & 0xf;
+ 
+ 	if (ep == EP_RX && type == 1) {
+-		ud_rx_arm();            /* host -> phone data is not used */
++		ud_rx_done();
+ 		return;
+ 	}
+ 	if (ep == EP_TX && type == 1) {
+@@ -661,6 +686,271 @@
+ 	}
+ }
+ 
++/* ---- host commands (a5usb=3) ---- */
++
++#define A5_PMU_SWRESET          0x0400
++#define A5_PMU_INFORM2          0x0808
++#define A5_PMU_INFORM3          0x080c
++#define A5_POWER_RESET          0x12345678      /* sec_reboot.c: SEC_POWER_RESET */
++#define A5_REASON_NORMAL        0x12345670      /* SEC_RESET_REASON_UNKNOWN: normal boot */
++#define A5_REASON_RECOVERY      0x12345674      /* SEC_RESET_REASON_RECOVERY: TWRP */
++
++static bool
++ud_name_in(const char *list, const char *name)
++{
++	size_t n = strlen(name);
++	for (const char *t = list; *t;) {
++		const char *end = strchr(t, ',');
++		size_t tl = end ? (size_t)(end - t) : strlen(t);
++		if (tl == n && n > 0 && strncmp(t, name, n) == 0) {
++			return true;
++		}
++		if (!end) {
++			break;
++		}
++		t = end + 1;
++	}
++	return false;
++}
++
++static const char *ud_sample_list;
++static int ud_sample_pid;
++static int ud_sample_hits;
++
++static int
++ud_sample_proc(proc_t p, __unused void *arg)
++{
++	char name[32];
++	int pid = proc_pid(p);
++	proc_name(pid, name, sizeof(name));
++	if ((ud_sample_pid > 0 && pid == ud_sample_pid) ||
++	    (ud_sample_list != NULL && ud_name_in(ud_sample_list, name))) {
++		task_t task = proc_task(p);
++		if (task != TASK_NULL) {
++			sweet_sample_task(name, pid, task);
++			ud_sample_hits++;
++		}
++	}
++	return PROC_RETURNED;
++}
++
++static void
++ud_sample(const char *list, int pid)
++{
++	ud_sample_list = list;
++	ud_sample_pid = pid;
++	ud_sample_hits = 0;
++	proc_iterate(PROC_ALLPROCLIST, ud_sample_proc, NULL, NULL, NULL);
++	printf("USB> sample: %d process(es)\n", ud_sample_hits);
++}
++
++static int ud_ps_count;
++
++static int
++ud_ps_proc(proc_t p, __unused void *arg)
++{
++	char name[32];
++	int pid = proc_pid(p);
++	proc_name(pid, name, sizeof(name));
++	printf("USB> ps %5d %5d %s\n", pid, proc_ppid(p), name);
++	ud_ps_count++;
++	return PROC_RETURNED;
++}
++
++static void
++ud_reset(uint32_t reason, const char *what)
++{
++	printf("USB> %s: syncing file systems\n", what);
++	(void)sync(current_proc(), NULL, NULL);
++	ud_sleep_ms(1500);
++	printf("USB> %s: reset now\n", what);
++	ud_sleep_ms(200);       /* let the last lines go out */
++	reg_wr(ud.pmu, A5_PMU_INFORM2, A5_POWER_RESET);
++	reg_wr(ud.pmu, A5_PMU_INFORM3, reason);
++	reg_wr(ud.pmu, A5_PMU_SWRESET, 1);
++	ud_sleep_ms(1000);
++	printf("USB> %s: still running?\n", what);
++}
++
++/* Read-only register dump; SoC peripheral space only (no DRAM). */
++static void
++ud_rd(uint64_t pa, uint32_t count)
++{
++	static vm_offset_t va;
++	static uint64_t va_page = ~0ull;
++	if (pa < 0x10000000 || pa >= 0x16000000 || (pa & 3)) {
++		printf("USB> rd: address must be 4-aligned in 0x10000000-0x15ffffff\n");
++		return;
++	}
++	if (count == 0) {
++		count = 1;
++	}
++	if (count > 64) {
++		count = 64;
++	}
++	for (uint32_t i = 0; i < count; i++) {
++		uint64_t a = pa + 4ull * i;
++		if (a >= 0x16000000) {
++			break;
++		}
++		if ((a & ~0xfffull) != va_page) {
++			va = ml_io_map((vm_offset_t)(a & ~0xfffull), 0x1000);  /* small leak per new page */
++			va_page = a & ~0xfffull;
++		}
++		if (!va) {
++			printf("USB> rd: map failed\n");
++			va_page = ~0ull;
++			return;
++		}
++		printf("USB> rd 0x%08llx = 0x%08x\n", a, reg_rd(va, (uint32_t)(a & 0xfff)));
++	}
++}
++
++static uint64_t
++ud_num(const char **s)
++{
++	const char *p = *s;
++	uint64_t v = 0;
++	uint64_t base = 10;
++	while (*p == ' ') {
++		p++;
++	}
++	if (p[0] == '0' && (p[1] == 'x' || p[1] == 'X')) {
++		base = 16;
++		p += 2;
++	}
++	for (;; p++) {
++		uint64_t d;
++		if (*p >= '0' && *p <= '9') {
++			d = (uint64_t)(*p - '0');
++		} else if (base == 16 && *p >= 'a' && *p <= 'f') {
++			d = (uint64_t)(*p - 'a' + 10);
++		} else if (base == 16 && *p >= 'A' && *p <= 'F') {
++			d = (uint64_t)(*p - 'A' + 10);
++		} else {
++			break;
++		}
++		v = v * base + d;
++	}
++	*s = p;
++	return v;
++}
++
++static void
++ud_command(char *line)
++{
++	char *arg = strchr(line, ' ');
++	if (arg) {
++		*arg++ = '\0';
++		while (*arg == ' ') {
++			arg++;
++		}
++	} else {
++		arg = line + strlen(line);
++	}
++	if (line[0] == '\0') {
++		return;
++	}
++	printf("USB> $ %s %s\n", line, arg);
++	if (!strcmp(line, "help")) {
++		printf("USB> commands: help | info | replay | ps | sample NAME[,NAME]|PID | "
++		    "kill PID [SIG] | rd PA [N] | reboot | recovery\n");
++	} else if (!strcmp(line, "info")) {
++		uint64_t ns;
++		absolutetime_to_nanoseconds(mach_absolute_time(), &ns);
++		printf("USB> info: up %llu s, console %llu bytes, sent %llu, received %u, DTR %u\n",
++		    ns / NSEC_PER_SEC, a5xelte_log_position(), ud.tx_bytes, ud.rx_bytes, ud.line_state & 1);
++	} else if (!strcmp(line, "replay")) {
++		/* Send the console again from the oldest byte still in the ring. */
++		ud.log_pos = 0;
++		printf("USB> replay: from the start of the ring\n");
++	} else if (!strcmp(line, "ps")) {
++		ud_ps_count = 0;
++		proc_iterate(PROC_ALLPROCLIST, ud_ps_proc, NULL, NULL, NULL);
++		printf("USB> ps: %d processes\n", ud_ps_count);
++	} else if (!strcmp(line, "sample")) {
++		if (*arg >= '0' && *arg <= '9') {
++			const char *s = arg;
++			ud_sample(NULL, (int)ud_num(&s));
++		} else if (*arg) {
++			ud_sample(arg, 0);
++		} else {
++			printf("USB> sample NAME[,NAME] or PID\n");
++		}
++	} else if (!strcmp(line, "kill")) {
++		const char *s = arg;
++		int pid = (int)ud_num(&s);
++		int sig = (int)ud_num(&s);
++		if (sig <= 0 || sig >= NSIG) {
++			sig = SIGKILL;
++		}
++		if (pid <= 1) {
++			printf("USB> kill: refusing pid %d\n", pid);
++			return;
++		}
++		proc_t p = proc_find(pid);
++		if (p == PROC_NULL) {
++			printf("USB> kill: no pid %d\n", pid);
++			return;
++		}
++		psignal(p, sig);
++		proc_rele(p);
++		printf("USB> kill: signal %d sent to %d\n", sig, pid);
++	} else if (!strcmp(line, "rd")) {
++		const char *s = arg;
++		uint64_t pa = ud_num(&s);
++		ud_rd(pa, (uint32_t)ud_num(&s));
++	} else if (!strcmp(line, "reboot")) {
++		ud_reset(A5_REASON_NORMAL, "reboot");
++	} else if (!strcmp(line, "recovery")) {
++		ud_reset(A5_REASON_RECOVERY, "recovery");
++	} else {
++		printf("USB> unknown command '%s' (help)\n", line);
++	}
++}
++
++/* Bulk OUT transfer done: append to the line buffer, re-arm. */
++static void
++ud_rx_done(void)
++{
++	volatile uint32_t *trb = (volatile uint32_t *)(ud.dma + UD_TRB_RX);
++	ud_sync(UD_TRB_RX, 16);
++	uint32_t left = trb[2] & 0xffffff;
++	uint32_t got = left <= UD_RX_SIZE ? UD_RX_SIZE - left : 0;
++	ud_sync(UD_RX, UD_RX_SIZE);
++	const char *in = (const char *)(ud.dma + UD_RX);
++	ud.rx_bytes += got;
++	for (uint32_t i = 0; ud.commands && i < got && !ud.cmd_ready; i++) {
++		char c = in[i];
++		if (c == '\r' || c == '\n') {
++			if (ud.cmd_len > 0) {
++				ud.cmd[ud.cmd_len] = '\0';
++				ud.cmd_ready = true;
++			}
++		} else if (c >= 0x20 && c < 0x7f && ud.cmd_len < sizeof(ud.cmd) - 1) {
++			ud.cmd[ud.cmd_len++] = c;
++		}
++	}
++	if (!ud.cmd_ready) {
++		ud_rx_arm();
++	}
++	/* else ud_thread re-arms after the command ran: one line at a time */
++}
++
++/* a5sample=NAME[,NAME]: periodic backtraces, like the donor's sweetsample. */
++static char ud_sample_names[128];
++
++static void
++ud_sample_thread(void *arg __unused, wait_result_t w __unused)
++{
++	ud_sleep_ms(90 * 1000);
++	for (int i = 0; i < 10; i++) {
++		printf("SMP --- sample %d\n", i);
++		ud_sample(ud_sample_names, 0);
++		ud_sleep_ms(120 * 1000);
++	}
++}
++
+ /*
+  * Bulk IN: the console ring from the start of the boot (or the last 4 MiB),
+  * up to 16 KiB per transfer. Only bytes counted one poll earlier are sent,
+@@ -712,6 +1002,14 @@
+ 			}
+ 			dwc_wr(GEVNTCOUNT, count);
+ 		}
++		if (ud.cmd_ready) {
++			ud_command(ud.cmd);
++			ud.cmd_len = 0;
++			ud.cmd_ready = false;
++			if (ud.configured) {
++				ud_rx_arm();
++			}
++		}
+ 		ud_tx_log(limit);
+ 		limit = a5xelte_log_position();
+ 		if ((++ticks % 60000) == 0) {
+@@ -778,6 +1076,15 @@
+ 	if (kernel_thread_start(ud_thread, NULL, &thread) == KERN_SUCCESS) {
+ 		thread_deallocate(thread);
+ 	}
++	if (PE_parse_boot_argn("a5sample", ud_sample_names, sizeof(ud_sample_names)) &&
++	    ud_sample_names[0] != '\0' && ud_sample_names[0] != '-' &&
++	    kernel_thread_start(ud_sample_thread, NULL, &thread) == KERN_SUCCESS) {
++		thread_deallocate(thread);
++		printf("A5XELTE USB: sampling %s every 120 s\n", ud_sample_names);
++	}
++	if (ud.commands) {
++		printf("A5XELTE USB: host commands on (a5usb=3), type help\n");
++	}
+ }
+ 
+ void
+@@ -806,6 +1113,7 @@
+ 		delay(15 * 1000 * 1000);
+ 		return;
+ 	}
++	ud.commands = (mode >= 3);
+ 	if (usb_power_up() == 0) {
+ 		ud_gadget_start();
+ 	}
