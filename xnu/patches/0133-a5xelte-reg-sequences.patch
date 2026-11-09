@@ -1,0 +1,279 @@
+--- a/bsd/dev/a5xelte_usb.c
++++ b/bsd/dev/a5xelte_usb.c
+@@ -171,7 +171,7 @@
+ 	uint8_t     line_coding[7];
+ 	uint64_t    log_pos, tx_bytes;
+ 	bool        commands;       /* a5usb=3 */
+-	char        cmd[128];       /* line being received */
++	char        cmd[512];       /* line being received ("reg" sequences, 0133) */
+ 	uint32_t    cmd_len;
+ 	bool        cmd_ready;
+ 	uint32_t    rx_bytes;
+@@ -860,6 +860,7 @@
+ 		printf("USB> commands: help | info | replay | ps | sample NAME[,NAME]|PID | "
+ 		    "kill PID [SIG] | rd PA [N] | reboot | recovery\n");
+ 		printf("USB> dvfs: temp | pmic [REG [N]] | cpufreq [MHZ] (343..1586)\n");
++		printf("USB> reg OPS: r PA [N] ; w PA V ; m PA MASK V ; p PA MASK V US ; d US ; i 0|1\n");
+ 	} else if (!strcmp(line, "info")) {
+ 		uint64_t ns;
+ 		absolutetime_to_nanoseconds(mach_absolute_time(), &ns);
+--- a/bsd/dev/a5xelte_dvfs.c
++++ b/bsd/dev/a5xelte_dvfs.c
+@@ -35,6 +35,27 @@
+  * "started", about 3 s, every CPU), with HSI2C_0's GIC lines off. The direct
+  * path does not use the batcher or its semaphore at all.
+  *
++ * 0133: "reg OPS" runs a register sequence from the host, so bring-up
++ * experiments need no new image. OPS are separated by ';':
++ *
++ *   r PA [N]           read N words (max 64)
++ *   w PA V             write
++ *   m PA MASK V        read-modify-write: (old & ~MASK) | (V & MASK)
++ *   p PA MASK V US     poll until (read & MASK) == V, at most US (1 s max)
++ *   d US               delay (1 s max)
++ *   i 0|1              interrupts off/on for the following ops (restored
++ *                      at the end of the line)
++ *
++ * PA is physical, 4-aligned, in 0x10000000-0x15ffffff. A failed poll or a
++ * refused write stops the line. Writes are refused to:
++ *   - the eMMC controllers (0x13540000-0x1356ffff): no storage access, so
++ *     no way to the bootloader, RECOVERY or EFS from here
++ *   - i2c_0 (0x13870000): S2MU005 charger and fuel gauge
++ *   - HSI2C_0 (PMIC bus): the batcher (0x500 up), MANUAL_CMD, CONF without
++ *     auto mode, and AUTO_CONF writes (not reads) longer than one byte. One
++ *     byte can select a PMIC register but never set one; BUCK1 is changed
++ *     only by "cpufreq", clamped to 1.2 V.
++ *
+  * Boot-arg a5cpufreq=MHZ applies a level once, 20 s after USB start.
+  * A thermal guard drops back to 902 MHz at 85 C (checked every second).
+  *
+@@ -118,7 +139,7 @@
+ 	vm_offset_t i2c, cmu[2], sysreg[2], tmu, gicd;
+ 	bool        gic_checked, started;
+ 	volatile bool busy;
+-	char        wcmd[16], warg[64];
++	char        wcmd[16], warg[512];
+ 	int         wake;
+ 	uint32_t    cmd_buf, cmd_idx, cmd_ptr, desc;
+ 	uint32_t    int_en;         /* batcher interrupt enable during a transfer */
+@@ -685,9 +706,200 @@
+ 	return v;
+ }
+ 
++/* ---- "reg": host-driven register sequences ---- */
++
++static struct {
++	uint32_t    page;
++	vm_offset_t va;
++} reg_map[32];
++static uint32_t reg_map_next;
++
++static vm_offset_t
++reg_va(uint32_t pa)
++{
++	uint32_t page = pa & ~0xfffu;
++	for (uint32_t i = 0; i < 32; i++) {
++		if (reg_map[i].va && reg_map[i].page == page) {
++			return reg_map[i].va + (pa & 0xfffu);
++		}
++	}
++	vm_offset_t va = ml_io_map((vm_offset_t)page, 0x1000);
++	if (!va) {
++		return 0;
++	}
++	uint32_t i = reg_map_next++ % 32;       /* an evicted mapping leaks one page of VA */
++	reg_map[i].page = page;
++	reg_map[i].va = va;
++	return va + (pa & 0xfffu);
++}
++
++static const char *
++reg_bad_addr(uint32_t pa)
++{
++	if (pa < 0x10000000u || pa >= 0x16000000u || (pa & 3)) {
++		return "address must be 4-aligned in 0x10000000-0x15ffffff";
++	}
++	return NULL;
++}
++
++static const char *
++reg_deny(uint32_t pa, uint32_t v)
++{
++	const char *e = reg_bad_addr(pa);
++	if (e) {
++		return e;
++	}
++	if (pa >= 0x13540000u && pa < 0x13570000u) {
++		return "eMMC controllers are never written";
++	}
++	if (pa >= 0x13870000u && pa < 0x13871000u) {
++		return "i2c_0 (S2MU005 charger / fuel gauge) is never written";
++	}
++	if (pa >= (uint32_t)HSI2C_PA && pa < (uint32_t)HSI2C_PA + 0x2000u) {
++		uint32_t o = pa - (uint32_t)HSI2C_PA;
++		if (o >= 0x500) {
++			return "HSI2C_0 batcher is not reachable from reg";
++		}
++		if (o == 0x4c) {
++			return "HSI2C_0 MANUAL_CMD is not reachable from reg";
++		}
++		if (o == I2C_CONF && !(v & (1u << 31))) {
++			return "HSI2C_0 CONF must keep auto mode";
++		}
++		if (o == I2C_AUTO && !(v & (1u << 16)) && (v & 0xffffu) != 1) {
++			return "HSI2C_0 writes are one byte at most (PMIC writes: cpufreq)";
++		}
++	}
++	return NULL;
++}
++
++static uint64_t
++reg_us(void)
++{
++	uint64_t ns;
++	absolutetime_to_nanoseconds(mach_absolute_time(), &ns);
++	return ns / 1000;
++}
++
++static void
++reg_run(const char *line)
++{
++	const char *s = line;
++	boolean_t ints = TRUE, ints_off = FALSE;
++	uint32_t n = 0;
++	const char *stop = NULL;
++
++	while (*s && !stop) {
++		while (*s == ' ' || *s == ';') {
++			s++;
++		}
++		if (!*s) {
++			break;
++		}
++		char op = *s++;
++		n++;
++		if (op == 'r') {
++			uint32_t pa = dv_num(&s), cnt = dv_num(&s);
++			if ((stop = reg_bad_addr(pa))) {
++				break;
++			}
++			cnt = cnt ? (cnt > 64 ? 64 : cnt) : 1;
++			for (uint32_t i = 0; i < cnt && pa + 4 * i < 0x16000000u; i++) {
++				vm_offset_t va = reg_va(pa + 4 * i);
++				if (!va) {
++					stop = "map failed";
++					break;
++				}
++				printf("USB> reg r 0x%08x = 0x%08x\n", pa + 4 * i, rd32(va, 0));
++			}
++		} else if (op == 'w' || op == 'm') {
++			uint32_t pa = dv_num(&s), mask = op == 'm' ? dv_num(&s) : ~0u, v = dv_num(&s);
++			if ((stop = reg_bad_addr(pa))) {
++				break;
++			}
++			vm_offset_t va = reg_va(pa);
++			if (!va) {
++				stop = "map failed";
++				break;
++			}
++			uint32_t old = op == 'm' ? rd32(va, 0) : 0;
++			uint32_t nv = op == 'm' ? ((old & ~mask) | (v & mask)) : v;
++			if ((stop = reg_deny(pa, nv))) {
++				break;
++			}
++			wr32(va, 0, nv);
++			if (op == 'm') {
++				printf("USB> reg m 0x%08x: 0x%08x -> 0x%08x\n", pa, old, nv);
++			} else {
++				printf("USB> reg w 0x%08x <- 0x%08x\n", pa, nv);
++			}
++		} else if (op == 'p') {
++			uint32_t pa = dv_num(&s), mask = dv_num(&s), v = dv_num(&s), us = dv_num(&s);
++			if ((stop = reg_bad_addr(pa))) {
++				break;
++			}
++			vm_offset_t va = reg_va(pa);
++			if (!va) {
++				stop = "map failed";
++				break;
++			}
++			if (us > 1000000) {
++				us = 1000000;
++			}
++			uint64_t t0 = reg_us();
++			uint32_t got;
++			for (;;) {
++				got = rd32(va, 0);
++				if ((got & mask) == (v & mask) || reg_us() - t0 >= us) {
++					break;
++				}
++				delay(1);
++			}
++			uint64_t el = reg_us() - t0;
++			printf("USB> reg p 0x%08x = 0x%08x %s after %llu us\n", pa, got,
++			    (got & mask) == (v & mask) ? "ok" : "TIMEOUT", (unsigned long long)el);
++			if ((got & mask) != (v & mask)) {
++				stop = "poll timed out";
++			}
++		} else if (op == 'd') {
++			uint32_t us = dv_num(&s);
++			delay(us > 1000000 ? 1000000 : us);
++		} else if (op == 'i') {
++			uint32_t on = dv_num(&s);
++			if (!on && !ints_off) {
++				ints = ml_set_interrupts_enabled(FALSE);
++				ints_off = TRUE;
++			} else if (on && ints_off) {
++				ml_set_interrupts_enabled(ints);
++				ints_off = FALSE;
++			}
++		} else {
++			stop = "unknown op (r w m p d i)";
++		}
++		while (*s == ' ') {
++			s++;
++		}
++		if (!stop && *s && *s != ';') {
++			stop = "junk after op";
++		}
++	}
++	if (ints_off) {
++		ml_set_interrupts_enabled(ints);
++	}
++	if (stop) {
++		printf("USB> reg: stopped at op %u: %s\n", n, stop);
++	} else {
++		printf("USB> reg: %u op(s) done\n", n);
++	}
++}
++
+ static void
+ dv_run(const char *cmd, const char *arg)
+ {
++	if (!strcmp(cmd, "reg")) {
++		reg_run(arg);
++		return;
++	}
+ 	if (!dv_map()) {
+ 		return;
+ 	}
+@@ -789,7 +1001,9 @@
+ 			continue;
+ 		}
+ 		dv_run(dv.wcmd, dv.warg);
+-		printf("USB> dvfs: '%s %s' finished\n", dv.wcmd, dv.warg);
++		if (strcmp(dv.wcmd, "reg")) {
++			printf("USB> dvfs: '%s %s' finished\n", dv.wcmd, dv.warg);
++		}
+ 		dv.busy = false;
+ 	}
+ }
+@@ -818,7 +1032,7 @@
+ bool
+ a5xelte_dvfs_command(const char *cmd, const char *arg)
+ {
+-	if (strcmp(cmd, "temp") && strcmp(cmd, "pmic") && strcmp(cmd, "cpufreq")) {
++	if (strcmp(cmd, "temp") && strcmp(cmd, "pmic") && strcmp(cmd, "cpufreq") && strcmp(cmd, "reg")) {
+ 		return false;
+ 	}
+ 	dv_post(cmd, arg);
