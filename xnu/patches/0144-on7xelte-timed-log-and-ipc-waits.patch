@@ -1,0 +1,364 @@
+--- a/bsd/dev/a5xelte_emmc.c
++++ b/bsd/dev/a5xelte_emmc.c
+@@ -24,6 +24,8 @@
+ #include <pexpert/device_tree.h>
+ #include <libkern/libkern.h>
+ #include <machine/atomic.h>
++#include <kern/clock.h>
++#include <mach/mach_time.h>
+ 
+ extern vm_offset_t ml_io_map(vm_offset_t phys_addr, vm_size_t size);
+ extern kern_return_t kernel_thread_start(thread_continue_t, void *, thread_t *);
+@@ -624,9 +626,8 @@
+ };
+ 
+ /* _cnputs may execute in any context. Keep this path free of locks and I/O. */
+-void a5xelte_log_append(const char *c, int size);
+-void
+-a5xelte_log_append(const char *c, int size)
++static void
++emmc_log_raw(const char *c, int size)
+ {
+ 	if (size <= 0) {
+ 		return;
+@@ -637,6 +638,65 @@
+ 	}
+ }
+ 
++/*
++ * 0144: every line in the ring (USB log, eMMC log) starts with "[sec.ms] ",
++ * time since boot. Only the ring gets it, the screen does not. The
++ * line-start flag is not locked: two CPUs printing at once may lose or
++ * double a stamp, never more.
++ */
++static uint64_t emmc_log_abs_per_ms;
++static int emmc_log_mid_line;
++
++static void
++emmc_log_stamp(void)
++{
++	char buf[28];
++	int n = (int)sizeof(buf);
++	uint64_t per = emmc_log_abs_per_ms;
++	if (per == 0) {
++		nanoseconds_to_absolutetime(NSEC_PER_MSEC, &per);
++		if (per == 0) {
++			return;         /* timebase not set up yet */
++		}
++		emmc_log_abs_per_ms = per;
++	}
++	uint64_t ms = mach_absolute_time() / per;
++	buf[--n] = ' ';
++	buf[--n] = ']';
++	for (int i = 0; i < 3; i++) {
++		buf[--n] = (char)('0' + ms % 10);
++		ms /= 10;
++	}
++	buf[--n] = '.';
++	do {
++		buf[--n] = (char)('0' + ms % 10);
++		ms /= 10;
++	} while (ms != 0 && n > 1);
++	buf[--n] = '[';
++	emmc_log_raw(buf + n, (int)sizeof(buf) - n);
++}
++
++void a5xelte_log_append(const char *c, int size);
++void
++a5xelte_log_append(const char *c, int size)
++{
++	int start = 0;
++	for (int i = 0; i < size; i++) {
++		if (!emmc_log_mid_line) {
++			emmc_log_mid_line = 1;
++			emmc_log_stamp();
++		}
++		if (c[i] == '\n') {
++			emmc_log_raw(c + start, i + 1 - start);
++			start = i + 1;
++			emmc_log_mid_line = 0;
++		}
++	}
++	if (start < size) {
++		emmc_log_raw(c + start, size - start);
++	}
++}
++
+ /* Console ring readers for bsd/dev/a5xelte_usb.c (lock-free, may lag). */
+ uint64_t a5xelte_log_position(void);
+ uint32_t a5xelte_log_copy(uint64_t *pos, uint64_t limit, char *out, uint32_t max);
+--- a/bsd/kern/kern_exec.c
++++ b/bsd/kern/kern_exec.c
+@@ -7413,7 +7413,12 @@
+ 			}
+ #if defined(ARM64_BOARD_CONFIG_SWEET) || defined(ARM64_BOARD_CONFIG_A5XELTE)
+ 			/* A short line keeps the persistent console ring useful. */
++#if defined(ARM64_BOARD_CONFIG_A5XELTE)
++			/* 0144: with the pid, to pair it with its "exit" line */
++			printf("exec %s pid %d\n", p->p_name, proc_pid(p));
++#else
+ 			printf("exec %s\n", p->p_name);
++#endif
+ #if defined(ARM64_BOARD_CONFIG_A5XELTE)
+ 			{
+ 				/* 0141: no Wi-Fi/BT/audio/modem services (bsd/dev/a5xelte_usb.c, on7deny=) */
+--- a/bsd/kern/kern_exit.c
++++ b/bsd/kern/kern_exit.c
+@@ -131,6 +131,11 @@
+ #include <kern/policy_internal.h>
+ #include <kern/exc_guard.h>
+ #include <kern/backtrace.h>
++#if defined(ARM64_BOARD_CONFIG_A5XELTE)
++#include <kern/clock.h>
++#include <mach/mach_time.h>
++#include <mach/task_info.h>
++#endif
+ 
+ #include <vm/vm_protos.h>
+ #include <os/log.h>
+@@ -2112,6 +2117,27 @@
+ 
+ 	uth = current_uthread();
+ 
++#if defined(ARM64_BOARD_CONFIG_A5XELTE)
++	{
++		/* 0144: how long it lived (since fork) and how much CPU it used */
++		extern kern_return_t task_info(task_t, task_flavor_t, task_info_t,
++		    mach_msg_type_number_t *);
++		struct task_absolutetime_info ti = {};
++		mach_msg_type_number_t cnt = TASK_ABSOLUTETIME_INFO_COUNT;
++		uint64_t now = mach_absolute_time(), lived = 0, cpu = 0;
++		if (p->p_stats != NULL && now > p->p_stats->ps_start) {
++			absolutetime_to_nanoseconds(now - p->p_stats->ps_start, &lived);
++		}
++		if (task != TASK_NULL && task_info(task, TASK_ABSOLUTETIME_INFO,
++		    (task_info_t)&ti, &cnt) == KERN_SUCCESS) {
++			absolutetime_to_nanoseconds(ti.total_user + ti.total_system, &cpu);
++		}
++		printf("exit %s pid %d: lived %llu ms, cpu %llu ms, status 0x%x\n",
++		    p->p_name, proc_pid(p), lived / NSEC_PER_MSEC, cpu / NSEC_PER_MSEC,
++		    (unsigned)p->p_xstat);
++	}
++#endif
++
+ 	proc_lock(p);
+ 	proc_transstart(p, 1, 0);
+ 	if (!(p->p_lflag & P_LEXIT)) {
+--- a/osfmk/kern/thread.h
++++ b/osfmk/kern/thread.h
+@@ -919,6 +919,13 @@
+ #endif /* CONFIG_IOSCHED */
+ 	struct knote            *ith_knote;         /* knote fired for rcv */
+ 
++#if defined(ARM64_BOARD_CONFIG_A5XELTE)
++	/* 0144: request sent, waiting for the reply (osfmk/ipc/mach_msg.c) */
++	uint64_t                a5_rpc_start;       /* mach_absolute_time, 0 = none */
++	int32_t                 a5_rpc_pid;         /* receiver of the request */
++	int32_t                 a5_rpc_msgid;
++	uint32_t                a5_rpc_rep;         /* WAIT lines printed so far */
++#endif
+ };
+ 
+ #define ith_state           saved.receive.state
+--- a/osfmk/ipc/mach_msg.c
++++ b/osfmk/ipc/mach_msg.c
+@@ -116,6 +116,164 @@
+ 
+ #include <libkern/coreanalytics/coreanalytics.h>
+ 
++#if defined(ARM64_BOARD_CONFIG_A5XELTE)
++#include <kern/clock.h>
++#include <mach/mach_time.h>
++
++/*
++ * 0144: who waits for whom. A thread that sends a request and waits for
++ * the reply on its own reply port (send+receive, local port == receive
++ * port) is stamped with the time and the receiver's pid. A watchdog thread
++ * prints the ones still waiting after 2, 5, 10, 20, 40... s:
++ *   WAIT SpringBoard(34) tid 812: 5 s for mediaserverd(28), msg id 1234
++ * and when a reply took 500 ms or more the waiter prints:
++ *   RPC SpringBoard(34) tid 812 -> mediaserverd(28) id 1234: 5210 ms
++ * pid -1 ("kernel") means a kernel object (IOKit, task ports...) or a port
++ * with no receiver right now.
++ */
++extern void proc_name(int pid, char * buf, int size);
++
++#define A5_RPC_SLOW_MS  500
++#define A5_RPC_WD_MAX   32
++
++static int a5_rpc_wd_started;
++static const uint32_t a5_rpc_steps[] = { 2, 5, 10, 20, 40, 80, 160, 320, 640, 1280 };
++#define A5_RPC_NSTEPS   ((uint32_t)(sizeof(a5_rpc_steps) / sizeof(a5_rpc_steps[0])))
++
++struct a5_rpc_seen {
++	uint64_t tid, secs;
++	int pid, dst, msgid;
++};
++
++static void
++a5_rpc_name(int pid, char *buf, int size)
++{
++	if (pid < 0) {
++		strlcpy(buf, "kernel", size);
++		return;
++	}
++	buf[0] = '\0';
++	proc_name(pid, buf, size);
++	if (buf[0] == '\0') {
++		strlcpy(buf, "?", size);
++	}
++}
++
++static void
++a5_rpc_watchdog(void *arg __unused, wait_result_t wr __unused)
++{
++	static struct a5_rpc_seen seen[A5_RPC_WD_MAX];
++	uint64_t per_s = 0;
++
++	for (;;) {
++		assert_wait_timeout((event_t)&a5_rpc_wd_started, THREAD_UNINT,
++		    1000, NSEC_PER_MSEC);
++		thread_block(THREAD_CONTINUE_NULL);
++
++		if (per_s == 0) {
++			nanoseconds_to_absolutetime(NSEC_PER_SEC, &per_s);
++			if (per_s == 0) {
++				continue;
++			}
++		}
++		uint64_t now = mach_absolute_time();
++		int n = 0, more = 0;
++		thread_t thread;
++
++		lck_mtx_lock(&tasks_threads_lock);
++		queue_iterate(&threads, thread, thread_t, threads) {
++			uint64_t start = *(volatile uint64_t *)&thread->a5_rpc_start;
++			if (start == 0 || now <= start) {
++				continue;
++			}
++			uint64_t secs = (now - start) / per_s;
++			uint32_t rep = thread->a5_rpc_rep;
++			if (rep >= A5_RPC_NSTEPS || secs < a5_rpc_steps[rep]) {
++				continue;
++			}
++			while (rep < A5_RPC_NSTEPS && secs >= a5_rpc_steps[rep]) {
++				rep++;
++			}
++			thread->a5_rpc_rep = rep;
++			if (n < A5_RPC_WD_MAX) {
++				seen[n].tid = thread_tid(thread);
++				seen[n].secs = secs;
++				seen[n].pid = task_pid(get_threadtask(thread));
++				seen[n].dst = thread->a5_rpc_pid;
++				seen[n].msgid = thread->a5_rpc_msgid;
++				n++;
++			} else {
++				more++;
++			}
++		}
++		lck_mtx_unlock(&tasks_threads_lock);
++
++		for (int i = 0; i < n; i++) {
++			char me[32], to[32];
++			a5_rpc_name(seen[i].pid, me, sizeof(me));
++			a5_rpc_name(seen[i].dst, to, sizeof(to));
++			printf("WAIT %s(%d) tid %llu: %llu s for %s(%d), msg id %d\n",
++			    me, seen[i].pid, seen[i].tid, seen[i].secs, to, seen[i].dst,
++			    seen[i].msgid);
++		}
++		if (more) {
++			printf("WAIT ... and %d more threads\n", more);
++		}
++	}
++}
++
++static void
++a5_rpc_begin(mach_port_name_t dest, mach_msg_id_t id)
++{
++	thread_t self = current_thread();
++	ipc_port_t port = IP_NULL;
++	int pid = -1;
++
++	if (ipc_port_translate_send(current_space(), dest, &port) == KERN_SUCCESS) {
++		pid = ipc_port_get_receiver_task_locked(port, NULL);
++		ip_mq_unlock(port);
++	}
++	self->a5_rpc_pid = pid;
++	self->a5_rpc_msgid = id;
++	self->a5_rpc_rep = 0;
++	__atomic_store_n(&self->a5_rpc_start, mach_absolute_time(), __ATOMIC_RELEASE);
++
++	if (!__atomic_load_n(&a5_rpc_wd_started, __ATOMIC_RELAXED) &&
++	    !__atomic_exchange_n(&a5_rpc_wd_started, 1, __ATOMIC_ACQ_REL)) {
++		thread_t wd;
++		if (kernel_thread_start(a5_rpc_watchdog, NULL, &wd) == KERN_SUCCESS) {
++			thread_deallocate(wd);
++		}
++	}
++}
++
++static void
++a5_rpc_end(void)
++{
++	thread_t self = current_thread();
++	uint64_t start = self->a5_rpc_start;
++	uint64_t ns = 0, now;
++
++	if (start == 0) {
++		return;
++	}
++	__atomic_store_n(&self->a5_rpc_start, 0, __ATOMIC_RELEASE);
++	now = mach_absolute_time();
++	if (now > start) {
++		absolutetime_to_nanoseconds(now - start, &ns);
++	}
++	if (ns >= A5_RPC_SLOW_MS * NSEC_PER_MSEC) {
++		char me[32], to[32];
++		int mypid = task_pid(current_task());
++		a5_rpc_name(mypid, me, sizeof(me));
++		a5_rpc_name(self->a5_rpc_pid, to, sizeof(to));
++		printf("RPC %s(%d) tid %llu -> %s(%d) id %d: %llu ms\n", me, mypid,
++		    thread_tid(self), to, self->a5_rpc_pid, self->a5_rpc_msgid,
++		    ns / NSEC_PER_MSEC);
++	}
++}
++#endif /* ARM64_BOARD_CONFIG_A5XELTE */
++
+ #ifndef offsetof
+ #define offsetof(type, member)  ((size_t)(&((type *)0)->member))
+ #endif /* offsetof */
+@@ -384,6 +542,9 @@
+ mach_msg_return_t
+ mach_msg_receive_results(void)
+ {
++#if defined(ARM64_BOARD_CONFIG_A5XELTE)
++	a5_rpc_end();   /* 0144: the reply (or an error) is in */
++#endif
+ 	return mach_msg_receive_results_kevent(NULL, NULL, NULL, NULL);
+ }
+ 
+@@ -1187,6 +1348,14 @@
+ 			return MACH_SEND_INVALID_OPTIONS;
+ 		}
+ 
++#if defined(ARM64_BOARD_CONFIG_A5XELTE)
++		/* 0144: a request that waits for its reply on its own reply port */
++		if ((option64 & MACH64_RCV_MSG) &&
++		    user_header.msgh_local_port != MACH_PORT_NULL &&
++		    user_header.msgh_local_port == (mach_port_name_t)(dc_rn >> 32)) {
++			a5_rpc_begin(user_header.msgh_remote_port, user_header.msgh_id);
++		}
++#endif
+ 		/* for scalar send: msg_send_size (from mb_ss) has not been bound checked */
+ 		mr = mach_msg_trap_send(msg_addr, aux_addr, option64,
+ 		    msg_timeout, priority, filter_nonfatal,
+@@ -1235,6 +1404,9 @@
+ 	}
+ 
+ end:
++#if defined(ARM64_BOARD_CONFIG_A5XELTE)
++	a5_rpc_end();   /* 0144: no-op if the receive already ended it */
++#endif
+ 	/* unblock call is idempotent */
+ 	ipc_port_thread_group_unblocked();
+ 	return mr;
