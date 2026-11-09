@@ -1,0 +1,202 @@
+--- a/bsd/dev/a5xelte_dvfs.c
++++ b/bsd/dev/a5xelte_dvfs.c
+@@ -19,6 +19,11 @@
+  *                  BUCK1 voltage is the highest one of the stock ASV table
+  *                  for that level (all groups), never above 1.2 V.
+  *
++ * 0131: the commands run in their own kernel thread, so the USB log keeps
++ * flowing if one of them hangs (xnu15 went silent on "pmic probe"), every
++ * PMIC transfer step is logged, and HSI2C_0's GIC lines (SPI 371/372, no
++ * handler here) are checked and masked before the first transfer.
++ *
+  * Boot-arg a5cpufreq=MHZ applies a level once, 20 s after USB start.
+  * A thermal guard drops back to 902 MHz at 85 C (checked every second).
+  *
+@@ -30,6 +35,8 @@
+ #include <sys/param.h>
+ #include <sys/systm.h>
+ #include <kern/clock.h>
++#include <kern/thread.h>
++#include <kern/sched_prim.h>
+ #include <machine/machine_routines.h>
+ #include <pexpert/pexpert.h>
+ 
+@@ -76,9 +83,15 @@
+ #define EMA_LOW                 0x12492u
+ #define EMA_HIGH                0x1b6d2u    /* pwrcal default when the fuses are 0 */
+ #define TMU_PA                  0x10130000ull
++#define GICD_PA                 0x104e1000ull
++#define HSI2C_INTID_MASK        ((1u << 19) | (1u << 20))  /* INTID 403, 404 in word 12 */
+ 
+ static struct {
+-	vm_offset_t i2c, cmu[2], sysreg[2], tmu;
++	vm_offset_t i2c, cmu[2], sysreg[2], tmu, gicd;
++	bool        gic_checked, started;
++	volatile bool busy;
++	char        wcmd[16], warg[64];
++	int         wake;
+ 	uint32_t    cmd_buf, cmd_idx, cmd_ptr, desc;
+ 	uint32_t    int_en;         /* batcher interrupt enable during a transfer */
+ 	uint32_t    hs, rd10;       /* bus mode, see "pmic mode" */
+@@ -133,7 +146,8 @@
+ 		dv.sysreg[0] = ml_io_map((vm_offset_t)SYSREG_CPUCL0_PA, 0x1000);
+ 		dv.sysreg[1] = ml_io_map((vm_offset_t)SYSREG_CPUCL1_PA, 0x1000);
+ 		dv.tmu = ml_io_map((vm_offset_t)TMU_PA, 0x1000);
+-		dv.mapped = dv.i2c && dv.cmu[0] && dv.cmu[1] && dv.sysreg[0] && dv.sysreg[1] && dv.tmu;
++		dv.gicd = ml_io_map((vm_offset_t)GICD_PA, 0x1000);
++		dv.mapped = dv.i2c && dv.cmu[0] && dv.cmu[1] && dv.sysreg[0] && dv.sysreg[1] && dv.tmu && dv.gicd;
+ 		if (!dv.mapped) {
+ 			printf("USB> dvfs: map failed\n");
+ 		}
+@@ -198,6 +212,17 @@
+ 	vm_offset_t r = dv.i2c;
+ 	uint32_t rd_first, st = 0;
+ 
++	if (!dv.gic_checked) {
++		uint32_t en = rd32(dv.gicd, 0x130);
++		printf("USB> pmic: GIC ISENABLER12 0x%08x (HSI2C_0 SPI 371/372 %s), ITARGETS 0x%08x\n", en,
++		    (en & HSI2C_INTID_MASK) ? "ENABLED, masking" : "off", rd32(dv.gicd, 0x800 + 400));
++		if (en & HSI2C_INTID_MASK) {
++			wr32(dv.gicd, 0x1b0, en & HSI2C_INTID_MASK);
++		}
++		dv.gic_checked = true;
++	}
++	printf("USB> pmic: %s %u byte(s), state 0x%x, i2c trans 0x%x\n", rd ? "read" : "write", len,
++	    rd32(r, HSI2C_BATCHER_STATE), rd32(r, 0x50));
+ 	dv.cmd_buf = 0xffffffff;
+ 	dv.cmd_idx = dv.cmd_ptr = dv.desc = 0;
+ 
+@@ -236,6 +261,7 @@
+ 
+ 	wr32(r, HSI2C_BATCHER_INT_EN, dv.int_en);
+ 	wr32(r, HSI2C_BATCHER_CON, rd32(r, HSI2C_BATCHER_CON) | BAT_START);
++	printf("USB> pmic: started\n");
+ 
+ 	for (int i = 0; i < 50000; i++) {          /* 500 ms, as Linux */
+ 		st = rd32(r, HSI2C_BATCHER_STATE);
+@@ -505,14 +531,11 @@
+ 	return v;
+ }
+ 
+-bool
+-a5xelte_dvfs_command(const char *cmd, const char *arg)
++static void
++dv_run(const char *cmd, const char *arg)
+ {
+-	if (strcmp(cmd, "temp") && strcmp(cmd, "pmic") && strcmp(cmd, "cpufreq")) {
+-		return false;
+-	}
+ 	if (!dv_map()) {
+-		return true;
++		return;
+ 	}
+ 	if (!strcmp(cmd, "temp")) {
+ 		printf("USB> temp: %d C (TMU 0x%08x, trim 0x%08x)\n", dv_temp(),
+@@ -523,7 +546,7 @@
+ 			dv.hs = dv_num(&s) ? 1 : 0;
+ 			dv.rd10 = dv_num(&s) ? 1 : 0;
+ 			printf("USB> pmic: mode hs %u rd10 %u\n", dv.hs, dv.rd10);
+-			return true;
++			return;
+ 		}
+ 		if (!strcmp(arg, "probe")) {
+ 			uint32_t hs0 = dv.hs, rd0 = dv.rd10;
+@@ -537,17 +560,17 @@
+ 			}
+ 			dv.hs = hs0;
+ 			dv.rd10 = rd0;
+-			return true;
++			return;
+ 		}
+ 		if (!strncmp(arg, "int ", 4)) {
+ 			const char *s = arg + 4;
+ 			dv.int_en = dv_num(&s) ? 1 : 0;
+ 			printf("USB> pmic: batcher interrupt enable %u\n", dv.int_en);
+-			return true;
++			return;
+ 		}
+ 		if (*arg == '\0') {
+ 			dv_show();
+-			return true;
++			return;
+ 		}
+ 		const char *s = arg;
+ 		uint32_t reg = dv_num(&s), n = dv_num(&s);
+@@ -576,6 +599,53 @@
+ 			dv_set(dv_num(&s) * 1000);
+ 		}
+ 	}
++}
++
++static void
++dv_worker(void *a __unused, wait_result_t w __unused)
++{
++	for (;;) {
++		if (!dv.busy) {
++			uint64_t deadline;
++			clock_interval_to_deadline(20, NSEC_PER_MSEC, &deadline);
++			(void)assert_wait_deadline(&dv.wake, THREAD_UNINT, deadline);
++			thread_block(THREAD_CONTINUE_NULL);
++			continue;
++		}
++		dv_run(dv.wcmd, dv.warg);
++		printf("USB> dvfs: '%s %s' finished\n", dv.wcmd, dv.warg);
++		dv.busy = false;
++	}
++}
++
++static void
++dv_post(const char *cmd, const char *arg)
++{
++	if (dv.busy) {
++		printf("USB> dvfs: busy with '%s %s'\n", dv.wcmd, dv.warg);
++		return;
++	}
++	if (!dv.started) {
++		thread_t th;
++		if (kernel_thread_start(dv_worker, NULL, &th) != KERN_SUCCESS) {
++			printf("USB> dvfs: no worker thread\n");
++			return;
++		}
++		thread_deallocate(th);
++		dv.started = true;
++	}
++	strlcpy(dv.wcmd, cmd, sizeof(dv.wcmd));
++	strlcpy(dv.warg, arg, sizeof(dv.warg));
++	dv.busy = true;
++}
++
++bool
++a5xelte_dvfs_command(const char *cmd, const char *arg)
++{
++	if (strcmp(cmd, "temp") && strcmp(cmd, "pmic") && strcmp(cmd, "cpufreq")) {
++		return false;
++	}
++	dv_post(cmd, arg);
+ 	return true;
+ }
+ 
+@@ -591,17 +661,17 @@
+ 		}
+ 	}
+ 	if (dv.boot_khz && dv.ticks == 20) {
+-		if (dv_map()) {
+-			printf("USB> cpufreq: a5cpufreq=%u\n", dv.boot_khz / 1000);
+-			dv_set(dv.boot_khz);
+-		}
++		char a[16];
++		snprintf(a, sizeof(a), "%u", dv.boot_khz / 1000);
++		printf("USB> cpufreq: a5cpufreq=%s\n", a);
++		dv_post("cpufreq", a);
+ 		dv.boot_khz = 0;
+ 	}
+ 	if (dv.cur_khz > 902000 && dv.mapped) {
+ 		int t = dv_temp();
+-		if (t >= 85) {
++		if (t >= 85 && !dv.busy) {
+ 			printf("USB> cpufreq: %d C, back to 902 MHz\n", t);
+-			dv_set(902000);
++			dv_post("cpufreq", "902");
+ 		}
+ 	}
+ }
