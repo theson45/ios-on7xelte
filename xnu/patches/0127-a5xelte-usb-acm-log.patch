@@ -1,0 +1,883 @@
+--- a/bsd/conf/files
++++ b/bsd/conf/files
+@@ -108,6 +108,7 @@
+ bsd/dev/a5xelte_emmc.c			standard
+ bsd/dev/a5xelte_keys.c			standard
+ bsd/dev/a5xelte_touch.c			standard
++bsd/dev/a5xelte_usb.c			standard
+ bsd/dev/sweet_sample.c			standard
+ bsd/dev/sweet_keys.c			standard
+ bsd/dev/sweet_touch.c			standard
+--- a/bsd/dev/a5xelte_emmc.c
++++ b/bsd/dev/a5xelte_emmc.c
+@@ -637,6 +637,37 @@
+ 	}
+ }
+ 
++/* Console ring readers for bsd/dev/a5xelte_usb.c (lock-free, may lag). */
++uint64_t a5xelte_log_position(void);
++uint32_t a5xelte_log_copy(uint64_t *pos, uint64_t limit, char *out, uint32_t max);
++uint64_t
++a5xelte_log_position(void)
++{
++	return os_atomic_load(&emmc_log_total, relaxed);
++}
++
++/* Copy bytes [*pos, limit) of the console stream, at most max; skips what
++ * the ring has already overwritten. */
++uint32_t
++a5xelte_log_copy(uint64_t *pos, uint64_t limit, char *out, uint32_t max)
++{
++	if (limit > os_atomic_load(&emmc_log_total, relaxed) || *pos >= limit) {
++		return 0;
++	}
++	if (limit - *pos > A5_LOG_SIZE) {
++		*pos = limit - A5_LOG_SIZE;
++	}
++	uint64_t n = limit - *pos;
++	if (n > max) {
++		n = max;
++	}
++	for (uint64_t i = 0; i < n; i++) {
++		out[i] = emmc_log_ring[(*pos + i) % A5_LOG_SIZE];
++	}
++	*pos += n;
++	return (uint32_t)n;
++}
++
+ struct a5_log_header {
+ 	char magic[8];
+ 	uint32_t version, size;
+@@ -711,6 +742,8 @@
+ 	}
+ }
+ 
++extern void a5xelte_usb_start(void);   /* bsd/dev/a5xelte_usb.c, boot-arg a5usb */
++
+ int
+ a5xelte_emmc_rootdev(dev_t *dev)
+ {
+@@ -738,6 +771,7 @@
+ 		printf("A5XELTE eMMC: /dev/emmcroot0 ready, GPT %s %s\n",
+ 		    emmc_partition_name, emmc_writable ? "writable" : "read-only");
+ 		emmc_log_start();
++		a5xelte_usb_start();
+ 	}
+ 	*dev = emmc_bdev;
+ 	return 0;
+--- /dev/null
++++ b/bsd/dev/a5xelte_usb.c
+@@ -0,0 +1,813 @@
++/*
++ * on7xelte (Exynos 7870): live kernel console over USB as a CDC-ACM serial
++ * port (Windows: in-box usbser.sys "USB Serial Device (COMn)"; Linux:
++ * /dev/ttyACM0; macOS: /dev/cu.usbmodem*).
++ *
++ * Boot-arg a5usb:
++ *   0 (default) off.
++ *   1  read-only probe: print the CMU / PMU state of the USB block and,
++ *      only when its bus clocks are on, the DWC3 and PHY registers; then
++ *      wait 15 s so the screen can be photographed. Writes nothing.
++ *   2  bring the controller up in device mode and stream the console
++ *      ring (bsd/dev/a5xelte_emmc.c, which records even when the screen
++ *      console is muted) to the bulk IN endpoint, from the start of the
++ *      boot. Nothing is read from the host (bulk OUT data is dropped).
++ *
++ * Hardware (Samsung kernel for SM-G610F, exynos7870.dtsi, pwrcal S5E7870,
++ * phy-exynos-usbdrd.c, phy-samsung-usb3-cal.c, dwc3/core.c):
++ *   DWC3 (USB 2.0 only, high speed) at 0x13600000, IRQ SPI 230 (unused:
++ *   events are polled), USB DRD PHY "USBCON" v0x210 at 0x135c0000, PHY
++ *   power switch PMU 0x10480704 bit 1, clocks in CMU_FSYS 0x13730000 and
++ *   CMU_MIF 0x10460000. The board has no VBUS pad (is_not_vbus_pad): VBUS
++ *   valid is forced in the PHY. The PHY reference is USB_PLL; its rate is
++ *   computed from USB_PLL_CON0 (OSCCLK 26 MHz).
++ * The device-side control transfer state machine and DMA handling come from
++ * the donor's bsd/dev/sweet_usb.c (DWC3 on Qualcomm), with ECM replaced by
++ * ACM.
++ */
++#if defined(ARM64_BOARD_CONFIG_A5XELTE)
++#include <sys/param.h>
++#include <sys/systm.h>
++#include <kern/clock.h>
++#include <kern/thread.h>
++#include <kern/sched_prim.h>
++#include <machine/machine_routines.h>
++#include <arm/caches_internal.h>
++#include <vm/pmap.h>
++#include <vm/vm_kern.h>
++#include <pexpert/pexpert.h>
++
++extern vm_offset_t ml_io_map(vm_offset_t, vm_size_t);
++extern ppnum_t pmap_find_phys(pmap_t pmap, addr64_t va);
++extern uint64_t a5xelte_log_position(void);
++extern uint32_t a5xelte_log_copy(uint64_t *pos, uint64_t limit, char *out, uint32_t max);
++void a5xelte_usb_start(void);
++
++/* ---- registers ---- */
++#define CMU_FSYS_PA             0x13730000
++#define   USB_PLL_CON0          0x0100          /* 31 enable, 29 locked, M 25:16, P 13:8, S 2:0 */
++#define   MUX_USB_PLL           0x0200          /* 12 select USB_PLL, 21 enable */
++#define   MUX_PHYCLK_USER       0x0230          /* 12 select PHY 60 MHz clock, 21 enable */
++#define   EN_FSYS_BUS           0x0804          /* 21 HCLK_USB20_CTRL, 20 ACLK_HSDRD */
++#define   EN_USB20DRD_REFCLK    0x0828          /* 0 */
++#define   EN_USB20DRD_PHYCLK    0x0830          /* 0 */
++#define CMU_MIF_PA              0x10460000
++#define   MUX_FSYS_BUS          0x0284
++#define   MUX_USB20DRD_REFCLK   0x029c          /* 21 enable */
++#define   DIV_USB20DRD_REFCLK   0x049c
++#define   EN_CMU_FSYS_BUS       0x0884          /* 0 */
++#define   EN_CMU_USB20DRD_REFCLK 0x089c         /* 0 */
++#define PMU_PA                  0x10480000
++#define   PMU_USBDEV_PHY_CTRL   0x0704          /* 1 USB2 PHY enable */
++#define DWC3_PA                 0x13600000
++#define DWC3_SIZE               0x10000
++#define PHY_PA                  0x135c0000
++#define   LINKSYSTEM            0x04
++#define   PHYUTMI               0x08
++#define   PHYCLKRST             0x10
++#define   PHYPARAM0             0x1c
++#define   LINKPORT              0x44
++#define   HSPHYCTRL             0x54
++#define   HSPHYPLLTUNE          0x70
++
++#define GSNPSID         0xc120
++#define GCTL            0xc110
++#define GSTS            0xc118
++#define GUSB2PHYCFG     0xc200
++#define GUSB3PIPECTL    0xc2c0
++#define GHWPARAMS0      0xc140
++#define GHWPARAMS1      0xc144
++#define GHWPARAMS3      0xc14c
++#define GEVNTADRLO      0xc400
++#define GEVNTADRHI      0xc404
++#define GEVNTSIZ        0xc408
++#define GEVNTCOUNT      0xc40c
++#define DCFG            0xc700
++#define DCTL            0xc704
++#define DEVTEN          0xc708
++#define DSTS            0xc70c
++#define DALEPENA        0xc720
++#define DEPCMDPAR2(n)   (0xc800 + 0x10 * (n))
++#define DEPCMDPAR1(n)   (0xc804 + 0x10 * (n))
++#define DEPCMDPAR0(n)   (0xc808 + 0x10 * (n))
++#define DEPCMD(n)       (0xc80c + 0x10 * (n))
++
++#define DCTL_RUN_STOP   (1u << 31)
++#define DCTL_CSFTRST    (1u << 30)
++#define DSTS_DEVCTRLHLT (1u << 22)
++
++#define DEPCMD_SETEPCONFIG      1
++#define DEPCMD_SETTRANSFRESOURCE 2
++#define DEPCMD_SETSTALL         4
++#define DEPCMD_STARTTRANSFER    6
++#define DEPCMD_DEPSTARTCFG      9
++#define DEPCMD_CMDACT           (1u << 10)
++
++#define TRB_HWO         (1u << 0)
++#define TRB_LST         (1u << 1)
++#define TRB_ISP_IMI     (1u << 10)
++#define TRB_IOC         (1u << 11)
++#define TRBCTL_NORMAL   (1u << 4)
++#define TRBCTL_SETUP    (2u << 4)
++#define TRBCTL_STATUS2  (3u << 4)
++#define TRBCTL_STATUS3  (4u << 4)
++#define TRBCTL_DATA     (5u << 4)
++
++/* DMA area layout */
++#define UD_EVT          0x0000          /* event buffer, 4 KiB */
++#define UD_EVT_SIZE     0x1000
++#define UD_TRB_OUT      0x1000          /* ep0 OUT */
++#define UD_TRB_IN       0x1010          /* ep0 IN */
++#define UD_TRB_RX       0x1020          /* ep1 OUT bulk */
++#define UD_TRB_TX       0x1030          /* ep1 IN bulk */
++#define UD_SETUP        0x1040          /* 8-byte setup packet */
++#define UD_DATA         0x1100          /* ep0 data stage, 512 bytes */
++#define UD_RX           0x2000          /* bulk OUT, dropped */
++#define UD_RX_SIZE      0x0200
++#define UD_TX           0x4000          /* bulk IN */
++#define UD_TX_MAX       0x3fff          /* never a multiple of 512: no ZLP needed */
++#define UD_SIZE         0x8000
++
++/* Physical endpoints: 2n = OUT, 2n+1 = IN */
++#define EP_RX           2               /* 0x01 bulk OUT */
++#define EP_TX           3               /* 0x81 bulk IN */
++#define EP_INT          5               /* 0x82 interrupt IN (never used) */
++
++static struct {
++	vm_offset_t dwc, phy, fsys, mif, pmu;
++	vm_offset_t dma;
++	uint64_t    dma_pa;
++	uint32_t    evt_pos;
++	int         sleep_chan;
++	enum { EP0_SETUP, EP0_DATA, EP0_WAIT_STATUS2, EP0_WAIT_STATUS3, EP0_STATUS } state;
++	bool        data_in;
++	uint8_t     pending_req;    /* class request with an OUT data stage */
++	uint32_t    events;
++	bool        configured;
++	bool        tx_busy;
++	uint16_t    line_state;     /* DTR bit 0, RTS bit 1 */
++	uint8_t     line_coding[7];
++	uint64_t    log_pos, tx_bytes;
++} ud = {
++	.line_coding = { 0x00, 0xc2, 0x01, 0x00, 0, 0, 8 },     /* 115200 8N1 */
++};
++
++static uint32_t
++rd(vm_offset_t base, uint32_t off)
++{
++	uint32_t v = *(volatile uint32_t *)(base + off);
++	__asm__ volatile ("dmb oshld" ::: "memory");
++	return v;
++}
++
++static void
++wr(vm_offset_t base, uint32_t off, uint32_t v)
++{
++	*(volatile uint32_t *)(base + off) = v;
++	__asm__ volatile ("dsb sy" ::: "memory");
++}
++
++static void
++setbits(vm_offset_t base, uint32_t off, uint32_t set, uint32_t clear)
++{
++	wr(base, off, (rd(base, off) & ~clear) | set);
++}
++
++#define dwc_rd(off)     rd(ud.dwc, (off))
++#define dwc_wr(off, v)  wr(ud.dwc, (off), (v))
++
++/* USB_PLL output in kHz, from its PMS (pll141xx: 26 MHz * M / (P << S)). */
++static uint32_t
++usb_pll_khz(uint32_t con0)
++{
++	uint32_t m = (con0 >> 16) & 0x3ff, p = (con0 >> 8) & 0x3f, s = con0 & 7;
++	if (p == 0) {
++		return 0;
++	}
++	return (uint32_t)(26000ull * m / ((uint64_t)p << s));
++}
++
++/* USBCON PHYCLKRST.FSEL code for the reference rate, or -1. */
++static int
++phy_fsel(uint32_t khz)
++{
++	switch (khz) {
++	case 9600: return 0x0;
++	case 10000: return 0x1;
++	case 12000: return 0x2;
++	case 19200: return 0x3;
++	case 20000: return 0x4;
++	case 24000: return 0x5;
++	case 26000: return 0x82 & 0x3f;
++	case 50000: return 0x7;
++	default: return -1;
++	}
++}
++
++static bool
++usb_bus_clocks_on(void)
++{
++	uint32_t bus = rd(ud.fsys, EN_FSYS_BUS);
++	return (rd(ud.mif, EN_CMU_FSYS_BUS) & 1) && (bus & (1u << 20)) && (bus & (1u << 21));
++}
++
++static void
++usb_probe_print(void)
++{
++	uint32_t pll = rd(ud.fsys, USB_PLL_CON0);
++	printf("A5XELTE USB: USB_PLL_CON0 0x%08x (%u kHz%s%s) MUX_USB_PLL 0x%08x MUX_PHYCLK 0x%08x\n",
++	    pll, usb_pll_khz(pll), (pll & (1u << 31)) ? ", on" : ", off",
++	    (pll & (1u << 29)) ? ", locked" : "", rd(ud.fsys, MUX_USB_PLL), rd(ud.fsys, MUX_PHYCLK_USER));
++	printf("A5XELTE USB: FSYS EN_BUS 0x%08x EN_REFCLK 0x%08x EN_PHYCLK 0x%08x\n",
++	    rd(ud.fsys, EN_FSYS_BUS), rd(ud.fsys, EN_USB20DRD_REFCLK), rd(ud.fsys, EN_USB20DRD_PHYCLK));
++	printf("A5XELTE USB: MIF MUX_BUS 0x%08x MUX_REF 0x%08x DIV_REF 0x%08x EN_BUS 0x%08x EN_REF 0x%08x\n",
++	    rd(ud.mif, MUX_FSYS_BUS), rd(ud.mif, MUX_USB20DRD_REFCLK), rd(ud.mif, DIV_USB20DRD_REFCLK),
++	    rd(ud.mif, EN_CMU_FSYS_BUS), rd(ud.mif, EN_CMU_USB20DRD_REFCLK));
++	printf("A5XELTE USB: PMU USBDEV_PHY_CONTROL 0x%08x\n", rd(ud.pmu, PMU_USBDEV_PHY_CTRL));
++	if (!usb_bus_clocks_on()) {
++		printf("A5XELTE USB: USB bus clocks off; DWC3 and PHY not read\n");
++		return;
++	}
++	printf("A5XELTE USB: DWC3 GSNPSID 0x%08x GCTL 0x%08x GSTS 0x%08x GUSB2PHYCFG 0x%08x\n",
++	    dwc_rd(GSNPSID), dwc_rd(GCTL), dwc_rd(GSTS), dwc_rd(GUSB2PHYCFG));
++	printf("A5XELTE USB: DWC3 DCFG 0x%08x DCTL 0x%08x DSTS 0x%08x HWP0 0x%08x HWP1 0x%08x HWP3 0x%08x\n",
++	    dwc_rd(DCFG), dwc_rd(DCTL), dwc_rd(DSTS), dwc_rd(GHWPARAMS0), dwc_rd(GHWPARAMS1), dwc_rd(GHWPARAMS3));
++	printf("A5XELTE USB: PHY LINKSYSTEM 0x%08x PHYUTMI 0x%08x PHYCLKRST 0x%08x PHYPARAM0 0x%08x HSPHYCTRL 0x%08x\n",
++	    rd(ud.phy, LINKSYSTEM), rd(ud.phy, PHYUTMI), rd(ud.phy, PHYCLKRST), rd(ud.phy, PHYPARAM0),
++	    rd(ud.phy, HSPHYCTRL));
++}
++
++/*
++ * Clocks, PHY power and PHY init in the order of the Linux driver
++ * (exynos_usbdrd_pipe3_init + samsung_exynos_cal_usb3phy_enable/tune_dev
++ * for USBCON v0x210, refsel CLKCORE, then the PHY clock user mux), with the
++ * DWC3 core and PHY interface held in reset meanwhile (dwc3_core_soft_reset).
++ */
++static int
++usb_power_up(void)
++{
++	/* CMU_MIF: USB20DRD reference clock mux gate and gate (FSYS bus is on: eMMC). */
++	setbits(ud.mif, MUX_USB20DRD_REFCLK, 1u << 21, 0);
++	setbits(ud.mif, EN_CMU_USB20DRD_REFCLK, 1, 0);
++	/* CMU_FSYS: controller bus clocks and reference clock gate. */
++	setbits(ud.fsys, EN_FSYS_BUS, (1u << 20) | (1u << 21), 0);
++	setbits(ud.fsys, EN_USB20DRD_REFCLK, 1, 0);
++
++	uint32_t pll = rd(ud.fsys, USB_PLL_CON0);
++	int fsel = phy_fsel(usb_pll_khz(pll));
++	if (fsel < 0) {
++		printf("A5XELTE USB: USB_PLL_CON0 0x%08x gives %u kHz, no PHY FSEL for it\n", pll, usb_pll_khz(pll));
++		return -1;
++	}
++	if (!(pll & (1u << 31))) {
++		wr(ud.fsys, USB_PLL_CON0, pll | (1u << 31));
++	}
++	for (int i = 0; i < 1000 && !(rd(ud.fsys, USB_PLL_CON0) & (1u << 29)); i++) {
++		delay(10);
++	}
++	if (!(rd(ud.fsys, USB_PLL_CON0) & (1u << 29))) {
++		printf("A5XELTE USB: USB_PLL does not lock (0x%08x)\n", rd(ud.fsys, USB_PLL_CON0));
++		return -1;
++	}
++	setbits(ud.fsys, MUX_USB_PLL, (1u << 12) | (1u << 21), 0);
++	delay(10);
++
++	/* PHY power switch in the PMU. */
++	setbits(ud.pmu, PMU_USBDEV_PHY_CTRL, 1u << 1, 0);
++	delay(100);
++
++	uint32_t id = dwc_rd(GSNPSID);
++	if ((id & 0xffff0000) != 0x55330000) {
++		printf("A5XELTE USB: no DWC3 (GSNPSID 0x%08x)\n", id);
++		return -1;
++	}
++
++	/* Device controller soft reset, then core and PHY interface reset. */
++	dwc_wr(DCTL, DCTL_CSFTRST);
++	for (int i = 0; i < 500 && (dwc_rd(DCTL) & DCTL_CSFTRST); i++) {
++		delay(1000);
++	}
++	setbits(ud.dwc, GCTL, 1u << 11, 0);
++	setbits(ud.dwc, GUSB3PIPECTL, 1u << 31, 0);
++	setbits(ud.dwc, GUSB2PHYCFG, 1u << 31, 0);
++
++	/* PHY: reference clock, PLL tune, port reset pulse. */
++	uint32_t clkrst = rd(ud.phy, PHYCLKRST);
++	clkrst |= 1u << 1;                                      /* PORTRESET */
++	clkrst = (clkrst & ~(3u << 2)) | (2u << 2);             /* REFCLKSEL = CLKCORE */
++	clkrst = (clkrst & ~(0x3fu << 5)) | ((uint32_t)fsel << 5);
++	clkrst |= (1u << 31) | 1u;                              /* EN_UTMISUSPEND, COMMONONN */
++	uint32_t plltune = rd(ud.phy, HSPHYPLLTUNE);
++	if (fsel == 0x5) {
++		plltune |= 1u << 6;                             /* PLL_B_TUNE for 24 MHz */
++	} else {
++		plltune &= ~(1u << 6);
++	}
++	plltune |= 0xe;                                         /* PLL_P_TUNE(0xe) */
++	wr(ud.phy, HSPHYPLLTUNE, plltune);
++	wr(ud.phy, PHYCLKRST, clkrst);
++	delay(10);
++	wr(ud.phy, PHYCLKRST, clkrst & ~(1u << 1));
++	/* Out of SIDDQ and software reset. */
++	setbits(ud.phy, HSPHYCTRL, 0, (1u << 6) | (1u << 0) | (1u << 31));
++	delay(500);
++	/* No VBUS pad: force VBUS / B-session valid. */
++	setbits(ud.phy, LINKSYSTEM, (1u << 7) | (1u << 8), 0);
++	/* UTMI: leave sleep/suspend, no pull-downs, external VBUS valid, OTG off. */
++	setbits(ud.phy, PHYUTMI, (1u << 10) | (1u << 9) | (1u << 6),
++	    (1u << 0) | (1u << 1) | (1u << 2) | (1u << 3) | (1u << 4));
++	/* Over-current from the controller, not a pad. */
++	setbits(ud.phy, LINKPORT, (1u << 3) | (1u << 2), 0);
++	setbits(ud.phy, HSPHYCTRL, 1u << 0, 0);
++	delay(20);
++	setbits(ud.phy, HSPHYCTRL, 0, 1u << 0);
++	/* Device-mode tuning (fill_hstune + set_hstune DEV for 7870), FLADJ. */
++	setbits(ud.phy, LINKSYSTEM, (0x20u << 1) | (1u << 27), 0x3fu << 1);
++	uint32_t p0 = rd(ud.phy, PHYPARAM0) & ~((0xfu << 22) | (3u << 20) | (3u << 18) | (1u << 17) |
++	    (3u << 15) | (3u << 13) | (0xfu << 9) | (7u << 6) | (7u << 3) | 7u);
++	p0 |= (0xeu << 22) | (1u << 20) | (2u << 18) | (0u << 15) | (0u << 13) | (3u << 9) |
++	    (6u << 6) | (2u << 3) | 3u;
++	wr(ud.phy, PHYPARAM0, p0);
++
++	/* PHY clock to the controller: user mux and gate. */
++	setbits(ud.fsys, MUX_PHYCLK_USER, (1u << 12) | (1u << 21), 0);
++	setbits(ud.fsys, EN_USB20DRD_PHYCLK, 1, 0);
++
++	delay(100000);
++	setbits(ud.dwc, GUSB3PIPECTL, 0, 1u << 31);
++	setbits(ud.dwc, GUSB2PHYCFG, 0, 1u << 31);
++	delay(100000);
++	setbits(ud.dwc, GCTL, 0, 1u << 11);
++
++	/* Device role; no scale-down, scrambling on; USB2 PHY never suspended. */
++	setbits(ud.dwc, GCTL, 2u << 12, (3u << 12) | (3u << 4) | (1u << 3));
++	setbits(ud.dwc, GUSB2PHYCFG, 0, 1u << 6);
++	printf("A5XELTE USB: powered, DWC3 0x%08x GCTL 0x%08x GUSB2PHYCFG 0x%08x PHYCLKRST 0x%08x PHYUTMI 0x%08x\n",
++	    id, dwc_rd(GCTL), dwc_rd(GUSB2PHYCFG), rd(ud.phy, PHYCLKRST), rd(ud.phy, PHYUTMI));
++	return 0;
++}
++
++/* ---- device controller (from the donor's sweet_usb.c) ---- */
++
++static void
++ud_sync(uint32_t off, uint32_t len)
++{
++	flush_dcache64((addr64_t)(ud.dma_pa + off), len, TRUE);
++}
++
++static void
++ud_sleep_ms(unsigned ms)
++{
++	uint64_t deadline;
++	clock_interval_to_deadline(ms, NSEC_PER_MSEC, &deadline);
++	(void)assert_wait_deadline(&ud.sleep_chan, THREAD_UNINT, deadline);
++	thread_block(THREAD_CONTINUE_NULL);
++}
++
++static int
++ud_epcmd(unsigned ep, uint32_t cmd, uint32_t p0, uint32_t p1, uint32_t p2)
++{
++	dwc_wr(DEPCMDPAR0(ep), p0);
++	dwc_wr(DEPCMDPAR1(ep), p1);
++	dwc_wr(DEPCMDPAR2(ep), p2);
++	dwc_wr(DEPCMD(ep), cmd | DEPCMD_CMDACT);
++	for (int i = 0; i < 1000; i++) {
++		uint32_t v = dwc_rd(DEPCMD(ep));
++		if (!(v & DEPCMD_CMDACT)) {
++			uint32_t status = (v >> 12) & 0xf;
++			if (status) {
++				printf("A5XELTE USB: ep%u cmd 0x%x status %u\n", ep, cmd & 0xf, status);
++				return -1;
++			}
++			return 0;
++		}
++		delay(1);
++	}
++	printf("A5XELTE USB: ep%u cmd 0x%x timeout\n", ep, cmd & 0xf);
++	return -1;
++}
++
++static void
++ud_start_trb(unsigned ep, uint32_t trb, uint32_t buf, uint32_t len, uint32_t ctl)
++{
++	volatile uint32_t *t = (volatile uint32_t *)(ud.dma + trb);
++	uint64_t bpa = ud.dma_pa + buf;
++
++	t[0] = (uint32_t)bpa;
++	t[1] = (uint32_t)(bpa >> 32);
++	t[2] = len;
++	t[3] = ctl | TRB_HWO | TRB_LST | TRB_ISP_IMI | TRB_IOC;
++	ud_sync(trb, 16);
++	if (len) {
++		ud_sync(buf, len);
++	}
++	uint64_t tpa = ud.dma_pa + trb;
++	ud_epcmd(ep, DEPCMD_STARTTRANSFER, (uint32_t)(tpa >> 32), (uint32_t)tpa, 0);
++}
++
++static void
++ud_start(unsigned ep, uint32_t buf, uint32_t len, uint32_t ctl)
++{
++	ud_start_trb(ep, ep ? UD_TRB_IN : UD_TRB_OUT, buf, len, ctl);
++}
++
++static void
++ud_start_setup(void)
++{
++	ud.state = EP0_SETUP;
++	ud_start(0, UD_SETUP, 8, TRBCTL_SETUP);
++}
++
++static void
++ud_stall(void)
++{
++	ud_epcmd(0, DEPCMD_SETSTALL, 0, 0, 0);
++	ud_start_setup();
++}
++
++/*
++ * CDC-ACM: device class 2 (Windows 10+ binds usbser.sys to it without an
++ * .inf), communication interface 0 with an interrupt endpoint, data
++ * interface 1 with bulk IN/OUT. VID 0x1209 / PID 0x0002 = pid.codes test
++ * ID, not a product.
++ */
++static const uint8_t ud_dev_desc[18] = {
++	18, 1, 0x00, 0x02, 0x02, 0x00, 0x00, 64,
++	0x09, 0x12, 0x02, 0x00, 0x00, 0x01, 1, 2, 3, 1,
++};
++static const uint8_t ud_cfg_desc[67] = {
++	9, 2, 67, 0, 2, 1, 0, 0x80, 250,                /* config: 2 interfaces, 500 mA */
++	9, 4, 0, 0, 1, 0x02, 0x02, 0x01, 0,             /* comm interface 0: CDC ACM, AT commands */
++	5, 0x24, 0x00, 0x10, 0x01,                      /* header, CDC 1.10 */
++	5, 0x24, 0x01, 0x00, 1,                         /* call management: data interface 1 */
++	4, 0x24, 0x02, 0x02,                            /* ACM: line coding + control line state */
++	5, 0x24, 0x06, 0, 1,                            /* union: control 0, data 1 */
++	7, 5, 0x82, 0x03, 16, 0, 9,                     /* ep 0x82 interrupt IN */
++	9, 4, 1, 0, 2, 0x0a, 0x00, 0x00, 0,             /* data interface 1 */
++	7, 5, 0x81, 0x02, 0x00, 0x02, 0,                /* ep 0x81 bulk IN, 512 */
++	7, 5, 0x01, 0x02, 0x00, 0x02, 0,                /* ep 0x01 bulk OUT, 512 */
++};
++static const char *const ud_strings[] = {
++	NULL, "ios-on7xelte", "J7 Prime iOS kernel log", "0001",
++};
++
++static uint32_t
++ud_string(unsigned idx, uint8_t *out)
++{
++	if (idx == 0) {
++		out[0] = 4; out[1] = 3; out[2] = 0x09; out[3] = 0x04;   /* en-US */
++		return 4;
++	}
++	if (idx >= sizeof(ud_strings) / sizeof(ud_strings[0])) {
++		return 0;
++	}
++	const char *str = ud_strings[idx];
++	uint32_t n = 2;
++	for (; *str && n < 126; str++) {
++		out[n++] = (uint8_t)*str;
++		out[n++] = 0;
++	}
++	out[0] = (uint8_t)n;
++	out[1] = 3;
++	return n;
++}
++
++static void
++ud_rx_arm(void)
++{
++	ud_start_trb(EP_RX, UD_TRB_RX, UD_RX, UD_RX_SIZE, TRBCTL_NORMAL);
++}
++
++/* SET_CONFIGURATION(1): bulk IN/OUT and the interrupt endpoint. */
++static void
++ud_configure(void)
++{
++	if (ud.configured) {
++		return;
++	}
++	if (ud_epcmd(0, DEPCMD_DEPSTARTCFG | (2u << 16), 0, 0, 0) ||
++	    ud_epcmd(EP_RX, DEPCMD_SETEPCONFIG, (2u << 1) | (512u << 3), (1u << 8) | ((uint32_t)EP_RX << 25), 0) ||
++	    ud_epcmd(EP_RX, DEPCMD_SETTRANSFRESOURCE, 1, 0, 0) ||
++	    ud_epcmd(EP_TX, DEPCMD_SETEPCONFIG, (2u << 1) | (512u << 3) | (1u << 17), (1u << 8) | ((uint32_t)EP_TX << 25), 0) ||
++	    ud_epcmd(EP_TX, DEPCMD_SETTRANSFRESOURCE, 1, 0, 0) ||
++	    ud_epcmd(EP_INT, DEPCMD_SETEPCONFIG, (3u << 1) | (16u << 3) | (2u << 17),
++	    (1u << 8) | (8u << 16) | ((uint32_t)EP_INT << 25), 0) ||
++	    ud_epcmd(EP_INT, DEPCMD_SETTRANSFRESOURCE, 1, 0, 0)) {
++		printf("A5XELTE USB: data endpoints setup failed\n");
++		return;
++	}
++	dwc_wr(DALEPENA, dwc_rd(DALEPENA) | (1u << EP_RX) | (1u << EP_TX) | (1u << EP_INT));
++	ud.configured = true;
++	ud.tx_busy = false;
++	ud_rx_arm();
++	printf("A5XELTE USB: ACM endpoints configured\n");
++}
++
++static void
++ud_setup(void)
++{
++	const uint8_t *st = (const uint8_t *)(ud.dma + UD_SETUP);
++	uint8_t *data = (uint8_t *)(ud.dma + UD_DATA);
++	uint8_t type = st[0], req = st[1];
++	uint16_t value = (uint16_t)(st[2] | st[3] << 8);
++	uint16_t index = (uint16_t)(st[4] | st[5] << 8);
++	uint16_t length = (uint16_t)(st[6] | st[7] << 8);
++	uint32_t n = 0;
++	bool ok = true;
++
++	if (ud.events < 400) {
++		printf("A5XELTE USB: setup %02x %02x %04x %04x len %u\n", type, req, value, index, length);
++	}
++	ud.data_in = (type & 0x80) != 0;
++	ud.pending_req = 0;
++	if ((type & 0x60) == 0x20) {    /* class (CDC PSTN) */
++		switch (req) {
++		case 0x20:              /* SET_LINE_CODING: 7 bytes OUT */
++			ok = (length == 7 && !ud.data_in);
++			ud.pending_req = req;
++			break;
++		case 0x21:              /* GET_LINE_CODING */
++			memcpy(data, ud.line_coding, 7); n = 7;
++			break;
++		case 0x22:              /* SET_CONTROL_LINE_STATE */
++			ud.line_state = value;
++			ok = (length == 0);
++			break;
++		case 0x23:              /* SEND_BREAK */
++			ok = (length == 0);
++			break;
++		default:
++			ok = false;
++			break;
++		}
++	} else if ((type & 0x60) != 0) {
++		ok = false;
++	} else if (req == 6) {          /* GET_DESCRIPTOR */
++		switch (value >> 8) {
++		case 1: memcpy(data, ud_dev_desc, sizeof(ud_dev_desc)); n = sizeof(ud_dev_desc); break;
++		case 2: memcpy(data, ud_cfg_desc, sizeof(ud_cfg_desc)); n = sizeof(ud_cfg_desc); break;
++		case 3: n = ud_string(value & 0xff, data); ok = n != 0; break;
++		default: ok = false; break;
++		}
++	} else if (req == 5) {          /* SET_ADDRESS */
++		uint32_t dcfg = dwc_rd(DCFG) & ~(0x7fu << 3);
++		dwc_wr(DCFG, dcfg | ((uint32_t)(value & 0x7f) << 3));
++		printf("A5XELTE USB: address %u\n", value & 0x7f);
++	} else if (req == 9) {          /* SET_CONFIGURATION */
++		if (value == 1) {
++			ud_configure();
++		}
++		printf("A5XELTE USB: configured (%u)\n", value);
++	} else if (req == 8) {          /* GET_CONFIGURATION */
++		data[0] = ud.configured ? 1 : 0; n = 1;
++	} else if (req == 0) {          /* GET_STATUS */
++		data[0] = 0; data[1] = 0; n = 2;
++	} else if (req == 11) {         /* SET_INTERFACE: only alt 0 exists */
++		ok = (value == 0);
++	} else if (req == 10) {         /* GET_INTERFACE */
++		data[0] = 0; n = 1;
++	} else if (req == 1 || req == 3) { /* CLEAR/SET_FEATURE */
++	} else {
++		ok = false;
++	}
++	if (!ok) {
++		ud_stall();
++		return;
++	}
++	if (length == 0) {
++		ud.state = EP0_WAIT_STATUS2;
++		return;
++	}
++	ud.state = EP0_DATA;
++	if (ud.data_in) {
++		if (n > length) {
++			n = length;
++		}
++		ud_start(1, UD_DATA, n, TRBCTL_DATA);
++	} else {
++		ud_start(0, UD_DATA, 64, TRBCTL_DATA);
++	}
++}
++
++static void
++ud_event(uint32_t ev)
++{
++	if (ev & 1) {                   /* device event */
++		uint32_t type = (ev >> 8) & 0xf;
++		if (type == 1) {        /* USB reset */
++			dwc_wr(DCFG, dwc_rd(DCFG) & ~(0x7fu << 3));
++			if (ud.configured) {
++				printf("A5XELTE USB: bus reset while configured\n");
++			}
++			ud.configured = false;
++			ud.tx_busy = false;
++		} else if (type == 2) { /* connect done */
++			uint32_t speed = dwc_rd(DSTS) & 7;
++			ud_epcmd(0, DEPCMD_SETEPCONFIG, (0u << 1) | (64u << 3) | (2u << 30),
++			    (1u << 8) | (1u << 10) | (0u << 25), 0);
++			ud_epcmd(1, DEPCMD_SETEPCONFIG, (0u << 1) | (64u << 3) | (2u << 30),
++			    (1u << 8) | (1u << 10) | (1u << 25), 0);
++			printf("A5XELTE USB: connected, speed %u\n", speed);
++		} else if (type == 0) {
++			printf("A5XELTE USB: disconnect\n");
++			ud.configured = false;
++			ud.tx_busy = false;
++		}
++		return;
++	}
++	unsigned ep = (ev >> 1) & 0x1f;
++	unsigned type = (ev >> 6) & 0xf;
++	unsigned status = (ev >> 12) & 0xf;
++
++	if (ep == EP_RX && type == 1) {
++		ud_rx_arm();            /* host -> phone data is not used */
++		return;
++	}
++	if (ep == EP_TX && type == 1) {
++		ud.tx_busy = false;
++		return;
++	}
++	if (ep > 1) {
++		return;
++	}
++	if (type == 1) {                /* XferComplete */
++		switch (ud.state) {
++		case EP0_SETUP:
++			ud_sync(UD_SETUP, 8);
++			ud_setup();
++			break;
++		case EP0_DATA:
++			if (ud.pending_req == 0x20) {
++				ud_sync(UD_DATA, 64);
++				memcpy(ud.line_coding, (const void *)(ud.dma + UD_DATA), 7);
++			}
++			ud.pending_req = 0;
++			ud.state = EP0_WAIT_STATUS3;
++			break;
++		case EP0_STATUS:
++			ud_start_setup();
++			break;
++		default:
++			break;
++		}
++		return;
++	}
++	if (type == 3 && status == 2) { /* XferNotReady, control status phase */
++		if (ud.state == EP0_WAIT_STATUS2 || ud.state == EP0_WAIT_STATUS3) {
++			uint32_t ctl = ud.state == EP0_WAIT_STATUS3 ? TRBCTL_STATUS3 : TRBCTL_STATUS2;
++			ud.state = EP0_STATUS;
++			ud_start(ep, UD_DATA, 0, ctl);
++		}
++	}
++}
++
++/*
++ * Bulk IN: the console ring from the start of the boot (or the last 4 MiB),
++ * up to 16 KiB per transfer. Only bytes counted one poll earlier are sent,
++ * so a writer still filling its bytes is not overtaken.
++ */
++static void
++ud_tx_log(uint64_t limit)
++{
++	if (!ud.configured || ud.tx_busy) {
++		return;
++	}
++	uint64_t avail = limit > ud.log_pos ? limit - ud.log_pos : 0;
++	uint32_t want = avail > UD_TX_MAX ? UD_TX_MAX : (uint32_t)avail;
++	if (want > 0 && (want % 512) == 0) {
++		want--;                 /* a short packet ends the transfer */
++	}
++	if (want == 0) {
++		return;
++	}
++	uint32_t n = a5xelte_log_copy(&ud.log_pos, limit, (char *)(ud.dma + UD_TX), want);
++	if (n == 0) {
++		return;
++	}
++	if ((n % 512) == 0) {
++		ud.log_pos--;
++		n--;
++	}
++	ud.tx_busy = true;
++	ud.tx_bytes += n;
++	ud_start_trb(EP_TX, UD_TRB_TX, UD_TX, n, TRBCTL_NORMAL);
++}
++
++static void
++ud_thread(void *arg __unused, wait_result_t wr __unused)
++{
++	uint64_t limit = 0;
++	uint32_t ticks = 0;
++	for (;;) {
++		uint32_t count = dwc_rd(GEVNTCOUNT) & 0xffff;
++		if (count) {
++			ud_sync(UD_EVT, UD_EVT_SIZE);
++			for (uint32_t done = 0; done < count; done += 4) {
++				uint32_t ev = *(volatile uint32_t *)(ud.dma + UD_EVT + ud.evt_pos);
++				ud.evt_pos = (ud.evt_pos + 4) % UD_EVT_SIZE;
++				if (ud.events++ < 100) {
++					printf("A5XELTE USB: event 0x%08x\n", ev);
++				}
++				ud_event(ev);
++			}
++			dwc_wr(GEVNTCOUNT, count);
++		}
++		ud_tx_log(limit);
++		limit = a5xelte_log_position();
++		if ((++ticks % 60000) == 0) {
++			printf("A5XELTE USB: %llu log bytes sent, DTR %u\n", ud.tx_bytes, ud.line_state & 1);
++		}
++		ud_sleep_ms(1);
++	}
++}
++
++static void
++ud_gadget_start(void)
++{
++	thread_t thread;
++
++	if (kmem_alloc_contig(kernel_map, &ud.dma, UD_SIZE, PAGE_MASK, 0, 0,
++	    KMA_DATA | KMA_ZERO | KMA_PERMANENT, VM_KERN_MEMORY_IOKIT) != KERN_SUCCESS) {
++		printf("A5XELTE USB: no DMA memory\n");
++		return;
++	}
++	ppnum_t pn = pmap_find_phys(kernel_pmap, (addr64_t)ud.dma);
++	if (!pn) {
++		return;
++	}
++	ud.dma_pa = ptoa_64(pn);
++
++	dwc_wr(DCTL, DCTL_CSFTRST);
++	int i;
++	for (i = 0; i < 500 && (dwc_rd(DCTL) & DCTL_CSFTRST); i++) {
++		delay(1000);
++	}
++	if (dwc_rd(DCTL) & DCTL_CSFTRST) {
++		printf("A5XELTE USB: device soft reset stuck\n");
++		return;
++	}
++
++	dwc_wr(GEVNTADRLO, (uint32_t)(ud.dma_pa + UD_EVT));
++	dwc_wr(GEVNTADRHI, (uint32_t)((ud.dma_pa + UD_EVT) >> 32));
++	dwc_wr(GEVNTSIZ, (1u << 31) | UD_EVT_SIZE);     /* interrupt masked: polled */
++	dwc_wr(GEVNTCOUNT, dwc_rd(GEVNTCOUNT) & 0xffff);
++	ud.evt_pos = 0;
++
++	/* High speed, address 0; events: disconnect, USB reset, connect done. */
++	dwc_wr(DCFG, dwc_rd(DCFG) & ~(7u | (0x7fu << 3)));
++	dwc_wr(DEVTEN, 0x7);
++
++	if (ud_epcmd(0, DEPCMD_DEPSTARTCFG, 0, 0, 0) ||
++	    ud_epcmd(0, DEPCMD_SETEPCONFIG, (0u << 1) | (512u << 3), (1u << 8) | (1u << 10) | (0u << 25), 0) ||
++	    ud_epcmd(0, DEPCMD_SETTRANSFRESOURCE, 1, 0, 0) ||
++	    ud_epcmd(1, DEPCMD_SETEPCONFIG, (0u << 1) | (512u << 3), (1u << 8) | (1u << 10) | (1u << 25), 0) ||
++	    ud_epcmd(1, DEPCMD_SETTRANSFRESOURCE, 1, 0, 0)) {
++		printf("A5XELTE USB: endpoint 0 setup failed\n");
++		return;
++	}
++	dwc_wr(DALEPENA, 0x3);
++	ud_start_setup();
++
++	dwc_wr(DCTL, dwc_rd(DCTL) | DCTL_RUN_STOP);
++	for (i = 0; i < 500 && (dwc_rd(DSTS) & DSTS_DEVCTRLHLT); i++) {
++		delay(1000);
++	}
++	printf("A5XELTE USB: running (DSTS 0x%08x after %d ms), DMA at 0x%llx; COM port on the PC\n",
++	    dwc_rd(DSTS), i, ud.dma_pa);
++	ud.log_pos = 0;
++	if (kernel_thread_start(ud_thread, NULL, &thread) == KERN_SUCCESS) {
++		thread_deallocate(thread);
++	}
++}
++
++void
++a5xelte_usb_start(void)
++{
++	static bool started;
++	int mode = 0;
++
++	PE_parse_boot_argn("a5usb", &mode, sizeof(mode));
++	if (mode <= 0 || started) {
++		return;
++	}
++	started = true;
++	ud.fsys = ml_io_map(CMU_FSYS_PA, 0x1000);
++	ud.mif = ml_io_map(CMU_MIF_PA, 0x1000);
++	ud.pmu = ml_io_map(PMU_PA, 0x1000);
++	ud.dwc = ml_io_map(DWC3_PA, DWC3_SIZE);
++	ud.phy = ml_io_map(PHY_PA, 0x1000);
++	if (!ud.fsys || !ud.mif || !ud.pmu || !ud.dwc || !ud.phy) {
++		printf("A5XELTE USB: map failed\n");
++		return;
++	}
++	usb_probe_print();
++	if (mode == 1) {
++		printf("A5XELTE USB: probe only (a5usb=1), waiting 15 s\n");
++		delay(15 * 1000 * 1000);
++		return;
++	}
++	if (usb_power_up() == 0) {
++		ud_gadget_start();
++	}
++}
++#endif /* ARM64_BOARD_CONFIG_A5XELTE */
