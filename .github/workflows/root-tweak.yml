@@ -1,0 +1,94 @@
+name: ios-root-tweak
+
+# Apply tools/sweet-root-tweaks.py to an ios-root image built earlier
+# (root.yml) instead of rebuilding it from the IPSW. Only the 128 MiB chunks
+# that changed are uploaded (gzip), with the per-chunk SHA-256 of the whole
+# new image, so the phone side can write just the chunks that differ.
+
+on:
+  workflow_dispatch:
+    inputs:
+      run_id:
+        description: "root.yml run that holds the ios-root artifact"
+        default: "42526101397"
+      base_sha256:
+        description: "SHA-256 of ios-root.img in that artifact"
+        default: "52fec8bc052d5022063e1db7492e3e2210fb3d05e2e2d1fabd57763d98862689"
+
+permissions:
+  actions: read
+  contents: read
+
+concurrency:
+  group: ios-root
+  cancel-in-progress: false
+
+jobs:
+  tweak:
+    runs-on: macos-15
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: ios-root
+          path: work/in
+          run-id: ${{ inputs.run_id }}
+          github-token: ${{ github.token }}
+
+      - name: Unpack and verify the base image
+        run: |
+          set -euxo pipefail
+          ls -la work/in
+          cat work/in/ios-root.img.gz.part* | gzip -dc > work/ios-root.img
+          rm -rf work/in
+          echo "${{ inputs.base_sha256 }}  work/ios-root.img" | shasum -a 256 -c
+          python3 tools/chunk-sums.py work/ios-root.img > work/base.sums
+          df -h /
+
+      - name: Apply the tweaks
+        run: |
+          set -eux
+          mkdir -p work/root
+          hdiutil attach -owners on -imagekey diskimage-class=CRawDiskImage \
+            -mountpoint work/root work/ios-root.img
+          sudo python3 tools/sweet-root-tweaks.py work/root
+          sudo ls -ln work/root/System/Library/xpc
+          sudo plutil -p work/root/private/var/mobile/Library/Preferences/com.apple.purplebuddy.plist
+          sync
+          hdiutil detach work/root
+          dev=$(hdiutil attach -owners on -imagekey diskimage-class=CRawDiskImage -nomount work/ios-root.img |
+                awk 'NR==1{print $1}')
+          sudo fsck_hfs -f -n "$dev"
+          hdiutil detach "$dev"
+
+      - name: Changed chunks
+        run: |
+          set -euxo pipefail
+          mkdir -p work/out
+          python3 tools/chunk-sums.py work/ios-root.img > work/out/chunks.sums
+          shasum -a 256 work/ios-root.img | awk '{print $1}' > work/out/image.sha256
+          python3 - work/ios-root.img work/base.sums work/out <<'PY'
+          import gzip, sys
+          img, base, out = sys.argv[1:]
+          CH = 128 << 20
+          old = [l.split()[1] for l in open(base)]
+          new = [l.split()[1] for l in open(out + "/chunks.sums")]
+          changed = [i for i, (a, b) in enumerate(zip(old, new)) if a != b]
+          print("changed chunks:", changed)
+          with open(img, "rb") as f:
+              for i in changed:
+                  f.seek(i * CH)
+                  with open(f"{out}/c{i}.gz", "wb") as g:
+                      g.write(gzip.compress(f.read(CH), 1))
+          PY
+          ls -la work/out
+          du -sh work/out
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ios-root-tweak
+          path: work/out
+          retention-days: 14
+          compression-level: 0

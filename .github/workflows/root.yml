@@ -12,6 +12,9 @@ on:
       trim:
         description: "Trim profile passed as TRIM to mkiosroot-staged.sh (on7xelte or empty)"
         default: ""
+      tweaks:
+        description: "Bring-up tweaks passed as TWEAKS to mkiosroot-staged.sh (sweet or empty)"
+        default: ""
 
 # The root image is several GiB: the download of the APFS components plus the
 # output has to fit on the runner disk, so this job runs alone.
@@ -39,7 +42,7 @@ jobs:
         run: |
           set -eux
           mkdir -p work
-          TRIM="${{ inputs.trim }}" bash tools/mkiosroot-staged.sh work "${{ inputs.ipsw_url }}" work/ios-root.img "${{ inputs.size }}"
+          TRIM="${{ inputs.trim }}" TWEAKS="${{ inputs.tweaks }}" bash tools/mkiosroot-staged.sh work "${{ inputs.ipsw_url }}" work/ios-root.img "${{ inputs.size }}"
           ls -la work/ios-root.img
 
       - name: Verify ownership and content

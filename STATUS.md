@@ -158,6 +158,13 @@ Sıradaki adım: kök dosya sistemi. A5'te önce `rd=md0` ile boş bir HFS+ RAM 
 - Ekran (`candidates/xnu6/screen-xnu6-launchd-mount-ro.webp`): dyld shared cache eşlendi (`not in trust cache` uyarıları), `A5XELTE Sandbox: launchd op 4`, launchd `hello`, `Darwin Bootstrapper Version 7.0.0`, boot görevleri (fsck, mount) çalıştı. `mount_hfs: Read-only file system` → `mount: / failed with 1` → panic `mount[3] exited`.
 - Çözüm: patch **0124** (`0124-a5xelte-read-write-root.patch`) donörün `rootrw=1` desteğini (0031, yalnız SWEET) A5XELTE'ye açar. Sonraki aday xnu7: `rootrw=1 emmcwrite=1` (sürücü yazmayı yalnız USERDATA aralığında yapar, patch 0108).
 
+### ✅ xnu7 telefonda: okuma-yazma kök, iOS servisleri başlıyor (2026-11-09)
+
+- Çekirdek CI run 42536305592 (commit 6590e52, 0124 uygulandı), boot-args xnu6 + `emmcwrite=1 rootrw=1`. BOOT SHA-256 `10e23870…188b`.
+- Ekran (`candidates/xnu7/screen-xnu7-daemons.webp`): mount aşaması geçti; launchd onlarca servisi başlatıyor (`backboardd`, `CommCenter`, `powerd`, `assistantd`, `symptomsd`, `cloudpaird` …), `A5XELTE container: com.apple.backboardd … container=1`. `logd_helper` CPU'yu yakıyor uyarısı (tek çekirdek). Panic yok.
+- 🎉 **Grafik arayüz:** birkaç dakika sonra ekranda beyaz Apple logosu, ardından dolu ilerleme çubuğu ve dönen simge (DataMigration ekranı) çizildi; backboardd J7'nin ekranına çiziyor (`screen-xnu7-apple-logo.webp`, `screen-xnu7-migration.webp`). Logonun altında `SWEET OIS: coreduetd/corkitd/ReportCrash sel …` satırları.
+- Eksik: imaja donörün `tools/sweet-root-tweaks.py` ayarları uygulanmadı (CommCenter işleri, `_PanicOnCrash`, Setup atlama, aktivasyon, MediaToolbox). `root.yml` buna göre genişletilmeli.
+
 ## Kök disk planı (2026-11-09, kullanıcıyla kararlaştırıldı)
 
 Hedef günlük kullanılabilir bir cihaz. Telefonda kullanıcı verisi yok, Android silinebilir. **Bootloader, download mode, RECOVERY ve EFS'e dokunulmayacak.**

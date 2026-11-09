@@ -5,7 +5,9 @@
 
 MOUNTED_ROOT is the HFS+ image mounted read-write (Linux: run
 `fsck.hfsplus -fy` on the image, then `mount -t hfsplus -o loop,force`).
-Run as root (it writes root/mobile owned files). Idempotent. This is what
+Run as root (it writes root/mobile owned files). Idempotent. Everything is
+reversible: launchd.plist is backed up as launchd.plist.orig, VirtualAudio is
+moved to HAL.disabled, the rest only adds preference keys. This is what
 turned the plain mkiosroot.sh output into the images that reach the home
 screen (image versions v8-v14 in NOTES.md):
 
@@ -57,6 +59,13 @@ def merge_pref(root, name, values):
 def launchd(root):
     path = os.path.join(root, 'System/Library/xpc/launchd.plist')
     st = os.stat(path)
+    # Nothing is deleted for good: the untouched plist stays next to the
+    # active one (copy it back to re-enable CommCenter and _PanicOnCrash).
+    orig = path + '.orig'
+    if not os.path.exists(orig):
+        shutil.copy2(path, orig)
+        os.chown(orig, st.st_uid, st.st_gid)
+        print('backup', orig)
     plist = load(path)
     jobs = plist['LaunchDaemons']
     renamed = 0

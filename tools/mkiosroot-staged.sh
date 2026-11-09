@@ -166,6 +166,17 @@ if [ "${TRIM:-}" = on7xelte ]; then
     sudo du -sk "$work/root"
 fi
 
+# --- 4c) optional bring-up tweaks (TWEAKS=sweet) ----------------------------
+# The donor's tools/sweet-root-tweaks.py, which took the sweet images to the
+# home screen: no CommCenter (no baseband), _PanicOnCrash off, containers,
+# DataMigration marked done, Setup skipped, SpringBoard watchdogs off,
+# mediaserverd crash loops off. on7xelte xnu7 showed the DataMigration
+# screen on every boot without these.
+if [ "${TWEAKS:-}" = sweet ]; then
+    echo "--- tweaks (sweet-root-tweaks.py) ---"
+    sudo python3 "$repo_root/tools/sweet-root-tweaks.py" "$work/root"
+fi
+
 # --- 5) logd migration markers + system keybag ------------------------------
 db="$work/root/private/var/db"
 sudo install -d -m 0751 "$db/diagnostics"
