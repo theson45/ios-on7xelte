@@ -1,0 +1,222 @@
+--- a/bsd/dev/a5xelte_emmc.c
++++ b/bsd/dev/a5xelte_emmc.c
+@@ -197,6 +197,169 @@
+ 	return error;
+ }
+ 
++/*
++ * 0147: multi-block read. CMD18 with the controller's auto CMD12, same polled
++ * PIO as emmc_read_sector but one command for up to EMMC_MULTI_MAX sectors
++ * (xnu30: 864 MB read at boot at 5.2 MB/s, 96 us per single-sector command).
++ * On any error the caller stops the card, redoes the request one sector at
++ * a time and switches multi-block reads off. Boot-arg emmcmulti=0 keeps them
++ * off. Writes are unchanged (CMD24, one sector).
++ */
++#define EMMC_MULTI_MAX  128u
++#define CMD_SEND_STOP   (1u << 12)
++#define CMD_STOP_ABORT  (1u << 14)
++#define INT_ACD         (1u << 14)
++static int emmc_multi_state;    /* 0 not read yet, 1 on, 2 off */
++static uint64_t emmc_multi_cmds;
++
++static bool
++emmc_multi_on(void)
++{
++	if (emmc_multi_state == 0) {
++		int on = 1;
++		(void)PE_parse_boot_argn("emmcmulti", &on, sizeof(on));
++		emmc_multi_state = on ? 1 : 2;
++		printf("A5XELTE eMMC: multi-block reads %s\n", on ? "on" : "off (emmcmulti=0)");
++	}
++	return emmc_multi_state == 1;
++}
++
++/* After a failed CMD18: CMD12 so the card leaves the data state. */
++static void
++emmc_stop_transmission(void)
++{
++	emmc_wr(EMMC_RINTSTS, 0xffffffffu);
++	emmc_wr(EMMC_CMDARG, 0);
++	uint32_t command = CMD_START | CMD_STOP_ABORT | CMD_RESP_CRC | CMD_RESP | 12u;
++	if ((emmc_rd(EMMC_CLKSEL) >> 16) & 7u) {
++		command |= CMD_HOLD;
++	}
++	emmc_wr(EMMC_CMD, command);
++	for (unsigned i = 0; i < 4000000; i++) {
++		if (emmc_rd(EMMC_RINTSTS) & (INT_CMD_DONE | INT_ERRORS)) {
++			break;
++		}
++	}
++	for (unsigned i = 0; i < 4000000; i++) {
++		if (!(emmc_rd(EMMC_STATUS) & (1u << 9))) {
++			break;
++		}
++	}
++	emmc_wr(EMMC_RINTSTS, 0xffffffffu);
++}
++
++static int
++emmc_read_multi(uint32_t lba, uint32_t count, uint8_t *dst)
++{
++	uint32_t hcon = emmc_rd(EMMC_HCON);
++	uint32_t width = (hcon >> 7) & 7u;
++	uint32_t ver = emmc_rd(EMMC_VERID) & 0xffffu;
++	uint32_t data_off = ver < 0x240au ? 0x100u : 0x200u;
++	uint32_t unit, words, read_words = 0;
++	uint32_t ctrl = emmc_rd(EMMC_CTRL);
++	uint32_t ints = emmc_rd(EMMC_INTMASK);
++	uint32_t pending = 0;
++	int error = 0;
++
++	if (count == 0 || count > EMMC_MULTI_MAX || width > 2 || ver == 0 ||
++		ver == 0xffff || !(emmc_rd(EMMC_PWREN) & 1u) || !(emmc_rd(EMMC_CLKENA) & 1u)) {
++		return ENXIO;
++	}
++	unit = 2u << width;
++	words = count * 512u / unit;
++	if (emmc_rd(EMMC_STATUS) & (1u << 9)) {
++		return EBUSY;
++	}
++	emmc_wr(EMMC_INTMASK, 0);
++	emmc_wr(EMMC_CTRL, (ctrl & ~(CTRL_INT_ENABLE | CTRL_DMA_ENABLE |
++		CTRL_USE_IDMAC)) | CTRL_FIFO_RESET);
++	for (unsigned i = 0; i < 1000000; i++) {
++		if (!(emmc_rd(EMMC_CTRL) & CTRL_FIFO_RESET)) {
++			break;
++		}
++		if (i == 999999) {
++			error = ETIMEDOUT;
++			goto out;
++		}
++	}
++	emmc_wr(EMMC_TMOUT, 0x573177ffu);
++	emmc_wr(EMMC_BLKSIZ, 512);
++	emmc_wr(EMMC_BYTCNT, count * 512u);
++	emmc_wr(EMMC_RINTSTS, 0xffffffffu);
++	emmc_wr(EMMC_CMDARG, lba);
++	uint32_t command = CMD_START | CMD_WAIT_DATA | CMD_DATA | CMD_SEND_STOP |
++		CMD_RESP_CRC | CMD_RESP | 18u;
++	if ((emmc_rd(EMMC_CLKSEL) >> 16) & 7u) {
++		command |= CMD_HOLD;
++	}
++	emmc_wr(EMMC_CMD, command);
++	uint64_t limit = 4000000ull * count;
++	for (uint64_t i = 0;; i++) {
++		pending = emmc_rd(EMMC_RINTSTS);
++		if (pending & INT_ERRORS) {
++			printf("A5XELTE eMMC: CMD18 error lba=%u n=%u rint=%x status=%x words=%u/%u\n",
++				lba, count, pending, emmc_rd(EMMC_STATUS), read_words, words);
++			error = EIO;
++			goto out;
++		}
++		uint32_t fifo = (emmc_rd(EMMC_STATUS) >> 17) & 0x1fffu;
++		while (fifo && read_words < words) {
++			if (unit == 8) {
++				/* Exynos7580: paired 32-bit SFR accesses for a 64-bit FIFO unit */
++				uint32_t lo = emmc_rd(data_off);
++				uint32_t hi = emmc_rd(data_off + 4);
++				uint64_t v = (uint64_t)lo | ((uint64_t)hi << 32);
++				memcpy(dst + (size_t)read_words * 8u, &v, 8);
++			} else if (unit == 4) {
++				uint32_t v = emmc_rd(data_off);
++				memcpy(dst + (size_t)read_words * 4u, &v, 4);
++			} else {
++				uint16_t v = *(volatile uint16_t *)(emmc_regs + data_off);
++				memcpy(dst + (size_t)read_words * 2u, &v, 2);
++			}
++			read_words++;
++			fifo--;
++		}
++		if (pending & INT_RXDR) {
++			emmc_wr(EMMC_RINTSTS, INT_RXDR);
++		}
++		if (read_words == words &&
++			(pending & INT_DATA_OVER) && (pending & INT_CMD_DONE)) {
++			break;
++		}
++		if (i >= limit) {
++			printf("A5XELTE eMMC: CMD18 timeout lba=%u n=%u rint=%x words=%u/%u\n",
++				lba, count, pending, read_words, words);
++			error = ETIMEDOUT;
++			goto out;
++		}
++	}
++	/* The controller sends CMD12 by itself; let it finish first. */
++	for (unsigned i = 0;; i++) {
++		pending = emmc_rd(EMMC_RINTSTS);
++		if ((pending & INT_ACD) && !(emmc_rd(EMMC_STATUS) & (1u << 9))) {
++			break;
++		}
++		if (pending & INT_ERRORS) {
++			printf("A5XELTE eMMC: CMD18 auto-stop error lba=%u rint=%x\n", lba, pending);
++			error = EIO;
++			break;
++		}
++		if (i == 4000000) {
++			printf("A5XELTE eMMC: CMD18 auto-stop timeout lba=%u rint=%x\n", lba, pending);
++			error = ETIMEDOUT;
++			break;
++		}
++	}
++	if (!error) {
++		emmc_multi_cmds++;
++	}
++out:
++	emmc_wr(EMMC_RINTSTS, 0xffffffffu);
++	emmc_wr(EMMC_INTMASK, ints);
++	return error;
++}
++
+ static int
+ emmc_write_sector(uint32_t lba, const uint8_t *sector)
+ {
+@@ -582,6 +745,26 @@
+ 		printf("USB> io bench: read %u sectors in %llu ms = %llu KB/s, %llu us per sector%s\n",
+ 			n, ms, ms ? (uint64_t)n * 512u / ms : 0,
+ 			n ? emmc_io_ms((t1 - t0) * 1000u) / n : 0, error ? " (error)" : "");
++		/* 0147: the same 1 MiB with CMD18, 64 KiB per command */
++		if (emmc_multi_on()) {
++			static uint8_t chunk[EMMC_MULTI_MAX * 512u];
++			error = 0;
++			lck_mtx_lock(&a5xelte_emmc_lock);
++			t0 = mach_absolute_time();
++			for (n = 0; n < 2048 && !error; n += EMMC_MULTI_MAX) {
++				error = emmc_read_multi((uint32_t)(emmc_first_lba + n), EMMC_MULTI_MAX, chunk);
++			}
++			if (error) {
++				emmc_stop_transmission();
++			}
++			t1 = mach_absolute_time();
++			lck_mtx_unlock(&a5xelte_emmc_lock);
++			ms = emmc_io_ms(t1 - t0);
++			printf("USB> io bench: CMD18 read %u sectors in %llu ms = %llu KB/s%s\n",
++				n, ms, ms ? (uint64_t)n * 512u / ms : 0, error ? " (error)" : "");
++		}
++		printf("USB> io: multi-block reads %s, %llu CMD18 so far\n",
++			emmc_multi_state == 1 ? "on" : "off", emmc_multi_cmds);
+ 		return;
+ 	}
+ 	lck_mtx_lock(&a5xelte_emmc_lock);
+@@ -663,6 +846,22 @@
+ 		uint32_t take = MIN(count - n, 512u - skip);
+ 		uint32_t lba = (uint32_t)(emmc_first_lba + pos / 512u);
+ 		if (buf_flags(bp) & B_READ) {
++			/* 0147: whole sectors go straight into the buffer with CMD18 */
++			uint32_t run = skip == 0 ? MIN((count - n) / 512u, EMMC_MULTI_MAX) : 0;
++			if (run >= 2 && emmc_multi_on()) {
++				error = emmc_read_multi(lba, run, (uint8_t *)vaddr + n);
++				if (error) {
++					printf("A5XELTE eMMC: multi-block read failed (%d) at lba %u; "
++						"single sectors from now on\n", error, lba);
++					emmc_stop_transmission();
++					emmc_multi_state = 2;
++					error = 0;
++					continue;       /* redo this part one sector at a time */
++				}
++				n += run * 512u;
++				buf_setresid(bp, count - n);
++				continue;
++			}
+ 			error = emmc_read_sector(lba, emmc_bounce);
+ 			if (!error) {
+ 				memcpy(vaddr + n, emmc_bounce + skip, take);
