@@ -77,8 +77,8 @@
 +	}
 +	absolutetime_to_nanoseconds(t1 - t0, &ns);
 +	absolutetime_to_nanoseconds(sum, &sum);
-+	printf("USB> top: %d processes, %llu ms CPU in %llu ms wall (%u CPUs)\n", ud_top_nb,
-+	    sum / 1000000, ns / 1000000, (unsigned)ml_get_max_cpus());
++	printf("USB> top: %d processes, %llu ms CPU in %llu ms wall (%u CPUs, 100%% = one CPU)\n", ud_top_nb,
++	    sum / 1000000, ns / 1000000, 8u);
 +	for (int k = 0; k < 20; k++) {
 +		int best = -1;
 +		for (int i = 0; i < ud_top_nb; i++) {
