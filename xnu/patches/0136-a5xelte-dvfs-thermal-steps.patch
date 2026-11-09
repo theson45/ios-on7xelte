@@ -1,0 +1,144 @@
+--- a/bsd/dev/a5xelte_dvfs.c
++++ b/bsd/dev/a5xelte_dvfs.c
+@@ -70,8 +70,18 @@
+  * after "i 1" or at the end of the line: console output with interrupts off
+  * panics XNU ("Console I/O from interrupt-disabled context", xnu18).
+  *
++ * 0136, after the live test on xnu20 (902 -> 839 -> 902 with reg, then
++ * cpufreq 1014 / 1248 / 1482 / 1586 all locked, 1586 settled at 64 C):
++ *   - thermal steps: at DV_HOT_C or more the level drops one step (not
++ *     below 902 MHz), at DV_COOL_C or less it climbs one step back toward
++ *     the level asked for ("cpufreq N" or a5cpufreq=N), at most one step
++ *     every DV_STEP_S seconds. DV_HOT_C + 10 drops straight to 902.
++ *   - reg never maps a new page with interrupts off (ml_io_map allocates:
++ *     zalloc panic on xnu20) and refuses the CMU_CPUCL0/1 hole after +0x800
++ *     (reading 0x10900804 is a synchronous external abort).
++ *   - PMIC transfer tracing is off by default ("pmic trace 1").
++ *
+  * Boot-arg a5cpufreq=MHZ applies a level once, 20 s after USB start.
+- * A thermal guard drops back to 902 MHz at 85 C (checked every second).
+  *
+  * Sources: Samsung 3.18 kernel for the J7 Prime (i2c-exynos5.c batcher
+  * transfer, s2mpu05 regulator, pwrcal S5E7870 PLL141xx / EMA / dividers)
+@@ -172,9 +182,15 @@
+ 	uint32_t    dtim[4], dconf; /* FS1..FS3, SLA and CONF as the bootloader left them */
+ 	uint32_t    cur_khz;        /* last level set here, 0 = bootloader's */
+ 	uint32_t    boot_khz, ticks;
++	uint32_t    target_khz;     /* level asked for; thermal steps climb back to it */
++	uint32_t    step_tick;      /* tick of the last thermal step */
+ 	bool        mapped;
+ } dv;
+ 
++#define DV_HOT_C    80
++#define DV_COOL_C   70
++#define DV_STEP_S   5
++
+ static const struct {
+ 	uint32_t khz, uv;
+ 	uint8_t  p, s, hpm;
+@@ -215,6 +231,7 @@
+ dv_map(void)
+ {
+ 	if (!dv.mapped) {
++		dv.quiet = 1;   /* PMIC transfer trace off until "pmic trace 1" */
+ 		dv.i2c = ml_io_map((vm_offset_t)HSI2C_PA, 0x2000);
+ 		dv.cmu[0] = ml_io_map((vm_offset_t)CMU_CPUCL0_PA, 0x1000);
+ 		dv.cmu[1] = ml_io_map((vm_offset_t)CMU_CPUCL1_PA, 0x1000);
+@@ -757,6 +774,9 @@
+ 			return reg_map[i].va + (pa & 0xfffu);
+ 		}
+ 	}
++	if (!ml_get_interrupts_enabled()) {
++		return 0;       /* ml_io_map allocates: read the page once before "i 0" */
++	}
+ 	vm_offset_t va = ml_io_map((vm_offset_t)page, 0x1000);
+ 	if (!va) {
+ 		return 0;
+@@ -812,6 +832,10 @@
+ 	if (pa < 0x10000000u || pa >= 0x16000000u || (pa & 3)) {
+ 		return "address must be 4-aligned in 0x10000000-0x15ffffff";
+ 	}
++	if (((pa & ~0xfffu) == (uint32_t)CMU_CPUCL0_PA || (pa & ~0xfffu) == (uint32_t)CMU_CPUCL1_PA) &&
++	    (pa & 0xfffu) > 0x800u) {
++		return "CMU_CPUCL0/1 after +0x800 is a hole (external abort)";
++	}
+ 	return NULL;
+ }
+ 
+@@ -880,7 +904,7 @@
+ 			for (uint32_t i = 0; i < cnt && pa + 4 * i < 0x16000000u; i++) {
+ 				vm_offset_t va = reg_va(pa + 4 * i);
+ 				if (!va) {
+-					stop = "map failed";
++					stop = ml_get_interrupts_enabled() ? "map failed" : "page not mapped yet (read it before i 0)";
+ 					break;
+ 				}
+ 				reg_out("USB> reg r 0x%08x = 0x%08x\n", pa + 4 * i, rd32(va, 0));
+@@ -892,7 +916,7 @@
+ 			}
+ 			vm_offset_t va = reg_va(pa);
+ 			if (!va) {
+-				stop = "map failed";
++				stop = ml_get_interrupts_enabled() ? "map failed" : "page not mapped yet (read it before i 0)";
+ 				break;
+ 			}
+ 			uint32_t old = op == 'm' ? rd32(va, 0) : 0;
+@@ -913,7 +937,7 @@
+ 			}
+ 			vm_offset_t va = reg_va(pa);
+ 			if (!va) {
+-				stop = "map failed";
++				stop = ml_get_interrupts_enabled() ? "map failed" : "page not mapped yet (read it before i 0)";
+ 				break;
+ 			}
+ 			if (us > 1000000) {
+@@ -1060,9 +1084,14 @@
+ 	} else {
+ 		if (*arg == '\0') {
+ 			dv_show();
++		} else if (!strncmp(arg, "auto ", 5)) {
++			const char *s = arg + 5;            /* thermal step: target stays */
++			dv_set(dv_num(&s) * 1000);
+ 		} else {
+ 			const char *s = arg;
+-			dv_set(dv_num(&s) * 1000);
++			if (dv_set(dv_num(&s) * 1000) == 0) {
++				dv.target_khz = dv.cur_khz;
++			}
+ 		}
+ 	}
+ }
+@@ -1135,11 +1164,28 @@
+ 		dv_post("cpufreq", a);
+ 		dv.boot_khz = 0;
+ 	}
+-	if (dv.cur_khz > 902000 && dv.mapped) {
+-		int t = dv_temp();
+-		if (t >= 85 && !dv.busy) {
+-			printf("USB> cpufreq: %d C, back to 902 MHz\n", t);
+-			dv_post("cpufreq", "902");
++	if (dv.mapped && dv.cur_khz && !dv.busy && dv.ticks - dv.step_tick >= DV_STEP_S) {
++		const int nlv = (int)(sizeof(dv_lv) / sizeof(dv_lv[0]));
++		int t = dv_temp(), lv = -1;
++		uint32_t next = 0;
++		for (int i = 0; i < nlv; i++) {
++			if (dv_lv[i].khz == dv.cur_khz) {
++				lv = i;
++			}
++		}
++		if (lv >= 0 && dv.cur_khz > 902000 && t >= DV_HOT_C + 10) {
++			next = 902000;
++		} else if (lv >= 0 && dv.cur_khz > 902000 && t >= DV_HOT_C) {
++			next = dv_lv[lv + 1].khz;
++		} else if (lv > 0 && t <= DV_COOL_C && dv.target_khz > dv.cur_khz) {
++			next = dv_lv[lv - 1].khz;
++		}
++		if (next) {
++			char a[24];
++			snprintf(a, sizeof(a), "auto %u", next / 1000);
++			printf("USB> cpufreq: %d C, %u -> %u MHz\n", t, dv.cur_khz / 1000, next / 1000);
++			dv.step_tick = dv.ticks;
++			dv_post("cpufreq", a);
+ 		}
+ 	}
+ }
