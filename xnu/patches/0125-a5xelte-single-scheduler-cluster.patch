@@ -1,0 +1,35 @@
+--- a/osfmk/arm64/machine_routines.c
++++ b/osfmk/arm64/machine_routines.c
+@@ -1050,7 +1050,13 @@ ml_parse_cpu_topology(void)
+ 		 * on the value provided by EDT. Instead, use the MPIDR value to see if we have
+ 		 * seen this exact cluster before. If so, then reuse that cluster ID for this CPU.
+ 		 */
+-#if HAS_CLUSTER || defined(A5XELTE)
++		/*
++		 * A5XELTE: both Exynos7870 A53 clusters form ONE scheduler cluster
++		 * (one pset), as on the SWEET donor (0078). With a pset per MPIDR
++		 * cluster, cpus=8 panicked on a recursive pset0 ticket lock as soon
++		 * as cpu1 came up; cpus=4 (one pset) runs.
++		 */
++#if HAS_CLUSTER
+ 		uint32_t phys_cluster_id = MPIDR_CLUSTER_ID(cpu->phys_id);
+ #else
+ 		uint32_t phys_cluster_id = (cpu->cluster_type == CLUSTER_TYPE_P);
+@@ -1084,7 +1090,7 @@ ml_parse_cpu_topology(void)
+ 			ml_read_reg_range(child, "cpm-impl-reg", &cluster->cpm_IMPL_pa, &cluster->cpm_IMPL_len);
+ 		}
+ 
+-#if HAS_CLUSTER || defined(A5XELTE)
++#if HAS_CLUSTER
+ 		if (MPIDR_CPU_ID(cpu->phys_id) > cluster_max_cpu_phys_id[phys_cluster_id]) {
+ 			cluster_max_cpu_phys_id[phys_cluster_id] = MPIDR_CPU_ID(cpu->phys_id);
+ 		}
+@@ -1110,7 +1116,7 @@ ml_parse_cpu_topology(void)
+ 
+ 	}
+ 
+-#if HAS_CLUSTER || defined(A5XELTE)
++#if HAS_CLUSTER
+ 	/*
+ 	 * Build the cluster offset array, ensuring that the region reserved
+ 	 * for each physical cluster contains enough entries to be indexed
