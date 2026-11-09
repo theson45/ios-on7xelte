@@ -53,7 +53,9 @@ jobs:
           mkdir -p work/root
           hdiutil attach -owners on -imagekey diskimage-class=CRawDiskImage \
             -mountpoint work/root work/ios-root.img
-          sudo python3 tools/sweet-root-tweaks.py work/root
+          sudo python3 tools/sweet-root-tweaks.py work/root | tee work/tweak.log
+          grep -q 'disabled job .* fairplayd.H2$' work/tweak.log
+          grep -q 'disabled job .* bluetoothd$' work/tweak.log
           sudo ls -ln work/root/System/Library/xpc
           sudo plutil -p work/root/private/var/mobile/Library/Preferences/com.apple.purplebuddy.plist
           sync

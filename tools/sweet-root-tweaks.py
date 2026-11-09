@@ -13,7 +13,10 @@ screen (image versions v8-v14 in NOTES.md):
 
   launchd.plist   _PanicOnCrash -> _PanicOnCrasX (a crashing daemon must not
                   panic the system); CommCenter jobs removed (no baseband: it
-                  crash-loops and Setup blocks on its CoreTelephony XPC)
+                  crash-loops and Setup blocks on its CoreTelephony XPC);
+                  fairplayd.H2 and bluetoothd jobs removed (no FairPlay keys,
+                  no Bluetooth chip: on the J7 they relaunched 20 and 18
+                  times in the first 8 minutes of every boot)
   containers      /private/var/containers/{Bundle,Data/System,Shared/SystemGroup,Temp}
                   (on iOS they live on the data volume)
   migration       LastSystemVersion so DataMigration does not run for an hour
@@ -33,6 +36,9 @@ import glob, os, plistlib, shutil, sys
 
 BUILD, VERSION = '20H392', '16.7.16'
 MOBILE = 501
+# Jobs that only crash-loop without the hardware they drive, by program name.
+# Copy launchd.plist.orig back over launchd.plist to bring them back.
+DISABLED_PROGRAMS = ('fairplayd.H2', 'bluetoothd')
 
 
 def load(path):
@@ -76,8 +82,21 @@ def launchd(root):
     removed = [k for k, j in jobs.items() if j.get('Label') == 'com.apple.CommCenter']
     for k in removed:
         del jobs[k]
+
+    def program(job):
+        p = job.get('Program') or (job.get('ProgramArguments') or [''])[0]
+        return os.path.basename(p)
+    off = [k for k, j in jobs.items() if program(j) in DISABLED_PROGRAMS]
+    for k in off:
+        print('disabled job', jobs[k].get('Label'), program(jobs[k]))
+    missing = set(DISABLED_PROGRAMS) - {program(jobs[k]) for k in off}
+    if missing:  # already removed by an earlier run, or renamed in this iOS
+        print('warning: no job runs', sorted(missing))
+    for k in off:
+        del jobs[k]
     save(path, plist, st.st_uid, st.st_gid, st.st_mode & 0o7777)
-    print(f'launchd.plist: {renamed} _PanicOnCrash renamed, {len(removed)} CommCenter jobs removed')
+    print(f'launchd.plist: {renamed} _PanicOnCrash renamed, {len(removed)} CommCenter jobs removed, '
+          f'{len(off)} jobs disabled')
 
 
 def containers(root):
