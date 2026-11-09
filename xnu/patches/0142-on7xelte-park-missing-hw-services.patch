@@ -1,0 +1,158 @@
+--- a/bsd/dev/a5xelte_usb.c
++++ b/bsd/dev/a5xelte_usb.c
+@@ -60,6 +60,7 @@
+ #include <sys/proc_internal.h>
+ #include <sys/signalvar.h>
+ #include <kern/task.h>
++#include <kern/kalloc.h>
+ extern task_t proc_task(proc_t);
+ extern void sweet_sample_task(const char *name, int pid, task_t task);  /* osfmk/kern/exception.c */
+ extern kern_return_t task_info(task_t, task_flavor_t, task_info_t, mach_msg_type_number_t *);
+@@ -881,9 +882,7 @@
+ 	printf("USB> bench: cpu %llu M dependent adds/s (~MHz), %llu us\n", x / us, us);
+ 
+ 	if (ud_bench_buf == 0 &&
+-	    kmem_alloc_contig(kernel_map, &ud_bench_buf, UD_BENCH_SIZE, PAGE_MASK, 0, 0,
+-	    KMA_DATA | KMA_ZERO | KMA_PERMANENT, VM_KERN_MEMORY_IOKIT) != KERN_SUCCESS) {
+-		ud_bench_buf = 0;
++	    (ud_bench_buf = (vm_offset_t)kalloc_data(UD_BENCH_SIZE, Z_WAITOK | Z_ZERO)) == 0) {
+ 		printf("USB> bench: no 4 MiB buffer\n");
+ 		goto out;
+ 	}
+@@ -945,9 +944,14 @@
+  * 0141: services for hardware this phone does not have (or the port does not
+  * drive yet): Wi-Fi, Bluetooth, audio, the modem, NFC. They only crash, get
+  * respawned and keep launchd busy (mediaserverd alone kept launchd ~75% busy
+- * in a loop). kern_exec.c asks here and refuses the spawn with EACCES; their
+- * clients get an error at once instead of waiting.
+- * Boot-arg on7deny=NAME[,NAME] replaces the list, on7deny=- allows all.
++ * in a loop). kern_exec.c asks here.
++ * 0142: refusing them made launchd respawn them about once a second (each a
++ * "crash" in the log), so by default they are parked instead: the exec goes
++ * on, and a moment later a worker thread stops the process with SIGSTOP
++ * within a few ms. launchd sees it running and leaves it alone.
++ * `kill PID 19` wakes one up again.
++ * Boot-arg on7deny=NAME[,NAME] replaces the list, on7deny=- allows all;
++ * on7denymode=refuse goes back to the 0141 behaviour (EACCES).
+  */
+ static const char ud_deny_default[] =
+     "mediaserverd,audioclocksyncd,audiomxd,UARPUpdaterServiceLegacyAudio,"
+@@ -957,33 +961,98 @@
+     "nfcd,carkitd";
+ static char ud_deny_arg[512];
+ static int ud_deny_state;       /* 0 not read, 1 default, 2 boot-arg, 3 off */
++static int ud_deny_refuse;      /* on7denymode=refuse */
+ static uint32_t ud_deny_count;
+ 
+-bool a5xelte_exec_denied(const char *name);
++#define UD_PARK_SLOTS   32
++static int ud_park_pid[UD_PARK_SLOTS];
++static int ud_park_started;
+ 
+-bool
+-a5xelte_exec_denied(const char *name)
++static void
++ud_park_thread(void *arg __unused, wait_result_t w __unused)
++{
++	for (;;) {
++		for (int i = 0; i < UD_PARK_SLOTS; i++) {
++			int slot = __atomic_exchange_n(&ud_park_pid[i], 0, __ATOMIC_ACQ_REL);
++			if (slot <= 0) {
++				continue;
++			}
++			int pid = slot & 0xffffff;
++			proc_t p = proc_find(pid);
++			if (p == PROC_NULL) {
++				/* still in exec (or gone): try again, up to ~2 s */
++				int tries = (slot >> 24) + 1, zero = 0;
++				if (tries < 127) {
++					__atomic_compare_exchange_n(&ud_park_pid[i], &zero,
++					    (pid & 0xffffff) | (tries << 24), false,
++					    __ATOMIC_ACQ_REL, __ATOMIC_RELAXED);
++				}
++				continue;
++			}
++			{
++				char name[32];
++				proc_name(pid, name, sizeof(name));
++				psignal(p, SIGSTOP);
++				proc_rele(p);
++				printf("exec %s parked (pid %d stopped, on7deny)\n", name, pid);
++			}
++		}
++		ud_sleep_ms(15);
++	}
++}
++
++static void
++ud_park(int pid)
++{
++	if (!__atomic_exchange_n(&ud_park_started, 1, __ATOMIC_ACQ_REL)) {
++		thread_t thread;
++		if (kernel_thread_start(ud_park_thread, NULL, &thread) == KERN_SUCCESS) {
++			thread_deallocate(thread);
++		}
++	}
++	for (int i = 0; i < UD_PARK_SLOTS; i++) {
++		int zero = 0;
++		if (__atomic_compare_exchange_n(&ud_park_pid[i], &zero, pid, false,
++		    __ATOMIC_ACQ_REL, __ATOMIC_RELAXED)) {
++			return;
++		}
++	}
++	printf("exec pid %d: park queue full, left running\n", pid);
++}
++
++/* 0 = run it, 1 = refuse the exec (EACCES), 2 = parked (exec goes on) */
++int a5xelte_exec_denied(const char *name, int pid);
++
++int
++a5xelte_exec_denied(const char *name, int pid)
+ {
+ 	int st = __atomic_load_n(&ud_deny_state, __ATOMIC_ACQUIRE);
+ 	if (st == 0) {
++		char mode[16];
+ 		if (PE_parse_boot_argn("on7deny", ud_deny_arg, sizeof(ud_deny_arg))) {
+ 			st = (ud_deny_arg[0] == '-' || ud_deny_arg[0] == '\0') ? 3 : 2;
+ 		} else {
+ 			st = 1;
+ 		}
++		ud_deny_refuse = PE_parse_boot_argn("on7denymode", mode, sizeof(mode)) &&
++		    strcmp(mode, "refuse") == 0;
+ 		__atomic_store_n(&ud_deny_state, st, __ATOMIC_RELEASE);
+ 	}
+ 	if (st == 3 || name == NULL) {
+-		return false;
++		return 0;
+ 	}
+ 	if (!ud_name_in(st == 2 ? ud_deny_arg : ud_deny_default, name)) {
+-		return false;
++		return 0;
++	}
++	if (!ud_deny_refuse && pid > 0) {
++		ud_park(pid);
++		return 2;
+ 	}
+ 	uint32_t n = __atomic_add_fetch(&ud_deny_count, 1, __ATOMIC_RELAXED);
+ 	if (n <= 64 || (n % 64) == 0) {
+ 		printf("exec %s denied (on7deny, %u so far)\n", name, n);
+ 	}
+-	return true;
++	return 1;
+ }
+ 
+ static int ud_ps_count;
+--- a/bsd/kern/kern_exec.c
++++ b/bsd/kern/kern_exec.c
+@@ -7418,8 +7418,9 @@
+ #if defined(ARM64_BOARD_CONFIG_A5XELTE)
+ 			{
+ 				/* 0141: no Wi-Fi/BT/audio/modem services (bsd/dev/a5xelte_usb.c, on7deny=) */
+-				extern bool a5xelte_exec_denied(const char *name);
+-				if (a5xelte_exec_denied(p->p_name)) {
++				/* 0142: 2 = parked, a worker stops it with SIGSTOP; the exec goes on */
++				extern int a5xelte_exec_denied(const char *name, int pid);
++				if (a5xelte_exec_denied(p->p_name, proc_pid(p)) == 1) {
+ 					/* done: asserts that a refused spawn carries a reason */
+ 					signature_failure_reason = os_reason_create(OS_REASON_EXEC,
+ 					    EXEC_EXIT_REASON_SECURITY_POLICY);
