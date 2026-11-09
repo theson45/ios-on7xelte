@@ -1,0 +1,97 @@
+--- a/bsd/dev/a5xelte_dvfs.c
++++ b/bsd/dev/a5xelte_dvfs.c
+@@ -87,8 +87,13 @@
+  *   time rtc       latch (UPDATE 0x02 |= RUDR) and read the RTC, set the
+  *                  clock from it if it is still before 2020. Run once by
+  *                  on7xelte_input.c 15 s after boot.
+- *   time EPOCH     set the clock (the USB logger sends the PC's time). The
+- *                  RTC itself is never written.
++ *   time EPOCH     set the clock (the USB logger sends the PC's time) and,
++ *                  since 0138 (approved by the user), write it to the RTC
++ *                  as Linux's rtc-sec does for S2MPU03X and later: SEC..YEAR
++ *                  from 0x04 in one message (hour | PM bit 6 from 12:00,
++ *                  weekday as a bit), then UPDATE 0x02 = WUDR (bit 1) with
++ *                  RUDR, FREEZE and AUDR cleared, 1 ms, and read it back.
++ *                  So the phone keeps the time without the PC. UTC.
+  *
+  * Boot-arg a5cpufreq=MHZ applies a level once, 20 s after USB start.
+  *
+@@ -569,6 +574,9 @@
+ #define RTC_UPDATE      0x02
+ #define RTC_RUDR        0x01
+ #define RTC_SEC         0x04
++#define RTC_WUDR        0x02    /* S2MPU03X and later (RTC_WUDR_MASK_REV) */
++#define RTC_FREEZE      0x04
++#define RTC_AUDR        0x10
+ 
+ static int
+ rtc_read(uint8_t t[7])
+@@ -606,6 +614,58 @@
+ 	return era * 146097 + (int64_t)doe - 719468;
+ }
+ 
++/* civil date from days since 1970-01-01 */
++static void
++civil_from_days(int64_t z, unsigned *y, unsigned *m, unsigned *d)
++{
++	z += 719468;
++	const int64_t era = (z >= 0 ? z : z - 146096) / 146097;
++	const unsigned doe = (unsigned)(z - era * 146097);
++	const unsigned yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365;
++	const unsigned doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
++	const unsigned mp = (5 * doy + 2) / 153;
++	*d = doy - (153 * mp + 2) / 5 + 1;
++	*m = mp < 10 ? mp + 3 : mp - 9;
++	*y = (unsigned)(yoe + era * 400) + (*m <= 2);
++}
++
++static int
++rtc_write(uint64_t epoch)
++{
++	uint64_t days = epoch / 86400;
++	unsigned rem = (unsigned)(epoch % 86400), y, m, d;
++	uint8_t up = 0, msg[8];
++	int e;
++	civil_from_days((int64_t)days, &y, &m, &d);
++	if (dv.batch || y < 2020 || y > 2099) {
++		return -1;
++	}
++	unsigned hour = rem / 3600;
++	msg[0] = RTC_SEC;
++	msg[1] = (uint8_t)(rem % 60);
++	msg[2] = (uint8_t)((rem / 60) % 60);
++	msg[3] = (uint8_t)(hour | (hour >= 12 ? 0x40u : 0));
++	msg[4] = (uint8_t)(1u << ((days + 4) % 7));     /* 1970-01-01 was a Thursday */
++	msg[5] = (uint8_t)d;
++	msg[6] = (uint8_t)m;
++	msg[7] = (uint8_t)(y - 2000);
++	dv.slave = RTC_ADDR;
++	e = pm_read(RTC_UPDATE, &up);
++	if (!e) {
++		e = pm_xfer(false, msg, sizeof(msg), true) ? -1 : 0;
++	}
++	if (!e) {
++		uint8_t u[2] = { RTC_UPDATE,
++			         (uint8_t)((up & ~(RTC_RUDR | RTC_WUDR | RTC_FREEZE | RTC_AUDR)) | RTC_WUDR) };
++		e = pm_xfer(false, u, sizeof(u), true) ? -1 : 0;
++		delay(2000);
++	}
++	dv.slave = 0;
++	printf("USB> time: RTC write %04u-%02u-%02u %02u:%02u:%02u (UPDATE was 0x%02x) %s\n", y, m, d,
++	    hour, msg[2], msg[1], up, e ? "FAILED" : "ok");
++	return e;
++}
++
+ static void
+ time_cmd(const char *arg)
+ {
+@@ -625,6 +685,9 @@
+ 		}
+ 		clock_set_calendar_microtime((clock_sec_t)v, 0);
+ 		printf("USB> time: clock %lu -> %llu (from the host)\n", (unsigned long)now, v);
++		if (rtc_write(v) == 0) {
++			time_cmd("");   /* read back */
++		}
+ 		return;
+ 	}
+ 	if (rtc_read(t)) {
