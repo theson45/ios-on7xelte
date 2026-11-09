@@ -1,0 +1,342 @@
+--- a/bsd/dev/a5xelte_emmc.c
++++ b/bsd/dev/a5xelte_emmc.c
+@@ -26,6 +26,10 @@
+ #include <machine/atomic.h>
+ #include <kern/clock.h>
+ #include <mach/mach_time.h>
++#include <machine/machine_routines.h>
++#include <arm/caches_internal.h>
++#include <vm/pmap.h>
++#include <vm/vm_kern.h>
+ 
+ extern vm_offset_t ml_io_map(vm_offset_t phys_addr, vm_size_t size);
+ extern kern_return_t kernel_thread_start(thread_continue_t, void *, thread_t *);
+@@ -520,6 +524,281 @@
+ 	return error;
+ }
+ 
++/*
++ * 0149: multi-block read through the controller's internal DMA (IDMAC).
++ * Register map and descriptor layout follow the SM-G610F downstream kernel
++ * (CONFIG_MMC_DW_64BIT_DESC, dw_mmc-exynos.h): DBADDRL 0x88, IDSTS64 0x90.
++ * Descriptors are chained through des6/des7, so it does not matter whether
++ * the secure world told the controller to expect the 128-byte FMP layout;
++ * des2 bits 28-31 stay 0 (FMP bypass, no encryption).
++ * The card writes into one physically contiguous 64 KiB buffer that is then
++ * copied to the caller. The first emmcdmacheck (32) DMA reads are read again
++ * with PIO CMD18 and compared; any error or mismatch switches DMA off for
++ * this boot and the request is served by PIO. Boot-arg emmcdma=0 keeps it off.
++ */
++#define EMMC_FIFOTH     0x04cu
++#define EMMC_BMOD       0x080u
++#define EMMC_PLDMND     0x084u
++#define EMMC_DBADDRL    0x088u
++#define EMMC_DBADDRU    0x08cu
++#define EMMC_IDSTS64    0x090u
++#define EMMC_IDINTEN64  0x094u
++#define EMMC_MPSECURITY 0x1010u
++#define EMMC_MPSCTRL0   0x120cu
++#define CTRL_DMA_RESET  (1u << 2)
++#define BMOD_SWR        (1u << 0)
++#define BMOD_FB         (1u << 1)
++#define BMOD_DE         (1u << 7)
++#define IDSTS_RI        (1u << 1)
++#define IDSTS_ERRORS    ((1u << 2) | (1u << 4) | (1u << 5) | (1u << 9))
++#define DES0_DIC        (1u << 1)
++#define DES0_LD         (1u << 2)
++#define DES0_FS         (1u << 3)
++#define DES0_CH         (1u << 4)
++#define DES0_OWN        (1u << 31)
++#define EMMC_DMA_CHUNK  4096u
++#define EMMC_DMA_BYTES  (EMMC_MULTI_MAX * 512u)
++#define EMMC_DMA_NDESC  (EMMC_DMA_BYTES / EMMC_DMA_CHUNK)
++
++struct emmc_dma_desc {
++	uint32_t des[32];
++};
++
++static int _Atomic emmc_dma_state;  /* 0 not set up, 3 setting up, 1 on, 2 off */
++static uint32_t emmc_dma_checks = 32;
++static uint64_t emmc_dma_cmds, emmc_dma_bad, emmc_dma_fail;
++static vm_offset_t emmc_dma_va;
++static uint64_t emmc_dma_pa;
++static struct emmc_dma_desc *emmc_dma_descs;
++
++/* Called without the disk lock: the allocation may wait for memory. */
++static void
++emmc_dma_setup(void)
++{
++	int expected = 0;
++	if (!os_atomic_cmpxchg(&emmc_dma_state, expected, 3, relaxed)) {
++		return;
++	}
++	int on = 1, check = 32;
++	(void)PE_parse_boot_argn("emmcdma", &on, sizeof(on));
++	(void)PE_parse_boot_argn("emmcdmacheck", &check, sizeof(check));
++	emmc_dma_checks = check < 0 ? 0 : (uint32_t)check;
++	if (!on) {
++		printf("A5XELTE eMMC: DMA reads off (emmcdma=0)\n");
++		os_atomic_store(&emmc_dma_state, 2, release);
++		return;
++	}
++	vm_size_t size = EMMC_DMA_BYTES + PAGE_SIZE;
++	if (kmem_alloc_contig(kernel_map, &emmc_dma_va, size, PAGE_MASK, 0, 0,
++		KMA_DATA | KMA_ZERO | KMA_PERMANENT, VM_KERN_MEMORY_IOKIT) != KERN_SUCCESS) {
++		printf("A5XELTE eMMC: DMA reads off, no contiguous memory\n");
++		os_atomic_store(&emmc_dma_state, 2, release);
++		return;
++	}
++	ppnum_t pn = pmap_find_phys(kernel_pmap, (addr64_t)emmc_dma_va);
++	if (!pn) {
++		printf("A5XELTE eMMC: DMA reads off, no physical address\n");
++		os_atomic_store(&emmc_dma_state, 2, release);
++		return;
++	}
++	emmc_dma_pa = ptoa_64(pn);
++	emmc_dma_descs = (struct emmc_dma_desc *)(emmc_dma_va + EMMC_DMA_BYTES);
++	printf("A5XELTE eMMC: DMA reads on, buffer pa 0x%llx, read-back check for %u reads, "
++		"bmod=%x fifoth=%x mpsctrl0=%x mpsecurity=%x\n", emmc_dma_pa, emmc_dma_checks,
++		emmc_rd(EMMC_BMOD), emmc_rd(EMMC_FIFOTH), emmc_rd(EMMC_MPSCTRL0),
++		emmc_rd(EMMC_MPSECURITY));
++	os_atomic_store(&emmc_dma_state, 1, release);
++}
++
++static bool
++emmc_dma_on(void)
++{
++	return os_atomic_load(&emmc_dma_state, acquire) == 1;
++}
++
++/* Leave the controller as the PIO paths expect it: IDMAC off, FIFO empty. */
++static void
++emmc_dma_quiesce(uint32_t fifoth)
++{
++	emmc_wr(EMMC_BMOD, (emmc_rd(EMMC_BMOD) & ~(BMOD_DE | BMOD_FB)) | BMOD_SWR);
++	emmc_wr(EMMC_CTRL, (emmc_rd(EMMC_CTRL) & ~(CTRL_USE_IDMAC | CTRL_DMA_ENABLE |
++		CTRL_INT_ENABLE)) | CTRL_DMA_RESET | CTRL_FIFO_RESET);
++	for (unsigned i = 0; i < 1000000; i++) {
++		if (!(emmc_rd(EMMC_CTRL) & (CTRL_DMA_RESET | CTRL_FIFO_RESET))) {
++			break;
++		}
++	}
++	emmc_wr(EMMC_FIFOTH, fifoth);
++	emmc_wr(EMMC_IDSTS64, 0x3ffu);
++	emmc_wr(EMMC_RINTSTS, 0xffffffffu);
++}
++
++static int
++emmc_read_dma(uint32_t lba, uint32_t count, uint8_t *dst)
++{
++	uint32_t hcon = emmc_rd(EMMC_HCON);
++	uint32_t width = (hcon >> 7) & 7u;
++	uint32_t ver = emmc_rd(EMMC_VERID) & 0xffffu;
++	uint32_t ints = emmc_rd(EMMC_INTMASK);
++	uint32_t fifoth = emmc_rd(EMMC_FIFOTH);
++	uint32_t bytes = count * 512u;
++	uint32_t ndesc = (bytes + EMMC_DMA_CHUNK - 1) / EMMC_DMA_CHUNK;
++	uint32_t pending = 0, idsts = 0;
++	int error = 0;
++
++	if (count == 0 || count > EMMC_MULTI_MAX || width > 2 || ver == 0 ||
++		ver == 0xffff || !(emmc_rd(EMMC_PWREN) & 1u) || !(emmc_rd(EMMC_CLKENA) & 1u)) {
++		return ENXIO;
++	}
++	if (emmc_rd(EMMC_STATUS) & (1u << 9)) {
++		return EBUSY;
++	}
++	uint64_t desc_pa = emmc_dma_pa + EMMC_DMA_BYTES;
++	for (uint32_t i = 0; i < ndesc; i++) {
++		struct emmc_dma_desc *d = &emmc_dma_descs[i];
++		uint32_t len = MIN(EMMC_DMA_CHUNK, bytes - i * EMMC_DMA_CHUNK);
++		uint64_t buf = emmc_dma_pa + (uint64_t)i * EMMC_DMA_CHUNK;
++		uint64_t next = desc_pa + (uint64_t)(i + 1) * sizeof(*d);
++		memset(d, 0, sizeof(*d));
++		d->des[0] = DES0_OWN | DES0_DIC | DES0_CH;
++		d->des[2] = len & 0x1fffu;          /* bits 28-31 zero: FMP bypass */
++		d->des[4] = (uint32_t)buf;
++		d->des[5] = (uint32_t)(buf >> 32);
++		d->des[6] = (uint32_t)next;
++		d->des[7] = (uint32_t)(next >> 32);
++	}
++	emmc_dma_descs[0].des[0] |= DES0_FS;
++	emmc_dma_descs[ndesc - 1].des[0] &= ~(DES0_CH | DES0_DIC);
++	emmc_dma_descs[ndesc - 1].des[0] |= DES0_LD;
++	emmc_dma_descs[ndesc - 1].des[6] = 0;
++	emmc_dma_descs[ndesc - 1].des[7] = 0;
++	flush_dcache64((addr64_t)desc_pa, ndesc * (unsigned)sizeof(struct emmc_dma_desc), TRUE);
++	flush_dcache64((addr64_t)emmc_dma_pa, bytes, TRUE);
++
++	emmc_wr(EMMC_INTMASK, 0);
++	emmc_wr(EMMC_CTRL, (emmc_rd(EMMC_CTRL) & ~(CTRL_INT_ENABLE | CTRL_USE_IDMAC)) |
++		CTRL_FIFO_RESET | CTRL_DMA_RESET);
++	for (unsigned i = 0; i < 1000000; i++) {
++		if (!(emmc_rd(EMMC_CTRL) & (CTRL_FIFO_RESET | CTRL_DMA_RESET))) {
++			break;
++		}
++		if (i == 999999) {
++			error = ETIMEDOUT;
++			goto out;
++		}
++	}
++	emmc_wr(EMMC_BMOD, BMOD_SWR);
++	emmc_wr(EMMC_IDINTEN64, 0);
++	emmc_wr(EMMC_IDSTS64, 0x3ffu);
++	emmc_wr(EMMC_DBADDRL, (uint32_t)desc_pa);
++	emmc_wr(EMMC_DBADDRU, (uint32_t)(desc_pa >> 32));
++	{
++		/* downstream dw_mci_init: msize = data_shift, bursts of 2^(msize+1) */
++		uint32_t msize = width + 1u;
++		uint32_t burst = 1u << (msize + 1u);
++		emmc_wr(EMMC_FIFOTH, (msize << 28) | ((burst - 1u) << 16) |
++			(EMMC_FIFO_DEPTH - burst));
++	}
++	emmc_wr(EMMC_CTRL, emmc_rd(EMMC_CTRL) | CTRL_DMA_ENABLE | CTRL_USE_IDMAC);
++	__builtin_arm_dsb(0xf);
++	emmc_wr(EMMC_BMOD, BMOD_DE | BMOD_FB);
++	emmc_wr(EMMC_PLDMND, 1);
++
++	emmc_wr(EMMC_TMOUT, 0x573177ffu);
++	emmc_wr(EMMC_BLKSIZ, 512);
++	emmc_wr(EMMC_BYTCNT, bytes);
++	emmc_wr(EMMC_RINTSTS, 0xffffffffu);
++	emmc_wr(EMMC_CMDARG, lba);
++	uint32_t command = CMD_START | CMD_WAIT_DATA | CMD_DATA | CMD_SEND_STOP |
++		CMD_RESP_CRC | CMD_RESP | 18u;
++	if ((emmc_rd(EMMC_CLKSEL) >> 16) & 7u) {
++		command |= CMD_HOLD;
++	}
++	emmc_wr(EMMC_CMD, command);
++	uint64_t limit = 4000000ull * count;
++	for (uint64_t i = 0;; i++) {
++		pending = emmc_rd(EMMC_RINTSTS);
++		idsts = emmc_rd(EMMC_IDSTS64);
++		if ((pending & INT_ERRORS) || (idsts & IDSTS_ERRORS)) {
++			printf("A5XELTE eMMC: DMA CMD18 error lba=%u n=%u rint=%x idsts=%x status=%x\n",
++				lba, count, pending, idsts, emmc_rd(EMMC_STATUS));
++			error = EIO;
++			goto out;
++		}
++		if ((pending & INT_DATA_OVER) && (pending & INT_CMD_DONE) && (idsts & IDSTS_RI)) {
++			break;
++		}
++		if (i >= limit) {
++			printf("A5XELTE eMMC: DMA CMD18 timeout lba=%u n=%u rint=%x idsts=%x bmod=%x\n",
++				lba, count, pending, idsts, emmc_rd(EMMC_BMOD));
++			error = ETIMEDOUT;
++			goto out;
++		}
++	}
++	for (unsigned i = 0;; i++) {
++		pending = emmc_rd(EMMC_RINTSTS);
++		if ((pending & INT_ACD) && !(emmc_rd(EMMC_STATUS) & (1u << 9))) {
++			break;
++		}
++		if (pending & INT_ERRORS) {
++			printf("A5XELTE eMMC: DMA CMD18 auto-stop error lba=%u rint=%x\n", lba, pending);
++			error = EIO;
++			break;
++		}
++		if (i == 4000000) {
++			printf("A5XELTE eMMC: DMA CMD18 auto-stop timeout lba=%u rint=%x\n", lba, pending);
++			error = ETIMEDOUT;
++			break;
++		}
++	}
++out:
++	emmc_dma_quiesce(fifoth);
++	emmc_wr(EMMC_INTMASK, ints);
++	if (!error) {
++		/* drop anything the CPU fetched while the card was writing */
++		flush_dcache64((addr64_t)emmc_dma_pa, bytes, TRUE);
++		memcpy(dst, (const void *)emmc_dma_va, bytes);
++	}
++	return error;
++}
++
++/* Whole-sector read run: DMA when it works, PIO CMD18 otherwise. */
++static int
++emmc_read_run(uint32_t lba, uint32_t count, uint8_t *dst)
++{
++	if (emmc_dma_on()) {
++		int error = emmc_read_dma(lba, count, dst);
++		if (!error && emmc_dma_checks) {
++			emmc_dma_checks--;
++			error = emmc_read_multi(lba, count, emmc_verify_buf);
++			if (error) {
++				emmc_stop_transmission();
++				return emmc_read_multi(lba, count, dst);
++			}
++			if (memcmp(emmc_verify_buf, dst, (size_t)count * 512u) != 0) {
++				emmc_dma_bad++;
++				printf("A5XELTE eMMC: DMA read MISMATCH lba=%u n=%u; DMA reads off, "
++					"using the PIO copy\n", lba, count);
++				os_atomic_store(&emmc_dma_state, 2, release);
++				memcpy(dst, emmc_verify_buf, (size_t)count * 512u);
++				return 0;
++			}
++			if (emmc_dma_checks == 0) {
++				printf("A5XELTE eMMC: DMA reads matched PIO, read-back check done\n");
++			}
++		}
++		if (!error) {
++			emmc_dma_cmds++;
++			return 0;
++		}
++		emmc_dma_fail++;
++		printf("A5XELTE eMMC: DMA read failed (%d) at lba %u; DMA reads off\n", error, lba);
++		os_atomic_store(&emmc_dma_state, 2, release);
++		emmc_stop_transmission();
++	}
++	return emmc_read_multi(lba, count, dst);
++}
++
+ static int
+ emmc_write_sector(uint32_t lba, const uint8_t *sector)
+ {
+@@ -923,6 +1202,27 @@
+ 			printf("USB> io bench: CMD18 read %u sectors in %llu ms = %llu KB/s%s\n",
+ 				n, ms, ms ? (uint64_t)n * 512u / ms : 0, error ? " (error)" : "");
+ 		}
++		/* 0149: the same 1 MiB with DMA */
++		if (emmc_dma_on()) {
++			static uint8_t dchunk[EMMC_MULTI_MAX * 512u];
++			error = 0;
++			lck_mtx_lock(&a5xelte_emmc_lock);
++			t0 = mach_absolute_time();
++			for (n = 0; n < 2048 && !error; n += EMMC_MULTI_MAX) {
++				error = emmc_read_dma((uint32_t)(emmc_first_lba + n), EMMC_MULTI_MAX, dchunk);
++			}
++			if (error) {
++				emmc_stop_transmission();
++			}
++			t1 = mach_absolute_time();
++			lck_mtx_unlock(&a5xelte_emmc_lock);
++			ms = emmc_io_ms(t1 - t0);
++			printf("USB> io bench: DMA read %u sectors in %llu ms = %llu KB/s%s\n",
++				n, ms, ms ? (uint64_t)n * 512u / ms : 0, error ? " (error)" : "");
++		}
++		printf("USB> io: DMA reads %s, %llu so far, %llu mismatches, %llu failures, %u checks left\n",
++			emmc_dma_on() ? "on" : "off", emmc_dma_cmds, emmc_dma_bad, emmc_dma_fail,
++			emmc_dma_checks);
+ 		printf("USB> io: multi-block reads %s, %llu CMD18 so far\n",
+ 			emmc_multi_state == 1 ? "on" : "off", emmc_multi_cmds);
+ 		printf("USB> io: multi-block writes %s, %llu CMD25 so far, %llu read-back mismatches, check %s\n",
+@@ -1000,6 +1300,9 @@
+ 		error = EIO;
+ 		goto done;
+ 	}
++	if ((buf_flags(bp) & B_READ) && os_atomic_load(&emmc_dma_state, relaxed) == 0) {
++		emmc_dma_setup();                       /* 0149, before the disk lock */
++	}
+ 	uint64_t io_t0 = mach_absolute_time();     /* 0146 */
+ 	lck_mtx_lock(&a5xelte_emmc_lock);
+ 	uint64_t io_t1 = mach_absolute_time();
+@@ -1012,7 +1315,7 @@
+ 			/* 0147: whole sectors go straight into the buffer with CMD18 */
+ 			uint32_t run = skip == 0 ? MIN((count - n) / 512u, EMMC_MULTI_MAX) : 0;
+ 			if (run >= 2 && emmc_multi_on()) {
+-				error = emmc_read_multi(lba, run, (uint8_t *)vaddr + n);
++				error = emmc_read_run(lba, run, (uint8_t *)vaddr + n);
+ 				if (error) {
+ 					printf("A5XELTE eMMC: multi-block read failed (%d) at lba %u; "
+ 						"single sectors from now on\n", error, lba);
