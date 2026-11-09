@@ -1,0 +1,121 @@
+--- a/bsd/dev/a5xelte_dvfs.c
++++ b/bsd/dev/a5xelte_dvfs.c
+@@ -66,6 +66,10 @@
+  *     the state is 0xe (no stop) or idle (stop).
+  *   With that, ID 0x02, B1CTRL1 0x58, B1CTRL2 0x3a (762.5 mV), RAMP 0x54.
+  *
++ * 0135: with "i 0" the results of the following ops are buffered and printed
++ * after "i 1" or at the end of the line: console output with interrupts off
++ * panics XNU ("Console I/O from interrupt-disabled context", xnu18).
++ *
+  * Boot-arg a5cpufreq=MHZ applies a level once, 20 s after USB start.
+  * A thermal guard drops back to 902 MHz at 85 C (checked every second).
+  *
+@@ -76,6 +80,7 @@
+ #if defined(ARM64_BOARD_CONFIG_A5XELTE)
+ #include <sys/param.h>
+ #include <sys/systm.h>
++#include <stdarg.h>
+ #include <kern/clock.h>
+ #include <kern/thread.h>
+ #include <kern/sched_prim.h>
+@@ -762,6 +767,45 @@
+ 	return va + (pa & 0xfffu);
+ }
+ 
++static char   reg_buf[2048];
++static size_t reg_len;
++static bool   reg_hold;
++
++static void reg_out(const char *fmt, ...) __printflike(1, 2);
++
++static void
++reg_out(const char *fmt, ...)
++{
++	va_list ap;
++	va_start(ap, fmt);
++	if (reg_hold) {
++		if (reg_len < sizeof(reg_buf) - 1) {
++			int n = vsnprintf(reg_buf + reg_len, sizeof(reg_buf) - reg_len, fmt, ap);
++			if (n > 0) {
++				reg_len += (size_t)n;
++			}
++			if (reg_len > sizeof(reg_buf) - 1) {
++				reg_len = sizeof(reg_buf) - 1;
++			}
++		}
++	} else {
++		char line[200];
++		vsnprintf(line, sizeof(line), fmt, ap);
++		printf("%s", line);
++	}
++	va_end(ap);
++}
++
++static void
++reg_flush(void)
++{
++	if (reg_len) {
++		printf("%s", reg_buf);
++		reg_len = 0;
++		reg_buf[0] = '\0';
++	}
++}
++
+ static const char *
+ reg_bad_addr(uint32_t pa)
+ {
+@@ -839,7 +883,7 @@
+ 					stop = "map failed";
+ 					break;
+ 				}
+-				printf("USB> reg r 0x%08x = 0x%08x\n", pa + 4 * i, rd32(va, 0));
++				reg_out("USB> reg r 0x%08x = 0x%08x\n", pa + 4 * i, rd32(va, 0));
+ 			}
+ 		} else if (op == 'w' || op == 'm') {
+ 			uint32_t pa = dv_num(&s), mask = op == 'm' ? dv_num(&s) : ~0u, v = dv_num(&s);
+@@ -858,9 +902,9 @@
+ 			}
+ 			wr32(va, 0, nv);
+ 			if (op == 'm') {
+-				printf("USB> reg m 0x%08x: 0x%08x -> 0x%08x\n", pa, old, nv);
++				reg_out("USB> reg m 0x%08x: 0x%08x -> 0x%08x\n", pa, old, nv);
+ 			} else {
+-				printf("USB> reg w 0x%08x <- 0x%08x\n", pa, nv);
++				reg_out("USB> reg w 0x%08x <- 0x%08x\n", pa, nv);
+ 			}
+ 		} else if (op == 'p') {
+ 			uint32_t pa = dv_num(&s), mask = dv_num(&s), v = dv_num(&s), us = dv_num(&s);
+@@ -885,7 +929,7 @@
+ 				delay(1);
+ 			}
+ 			uint64_t el = reg_us() - t0;
+-			printf("USB> reg p 0x%08x = 0x%08x %s after %llu us\n", pa, got,
++			reg_out("USB> reg p 0x%08x = 0x%08x %s after %llu us\n", pa, got,
+ 			    (got & mask) == (v & mask) ? "ok" : "TIMEOUT", (unsigned long long)el);
+ 			if ((got & mask) != (v & mask)) {
+ 				stop = "poll timed out";
+@@ -896,11 +940,14 @@
+ 		} else if (op == 'i') {
+ 			uint32_t on = dv_num(&s);
+ 			if (!on && !ints_off) {
++				reg_hold = true;
+ 				ints = ml_set_interrupts_enabled(FALSE);
+ 				ints_off = TRUE;
+ 			} else if (on && ints_off) {
+ 				ml_set_interrupts_enabled(ints);
+ 				ints_off = FALSE;
++				reg_hold = false;
++				reg_flush();
+ 			}
+ 		} else {
+ 			stop = "unknown op (r w m p d i)";
+@@ -915,6 +962,8 @@
+ 	if (ints_off) {
+ 		ml_set_interrupts_enabled(ints);
+ 	}
++	reg_hold = false;
++	reg_flush();
+ 	if (stop) {
+ 		printf("USB> reg: stopped at op %u: %s\n", n, stop);
+ 	} else {
