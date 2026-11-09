@@ -24,7 +24,9 @@ reboot, recovery (reboot into TWRP).
 
 On every port open "replay" is sent first (unless --no-replay), so the start
 of the boot that went out before the port was open is not lost (the log
-then holds those lines twice). Needs no extra Python packages.
+then holds those lines twice), then "time EPOCH" with the PC's clock (0137:
+the phone has no other source of real time; --no-time skips it). Needs no
+extra Python packages.
 """
 import glob, os, queue, sys, threading, time
 
@@ -124,7 +126,8 @@ def main():
         port = args[i + 1]
         del args[i:i + 2]
     replay = "--no-replay" not in args
-    args = [a for a in args if a != "--no-replay"]
+    settime = "--no-time" not in args
+    args = [a for a in args if a not in ("--no-replay", "--no-time")]
     out = args[0] if args else "."
     os.makedirs(out, exist_ok=True)
     name = os.path.join(out, time.strftime("usblog-%Y%m%d-%H%M%S.txt"))
@@ -163,6 +166,8 @@ def main():
                 note(f"{p} open")
                 if replay:
                     cmds.put("replay")
+                if settime:
+                    cmds.put("time %d" % int(time.time()))
                 while True:
                     while not cmds.empty():
                         c = cmds.get()

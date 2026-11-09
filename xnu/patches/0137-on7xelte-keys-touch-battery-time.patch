@@ -1,0 +1,819 @@
+--- a/bsd/conf/files
++++ b/bsd/conf/files
+@@ -110,6 +110,7 @@
+ bsd/dev/a5xelte_touch.c			standard
+ bsd/dev/a5xelte_usb.c			standard
+ bsd/dev/a5xelte_dvfs.c			standard
++bsd/dev/on7xelte_input.c		standard
+ bsd/dev/sweet_sample.c			standard
+ bsd/dev/sweet_keys.c			standard
+ bsd/dev/sweet_touch.c			standard
+--- a/iokit/KernelConfigTables.cpp
++++ b/iokit/KernelConfigTables.cpp
+@@ -89,7 +89,7 @@
+     "     'IOProviderClass' = IOResources;"
+     "     'IOMatchCategory' = SweetHIDTouch;"
+     "   },"
+-#if !defined(ARM64_BOARD_CONFIG_A5XELTE)
++#if 1 /* 0137: SweetBattery on A5XELTE too, fed by the J7 S2MU005 fuel gauge */
+     "   {"
+     "     'IOClass'         = SweetBattery;"
+     "     'IOProviderClass' = IOResources;"
+--- a/bsd/dev/a5xelte_keys.c
++++ b/bsd/dev/a5xelte_keys.c
+@@ -16,6 +16,7 @@
+ 
+ extern vm_offset_t ml_io_map(vm_offset_t, vm_size_t);
+ extern void sweet_hid_key(int key, int down);
++extern void on7xelte_input_start(void);   /* bsd/dev/on7xelte_input.c (0137) */
+ 
+ #define A5_ALIVE_PA 0x139b0000u
+ #define A5_GPA2_CON 0x40u
+@@ -87,6 +88,7 @@
+ 		return;
+ 	}
+ 	a5_keys_started = true;
++	on7xelte_input_start();         /* J7 Prime keys, touch and fuel gauge */
+ 	(void)PE_parse_boot_argn("a5keys", &enabled, sizeof(enabled));
+ 	if (!enabled) {
+ 		printf("A5XELTE KEYS: disabled\n");
+--- a/bsd/dev/a5xelte_dvfs.c
++++ b/bsd/dev/a5xelte_dvfs.c
+@@ -81,6 +81,15 @@
+  *     (reading 0x10900804 is a synchronous external abort).
+  *   - PMIC transfer tracing is off by default ("pmic trace 1").
+  *
++ * 0137: the S2MPU05 RTC (address 0x06 on the same bus, binary, 24 h) sets
++ * the clock, which was at 1969 (XNU here has no RTC driver):
++ *   time           show the clock and the RTC
++ *   time rtc       latch (UPDATE 0x02 |= RUDR) and read the RTC, set the
++ *                  clock from it if it is still before 2020. Run once by
++ *                  on7xelte_input.c 15 s after boot.
++ *   time EPOCH     set the clock (the USB logger sends the PC's time). The
++ *                  RTC itself is never written.
++ *
+  * Boot-arg a5cpufreq=MHZ applies a level once, 20 s after USB start.
+  *
+  * Sources: Samsung 3.18 kernel for the J7 Prime (i2c-exynos5.c batcher
+@@ -100,6 +109,7 @@
+ extern vm_offset_t ml_io_map(vm_offset_t, vm_size_t);
+ bool a5xelte_dvfs_command(const char *cmd, const char *arg);
+ void a5xelte_dvfs_tick(void);
++bool a5xelte_rtc_boot(void);
+ 
+ /* HSI2C_0 (PMIC bus) and its batcher */
+ #define HSI2C_PA                0x10510000ull
+@@ -184,6 +194,8 @@
+ 	uint32_t    boot_khz, ticks;
+ 	uint32_t    target_khz;     /* level asked for; thermal steps climb back to it */
+ 	uint32_t    step_tick;      /* tick of the last thermal step */
++	uint32_t    slave;          /* 0 = PMIC, else this 7-bit address (RTC) */
++	int         posting;
+ 	bool        mapped;
+ } dv;
+ 
+@@ -378,7 +390,7 @@
+ 	ctl |= rd ? (1u << 6) : (1u << 7);                      /* RXCHON / TXCHON */
+ 	uint32_t au = rd32(r, I2C_AUTO) & ~((1u << 31) | (1u << 17) | (1u << 16) | 0xffffu);
+ 	au |= (rd ? (1u << 16) : 0) | (stop ? (1u << 17) : 0) | len;
+-	wr32(r, I2C_ADDR, (PMIC_ADDR & 0x7fu) << 10);
++	wr32(r, I2C_ADDR, ((dv.slave ? dv.slave : PMIC_ADDR) & 0x7fu) << 10);
+ 	wr32(r, I2C_CTL, ctl);
+ 	if (!rd) {
+ 		for (uint32_t i = 0; i < len; i++) {
+@@ -432,6 +444,10 @@
+ 	vm_offset_t r = dv.i2c;
+ 	uint32_t rd_first, st = 0;
+ 
++	if (dv.slave) {
++		return -1;      /* RTC only on the direct path */
++	}
++
+ 	if (!dv.gic_checked) {
+ 		uint32_t en = rd32(dv.gicd, 0x130);
+ 		printf("USB> pmic: GIC ISENABLER12 0x%08x (HSI2C_0 SPI 371/372 %s), ITARGETS 0x%08x\n", en,
+@@ -547,6 +563,90 @@
+ 	return 0;
+ }
+ 
++/* ---- RTC (S2MPU05 at 0x06, read only apart from the RUDR latch) ---- */
++
++#define RTC_ADDR        0x06
++#define RTC_UPDATE      0x02
++#define RTC_RUDR        0x01
++#define RTC_SEC         0x04
++
++static int
++rtc_read(uint8_t t[7])
++{
++	uint8_t up = 0, reg = RTC_SEC, msg[2];
++	int e;
++	if (dv.batch) {
++		return -1;
++	}
++	dv.slave = RTC_ADDR;
++	e = pm_read(RTC_UPDATE, &up);
++	if (!e) {
++		msg[0] = RTC_UPDATE;
++		msg[1] = (uint8_t)(up | RTC_RUDR);      /* copy the counters to the read buffer */
++		e = pm_xfer(false, msg, 2, true) ? -1 : 0;
++	}
++	if (!e) {
++		delay(2000);
++		e = (pm_xfer(false, &reg, 1, false) || pm_xfer(true, t, 7, true)) ? -1 : 0;
++	}
++	dv.slave = 0;
++	return e;
++}
++
++/* days since 1970-01-01 (proleptic Gregorian) */
++static int64_t
++days_from_civil(int64_t y, unsigned m, unsigned d)
++{
++	y -= m <= 2;
++	const int64_t era = (y >= 0 ? y : y - 399) / 400;
++	const unsigned yoe = (unsigned)(y - era * 400);
++	const unsigned mp = m > 2 ? m - 3 : m + 9;
++	const unsigned doy = (153 * mp + 2) / 5 + d - 1;
++	const unsigned doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
++	return era * 146097 + (int64_t)doe - 719468;
++}
++
++static void
++time_cmd(const char *arg)
++{
++	clock_sec_t now;
++	clock_usec_t us;
++	uint8_t t[7];
++	clock_get_calendar_microtime(&now, &us);
++	if (*arg >= '0' && *arg <= '9') {
++		const char *s = arg;
++		uint64_t v = 0;
++		while (*s >= '0' && *s <= '9') {
++			v = v * 10 + (uint64_t)(*s++ - '0');
++		}
++		if (v < 1577836800ull || v > 4102444800ull) {
++			printf("USB> time: %llu out of 2020..2100, ignored\n", v);
++			return;
++		}
++		clock_set_calendar_microtime((clock_sec_t)v, 0);
++		printf("USB> time: clock %lu -> %llu (from the host)\n", (unsigned long)now, v);
++		return;
++	}
++	if (rtc_read(t)) {
++		printf("USB> time: clock %lu, RTC read failed\n", (unsigned long)now);
++		return;
++	}
++	unsigned sec = t[0] & 0x7f, min = t[1] & 0x7f, hour = t[2] & 0x1f;
++	unsigned day = t[4] & 0x1f, mon = t[5] & 0x0f, year = 2000u + (t[6] & 0x7f);
++	bool ok = sec < 60 && min < 60 && hour < 24 && day >= 1 && day <= 31 && mon >= 1 && mon <= 12;
++	uint64_t rtc = ok ? (uint64_t)(days_from_civil(year, mon, day) * 86400 + hour * 3600 + min * 60 + sec) : 0;
++	printf("USB> time: clock %lu, RTC %04u-%02u-%02u %02u:%02u:%02u = %llu%s\n", (unsigned long)now,
++	    year, mon, day, hour, min, sec, rtc, ok ? "" : " (invalid)");
++	if (!strcmp(arg, "rtc") && ok) {
++		if (now >= 1577836800ul) {
++			printf("USB> time: clock already set, RTC not used\n");
++		} else {
++			clock_set_calendar_microtime((clock_sec_t)rtc, 0);
++			printf("USB> time: clock set from the RTC\n");
++		}
++	}
++}
++
+ /* ---- CPU clusters ---- */
+ 
+ static uint32_t
+@@ -1005,7 +1105,9 @@
+ 	if (!dv_map()) {
+ 		return;
+ 	}
+-	if (!strcmp(cmd, "temp")) {
++	if (!strcmp(cmd, "time")) {
++		time_cmd(arg);
++	} else if (!strcmp(cmd, "temp")) {
+ 		printf("USB> temp: %d C (TMU 0x%08x, trim 0x%08x)\n", dv_temp(),
+ 		    rd32(dv.tmu, 0x40), rd32(dv.tmu, 0x0));
+ 	} else if (!strcmp(cmd, "pmic")) {
+@@ -1115,18 +1217,24 @@
+ 	}
+ }
+ 
+-static void
++/* USB thread and on7xelte_input.c both post: "posting" keeps them apart. */
++static bool
+ dv_post(const char *cmd, const char *arg)
+ {
++	bool ok = false;
++	if (__atomic_exchange_n(&dv.posting, 1, __ATOMIC_ACQUIRE)) {
++		printf("USB> dvfs: busy\n");
++		return false;
++	}
+ 	if (dv.busy) {
+ 		printf("USB> dvfs: busy with '%s %s'\n", dv.wcmd, dv.warg);
+-		return;
++		goto out;
+ 	}
+ 	if (!dv.started) {
+ 		thread_t th;
+ 		if (kernel_thread_start(dv_worker, NULL, &th) != KERN_SUCCESS) {
+ 			printf("USB> dvfs: no worker thread\n");
+-			return;
++			goto out;
+ 		}
+ 		thread_deallocate(th);
+ 		dv.started = true;
+@@ -1134,18 +1242,30 @@
+ 	strlcpy(dv.wcmd, cmd, sizeof(dv.wcmd));
+ 	strlcpy(dv.warg, arg, sizeof(dv.warg));
+ 	dv.busy = true;
++	ok = true;
++out:
++	__atomic_store_n(&dv.posting, 0, __ATOMIC_RELEASE);
++	return ok;
+ }
+ 
+ bool
+ a5xelte_dvfs_command(const char *cmd, const char *arg)
+ {
+-	if (strcmp(cmd, "temp") && strcmp(cmd, "pmic") && strcmp(cmd, "cpufreq") && strcmp(cmd, "reg")) {
++	if (strcmp(cmd, "temp") && strcmp(cmd, "pmic") && strcmp(cmd, "cpufreq") && strcmp(cmd, "reg") &&
++	    strcmp(cmd, "time")) {
+ 		return false;
+ 	}
+ 	dv_post(cmd, arg);
+ 	return true;
+ }
+ 
++/* on7xelte_input.c, once after boot: false = busy, ask again later */
++bool
++a5xelte_rtc_boot(void)
++{
++	return !dv.busy && dv_post("time", "rtc");
++}
++
+ /* Called about once a second from the USB thread. */
+ void
+ a5xelte_dvfs_tick(void)
+--- a/iokit/Kernel/arm/SweetBattery.cpp
++++ b/iokit/Kernel/arm/SweetBattery.cpp
+@@ -3,8 +3,14 @@
+  * sweetbattery=1: read-only PM6150 polling every 30 seconds; voltage-derived
+  * SOC is an UNCALIBRATED estimate, not a replacement for the Linux QG algo.
+  * See report.md for binary evidence, register provenance and integration.
++ *
++ * 0137, A5XELTE (Galaxy J7 Prime): on by default, reads the S2MU005 fuel
++ * gauge through on7xelte_fg_read() (bsd/dev/on7xelte_input.c): voltage,
++ * current and the gauge's own SOC, 3300 mAh. There is no charger reading
++ * yet: on charger = charging current above 20 mA, or 99 % and up without
++ * a discharge current. sweetbattery=0 keeps the static 100 % fallback.
+  */
+-#if defined(ARM64_BOARD_CONFIG_SWEET)
++#if defined(ARM64_BOARD_CONFIG_SWEET) || defined(ARM64_BOARD_CONFIG_A5XELTE)
+ #include <device/device_types.h> /* io_buf_ptr_t for private OSKext headers */
+ #include <IOKit/IOLib.h>
+ #include <IOKit/IOWorkLoop.h>
+@@ -12,9 +18,18 @@
+ #include <IOKit/pwr_mgt/IOPMPowerSource.h>
+ #include <libkern/c++/OSCollectionIterator.h>
+ #include <pexpert/pexpert.h>
++#if defined(ARM64_BOARD_CONFIG_A5XELTE)
++/* bsd/dev/on7xelte_input.c */
++extern "C" int on7xelte_fg_read(unsigned *mv, int *ma, unsigned *soc100);
++#define SB_DESIGN_MAH 3300u
++#define SB_SOURCE "S2MU005 fuel gauge"
++#else
+ /* bsd/dev/sweet_spmi.c */
+ extern "C" int sweet_spmi_init(void);
+ extern "C" int sweet_spmi_read(unsigned sid, unsigned addr, uint8_t *out);
++#define SB_DESIGN_MAH 5020u
++#define SB_SOURCE "PM6150 / estimated SOC"
++#endif
+ 
+ class SweetBattery : public IOPMPowerSource {
+ 	OSDeclareDefaultStructors(SweetBattery);
+@@ -102,10 +117,10 @@
+     bool capable, bool charging, bool full, bool measured, bool currentValid)
+ {
+ 	/* Use consistent mAh units (DT nominal=5020). powerd computes C*100/M. */
+-	const unsigned capacity = (5020u * percent + 50u) / 100u;
++	const unsigned capacity = (SB_DESIGN_MAH * percent + 50u) / 100u;
+ 	setBatteryInstalled(true);
+ 	setCurrentCapacity(capacity);
+-	setMaxCapacity(5020);
++	setMaxCapacity(SB_DESIGN_MAH);
+ 	setExternalConnected(external);
+ 	setExternalChargeCapable(capable);
+ 	setIsCharging(charging);
+@@ -119,8 +134,8 @@
+ 	putBool("FullyCharged", full);
+ 	putBool("AppleRawExternalConnected", external);
+ 	putNumber("AppleRawCurrentCapacity", capacity);
+-	putNumber("AppleRawMaxCapacity", 5020);
+-	putNumber("DesignCapacity", 5020);
++	putNumber("AppleRawMaxCapacity", SB_DESIGN_MAH);
++	putNumber("DesignCapacity", SB_DESIGN_MAH);
+ 	putNumber("InstantAmperage", (UInt32)ma);
+ 	/* iOS battery convention: centidegrees C; fixed 25 C, NOT measured. */
+ 	putNumber("Temperature", 2500);
+@@ -137,7 +152,7 @@
+ 		const char *keys[] = {kIOBatteryCurrentChargeKey, kIOBatteryCapacityKey,
+ 		    kIOBatteryVoltageKey, kIOBatteryAmperageKey, kIOBatteryCycleCountKey,
+ 		    kIOBatteryFlagsKey};
+-		UInt32 values[] = {capacity, 5020, mv, (UInt32)ma, 0,
++		UInt32 values[] = {capacity, SB_DESIGN_MAH, mv, (UInt32)ma, 0,
+ 		    (UInt32)(kIOBatteryInstalled | (external ? kIOBatteryChargerConnect : 0) |
+ 		    (charging ? kIOBatteryCharge : 0))};
+ 		for (unsigned i = 0; i < sizeof(values) / sizeof(values[0]); ++i) {
+@@ -154,12 +169,47 @@
+ 	int mode = measured ? 1 : 0;
+ 	if (mode != fLastMode) {
+ 		IOLog("SWEET BATTERY: %s, %u%% %umV external=%d charging=%d\n",
+-		    measured ? "PM6150 / estimated SOC" : "static fallback",
++		    measured ? SB_SOURCE : "static fallback",
+ 		    percent, mv, external, charging);
+ 		fLastMode = mode;
+ 	}
+ }
+ 
++#if defined(ARM64_BOARD_CONFIG_A5XELTE)
++bool
++SweetBattery::readWord(unsigned, uint16_t *)
++{
++	return false;
++}
++
++unsigned
++SweetBattery::estimatePercent(unsigned mv)
++{
++	return mv >= 4200 ? 100 : 50;   /* unused here: the gauge gives the SOC */
++}
++
++void
++SweetBattery::poll(void)
++{
++	unsigned mv = 0, soc = 0;
++	int ma = 0;
++	if (!fReal || on7xelte_fg_read(&mv, &ma, &soc) || mv < 2800 || mv > 4600) {
++		publish(100, 4200, 0, true, true, false, true, false, false);
++		return;
++	}
++	unsigned percent = (soc + 50u) / 100u;
++	if (percent > 100) {
++		percent = 100;
++	}
++	if (percent < 1) {
++		percent = 1;    /* never 0 %: the gauge is not calibrated against Linux's UI SOC */
++	}
++	bool charging = ma > 20;
++	bool external = charging || (percent >= 99 && ma > -20);
++	bool full = external && !charging && percent >= 99;
++	publish(full ? 100 : percent, mv, ma, external, external, charging, full, true, true);
++}
++#else
+ /* Keep the proven single-byte observer command. Read two matching whole
+  * words to reject most torn ADC samples without writing the QG HOLD bit.
+  * This is a bounded consistency check, not a hardware snapshot guarantee. */
+@@ -245,6 +295,7 @@
+ 	publish(full ? 100 : estimatePercent(mv), mv, ma, external, capable,
+ 	    charging, full, true, currentValid);
+ }
++#endif /* ARM64_BOARD_CONFIG_A5XELTE */
+ 
+ void
+ SweetBattery::timerFired(OSObject *owner, IOTimerEventSource *sender)
+@@ -262,9 +313,15 @@
+ 	if (!IOPMPowerSource::start(provider)) {
+ 		return false;
+ 	}
++#if defined(ARM64_BOARD_CONFIG_A5XELTE)
++	int real = 1;
++	(void)PE_parse_boot_argn("sweetbattery", &real, sizeof(real));
++	fReal = real != 0;      /* the gauge may answer only once on7xelte_input starts */
++#else
+ 	int real = 0;
+ 	(void)PE_parse_boot_argn("sweetbattery", &real, sizeof(real));
+ 	fReal = real == 1 && sweet_spmi_init() == 0;
++#endif
+ 	/* Publish a complete source BEFORE registerService wakes powerd. */
+ 	poll();
+ 	if (fReal) {
+@@ -316,4 +373,4 @@
+ 	OSSafeReleaseNULL(fLoop);
+ 	IOPMPowerSource::free();
+ }
+-#endif /* ARM64_BOARD_CONFIG_SWEET */
++#endif /* ARM64_BOARD_CONFIG_SWEET || ARM64_BOARD_CONFIG_A5XELTE */
+--- /dev/null
++++ b/bsd/dev/on7xelte_input.c
+@@ -0,0 +1,411 @@
++/*
++ * on7xelte (Galaxy J7 Prime, Exynos7870) keys, touch and fuel gauge.
++ *
++ * Everything here was read live with "reg" on xnu21 before it was written:
++ *   - keys, ALIVE pinctrl 0x139f0000, all active low inputs:
++ *     Power GPA0-0 (DAT +0x44 bit0), Home GPA1-7 (+0x64 bit7),
++ *     Vol+ GPA2-0 and Vol- GPA2-1 (+0x84 bit0/bit1).
++ *   - touch: Synaptics TD4300 (RMI4) at 0x70 on i2c_3 0x13840000, pins
++ *     gpc3-0/1 (pinctrl TOUCH 0x139d0000) switched to I2C, ATTN on gpc3-2
++ *     (active low). F01 data at 0x04 (+1 = interrupt status, read clears
++ *     ATTN), F12 data at 0x08: 8 bytes per finger (type, x lo/hi, y lo/hi,
++ *     z, wx, wy), type 1 = finger. Coordinates are panel pixels 1080x1920,
++ *     which is SweetHID's A5XELTE logical size.
++ *   - fuel gauge: S2MU005 at 0x3b on i2c_4 0x13830000, pins gpc4-0/1
++ *     (pinctrl TOP 0x139b0000 +0x60). VBAT 0x04 (mV = raw * 1000 >> 13),
++ *     current 0x06 (signed, mA = -raw * 1000 >> 12, positive = charging),
++ *     RSOC 0x08 (0.01 % = raw * 10000 >> 14).
++ *
++ * The two buses are the old S3C2440-style controller, driven polled here
++ * (IICCON 0xab: ack, PCLK/16/12, about 385 kHz, verified live). No
++ * interrupts are used and nothing but the I2C controllers and the two pin
++ * mux nibble pairs is written. The touch controller and the fuel gauge are
++ * only read, except the RMI4 page select (0xff = 0).
++ *
++ * Boot-args: on7input=0 turns all of it off; on7touch=0 / on7keys=0 one
++ * part. The fuel gauge is read by SweetBattery through on7xelte_fg_read().
++ */
++#if defined(ARM64_BOARD_CONFIG_A5XELTE)
++#include <sys/param.h>
++#include <sys/systm.h>
++#include <kern/clock.h>
++#include <kern/thread.h>
++#include <kern/sched_prim.h>
++#include <kern/locks.h>
++#include <machine/machine_routines.h>
++#include <pexpert/pexpert.h>
++
++extern vm_offset_t ml_io_map(vm_offset_t, vm_size_t);
++extern void sweet_hid_key(int key, int down);
++extern void sweet_hid_touch(int finger, int down, int x, int y);
++extern bool a5xelte_rtc_boot(void);   /* a5xelte_dvfs.c */
++
++void on7xelte_input_start(void);
++int on7xelte_fg_read(unsigned *mv, int *ma, unsigned *soc100);
++
++#define ALIVE_PA        0x139f0000ull
++#define TOP_PA          0x139b0000ull   /* gpc4 CON +0x60 */
++#define TOUCH_PIN_PA    0x139d0000ull   /* gpc3 CON +0, DAT +4 */
++#define I2C3_PA         0x13840000ull   /* touch */
++#define I2C4_PA         0x13830000ull   /* fuel gauge */
++
++#define IICCON          0x00
++#define IICSTAT         0x04
++#define IICDS           0x0c
++#define CON_ACK         0xabu   /* ack, PCLK/16, int enable (pending flag), scale 11 */
++#define CON_NACK        0x2bu
++#define CON_PEND        0x10u
++
++#define TSP_ADDR        0x70
++#define TSP_F01_DATA    0x04
++#define TSP_F12_DATA    0x08
++#define TSP_SLOTS       10
++#define FG_ADDR         0x3b
++
++static struct {
++	vm_offset_t alive, top, tpin, i2c3, i2c4;
++	lck_grp_t   *grp;
++	lck_mtx_t   *fg_lock;
++	bool        started, fg_ok;
++	int         sleep;
++} in;
++
++static inline uint32_t
++rd(vm_offset_t b, uint32_t off)
++{
++	uint32_t v = *(volatile uint32_t *)(b + off);
++	__asm__ volatile ("dmb oshld" ::: "memory");
++	return v;
++}
++
++static inline void
++wr(vm_offset_t b, uint32_t off, uint32_t v)
++{
++	__asm__ volatile ("dmb oshst" ::: "memory");
++	*(volatile uint32_t *)(b + off) = v;
++}
++
++static void
++in_sleep_ms(uint32_t ms)
++{
++	uint64_t deadline;
++	clock_interval_to_deadline(ms, NSEC_PER_MSEC, &deadline);
++	(void)assert_wait_deadline(&in.sleep, THREAD_UNINT, deadline);
++	thread_block(THREAD_CONTINUE_NULL);
++}
++
++/* ---- S3C polled I2C ---------------------------------------------------- */
++
++static int
++s3c_wait(vm_offset_t b)
++{
++	for (int i = 0; i < 1000; i++) {                /* 10 ms; a byte takes ~25 us */
++		if (rd(b, IICCON) & CON_PEND) {
++			return 0;
++		}
++		delay(10);
++	}
++	return -1;
++}
++
++static void
++s3c_stop(vm_offset_t b, bool rx)
++{
++	wr(b, IICSTAT, rx ? 0x90u : 0xd0u);
++	wr(b, IICCON, CON_NACK);                        /* clears pending, sends stop */
++	for (int i = 0; i < 100 && (rd(b, IICSTAT) & (1u << 5)); i++) {  /* bus busy */
++		delay(5);
++	}
++}
++
++/* START, address + write; returns 0 on ACK. */
++static int
++s3c_start_tx(vm_offset_t b, uint8_t addr7)
++{
++	wr(b, IICSTAT, 0x10);
++	wr(b, IICCON, CON_ACK);
++	wr(b, IICDS, (uint32_t)addr7 << 1);
++	wr(b, IICSTAT, 0xf0);
++	if (s3c_wait(b) || (rd(b, IICSTAT) & 1u)) {
++		return -1;
++	}
++	return 0;
++}
++
++static int
++s3c_tx_byte(vm_offset_t b, uint8_t v)
++{
++	wr(b, IICDS, v);
++	wr(b, IICCON, CON_ACK);
++	if (s3c_wait(b) || (rd(b, IICSTAT) & 1u)) {
++		return -1;
++	}
++	return 0;
++}
++
++static int
++s3c_read(vm_offset_t b, uint8_t addr7, uint8_t reg, uint8_t *buf, uint32_t n)
++{
++	if (s3c_start_tx(b, addr7) || s3c_tx_byte(b, reg)) {
++		s3c_stop(b, false);
++		return -1;
++	}
++	wr(b, IICDS, ((uint32_t)addr7 << 1) | 1u);
++	wr(b, IICSTAT, 0xb0);                           /* repeated START, master receive */
++	wr(b, IICCON, CON_ACK);
++	if (s3c_wait(b) || (rd(b, IICSTAT) & 1u)) {
++		s3c_stop(b, true);
++		return -1;
++	}
++	for (uint32_t i = 0; i < n; i++) {
++		wr(b, IICCON, i + 1 == n ? CON_NACK : CON_ACK);
++		if (s3c_wait(b)) {
++			s3c_stop(b, true);
++			return -1;
++		}
++		buf[i] = (uint8_t)rd(b, IICDS);
++	}
++	s3c_stop(b, true);
++	return 0;
++}
++
++static int
++s3c_write(vm_offset_t b, uint8_t addr7, const uint8_t *buf, uint32_t n)
++{
++	int e = s3c_start_tx(b, addr7);
++	for (uint32_t i = 0; !e && i < n; i++) {
++		e = s3c_tx_byte(b, buf[i]);
++	}
++	s3c_stop(b, false);
++	return e;
++}
++
++/* Low byte of a pinctrl CON register: pins 0 and 1 to function 2 (I2C). */
++static void
++pins_to_i2c(vm_offset_t pin, uint32_t con_off, const char *name)
++{
++	uint32_t con = rd(pin, con_off);
++	if ((con & 0xffu) != 0x22u) {
++		wr(pin, con_off, (con & ~0xffu) | 0x22u);
++		printf("ON7 INPUT: %s CON 0x%x -> 0x%x (pins to I2C)\n", name, con, rd(pin, con_off));
++	}
++}
++
++/* ---- fuel gauge -------------------------------------------------------- */
++
++int
++on7xelte_fg_read(unsigned *mv, int *ma, unsigned *soc100)
++{
++	uint8_t d[6];
++	int e;
++	if (!in.fg_ok) {
++		return -1;
++	}
++	lck_mtx_lock(in.fg_lock);
++	e = s3c_read(in.i2c4, FG_ADDR, 0x04, d, sizeof(d));
++	lck_mtx_unlock(in.fg_lock);
++	if (e) {
++		return -1;
++	}
++	uint32_t vraw = (uint32_t)d[0] | ((uint32_t)d[1] << 8);
++	int16_t craw = (int16_t)((uint16_t)d[2] | ((uint16_t)d[3] << 8));
++	int16_t sraw = (int16_t)((uint16_t)d[4] | ((uint16_t)d[5] << 8));
++	*mv = (vraw * 1000u) >> 13;
++	*ma = -(((int32_t)craw * 1000) / 4096);
++	int s = ((int32_t)sraw * 10000) / 16384;
++	*soc100 = s < 0 ? 0 : (s > 10000 ? 10000 : (unsigned)s);
++	return 0;
++}
++
++/* ---- keys -------------------------------------------------------------- */
++
++static uint32_t
++keys_sample(void)
++{
++	/* bit n = key n pressed: 0 power, 1 vol+, 2 vol-, 3 home (SweetHID order) */
++	uint32_t a0 = rd(in.alive, 0x44), a1 = rd(in.alive, 0x64), a2 = rd(in.alive, 0x84);
++	return (!(a0 & 1u) ? 1u : 0) | (!(a2 & 1u) ? 2u : 0) | (!(a2 & 2u) ? 4u : 0) |
++	       (!(a1 & 0x80u) ? 8u : 0);
++}
++
++/* ---- touch ------------------------------------------------------------- */
++
++static struct {
++	bool     on;            /* controller answered */
++	uint32_t down;          /* slots reported down */
++	int      x[TSP_SLOTS], y[TSP_SLOTS];
++	uint32_t fails, idle;
++} ts;
++
++static void
++touch_release_all(void)
++{
++	for (int i = 0; i < TSP_SLOTS; i++) {
++		if (ts.down & (1u << i)) {
++			sweet_hid_touch(i, 0, ts.x[i], ts.y[i]);
++		}
++	}
++	ts.down = 0;
++}
++
++static bool
++touch_attn(void)
++{
++	return !(rd(in.tpin, 0x04) & (1u << 2));        /* gpc3-2 low = report pending */
++}
++
++static void
++touch_service(void)
++{
++	uint8_t st[2], f[TSP_SLOTS * 8];
++	if (s3c_read(in.i2c3, TSP_ADDR, TSP_F01_DATA, st, sizeof(st)) ||
++	    s3c_read(in.i2c3, TSP_ADDR, TSP_F12_DATA, f, sizeof(f))) {
++		if (ts.on) {
++			printf("ON7 INPUT: touch stopped answering\n");
++			touch_release_all();
++		}
++		ts.on = false;
++		ts.fails++;
++		return;
++	}
++	if (!ts.on) {
++		printf("ON7 INPUT: touch answers (status 0x%02x int 0x%02x)\n", st[0], st[1]);
++		ts.on = true;
++	}
++	for (int i = 0; i < TSP_SLOTS; i++) {
++		const uint8_t *p = f + i * 8;
++		bool down = p[0] == 0x01;
++		int x = p[1] | (p[2] << 8), y = p[3] | (p[4] << 8);
++		if (down && (x > 1079 || y > 1919)) {
++			continue;       /* garbage: keep the last state */
++		}
++		if (down) {
++			ts.x[i] = x;
++			ts.y[i] = y;
++			ts.down |= 1u << i;
++			sweet_hid_touch(i, 1, x, y);
++		} else if (ts.down & (1u << i)) {
++			ts.down &= ~(1u << i);
++			sweet_hid_touch(i, 0, ts.x[i], ts.y[i]);
++		}
++	}
++}
++
++static bool
++touch_wake(void)
++{
++	/* RMI4 page 0, then one F01 read: the panel is powered with the display */
++	uint8_t page[2] = { 0xff, 0x00 }, st[2];
++	if (s3c_write(in.i2c3, TSP_ADDR, page, sizeof(page)) ||
++	    s3c_read(in.i2c3, TSP_ADDR, TSP_F01_DATA, st, sizeof(st))) {
++		return false;
++	}
++	printf("ON7 INPUT: touch at 0x%x on i2c_3 (status 0x%02x int 0x%02x)\n", TSP_ADDR, st[0], st[1]);
++	ts.on = true;
++	return true;
++}
++
++/* ---- thread ------------------------------------------------------------ */
++
++static void
++in_thread(void *arg __unused, wait_result_t w __unused)
++{
++	int keys = 1, touch = 1;
++	(void)PE_parse_boot_argn("on7keys", &keys, sizeof(keys));
++	(void)PE_parse_boot_argn("on7touch", &touch, sizeof(touch));
++	uint32_t stable = keys ? keys_sample() : 0, prev = stable, same = 0;
++	uint32_t tick = 0;
++	bool rtc_asked = false;
++
++	printf("ON7 INPUT: keys %s, touch %s, keys now 0x%x\n", keys ? "on" : "off",
++	    touch ? "on" : "off", stable);
++	for (;;) {
++		tick++;
++		if (keys) {
++			uint32_t s = keys_sample();
++			if (s == prev) {
++				same = same < 2 ? same + 1 : 2;
++			} else {
++				prev = s;
++				same = 0;
++			}
++			if (same == 2 && s != stable) {
++				for (int k = 0; k < 4; k++) {
++					if ((s ^ stable) & (1u << k)) {
++						sweet_hid_key(k, (int)((s >> k) & 1u));
++					}
++				}
++				stable = s;
++			}
++		}
++		if (touch) {
++			if (!ts.on) {
++				/* retry every 2 s (screen off / panel not powered yet) */
++				if (tick % 200 == 0) {
++					(void)touch_wake();
++				}
++			} else if (touch_attn()) {
++				ts.idle = 0;
++				touch_service();
++			} else if (ts.down && ++ts.idle >= 50) {
++				/* no report for 500 ms with fingers down: re-read once */
++				ts.idle = 0;
++				touch_service();
++			}
++		}
++		/* clock from the PMIC RTC once, 15 s in (bsd/dev/a5xelte_dvfs.c) */
++		if (!rtc_asked && tick >= 1500) {
++			rtc_asked = a5xelte_rtc_boot();
++			if (!rtc_asked && tick >= 6000) {
++				rtc_asked = true;
++			}
++		}
++		in_sleep_ms(10);
++	}
++}
++
++void
++on7xelte_input_start(void)
++{
++	int on = 1;
++	thread_t th;
++	if (in.started) {
++		return;
++	}
++	in.started = true;
++	(void)PE_parse_boot_argn("on7input", &on, sizeof(on));
++	if (!on) {
++		printf("ON7 INPUT: off (on7input=0)\n");
++		return;
++	}
++	in.alive = ml_io_map((vm_offset_t)ALIVE_PA, 0x1000);
++	in.top = ml_io_map((vm_offset_t)TOP_PA, 0x1000);
++	in.tpin = ml_io_map((vm_offset_t)TOUCH_PIN_PA, 0x1000);
++	in.i2c3 = ml_io_map((vm_offset_t)I2C3_PA, 0x1000);
++	in.i2c4 = ml_io_map((vm_offset_t)I2C4_PA, 0x1000);
++	if (!in.alive || !in.top || !in.tpin || !in.i2c3 || !in.i2c4) {
++		printf("ON7 INPUT: mapping failed\n");
++		return;
++	}
++	in.grp = lck_grp_alloc_init("on7input", LCK_GRP_ATTR_NULL);
++	in.fg_lock = lck_mtx_alloc_init(in.grp, LCK_ATTR_NULL);
++	pins_to_i2c(in.top, 0x60, "gpc4 (fuel gauge)");
++	pins_to_i2c(in.tpin, 0x00, "gpc3 (touch)");
++
++	unsigned mv = 0, soc = 0;
++	int ma = 0;
++	in.fg_ok = true;
++	if (on7xelte_fg_read(&mv, &ma, &soc)) {
++		in.fg_ok = false;
++		printf("ON7 INPUT: fuel gauge at 0x%x on i2c_4 does not answer\n", FG_ADDR);
++	} else {
++		printf("ON7 INPUT: battery %u.%02u%% %u mV %d mA\n", soc / 100, soc % 100, mv, ma);
++	}
++	(void)touch_wake();
++	if (kernel_thread_start(in_thread, NULL, &th) == KERN_SUCCESS) {
++		thread_deallocate(th);
++	} else {
++		printf("ON7 INPUT: no thread\n");
++	}
++}
++#endif /* ARM64_BOARD_CONFIG_A5XELTE */
