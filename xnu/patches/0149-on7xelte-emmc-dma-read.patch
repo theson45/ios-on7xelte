@@ -1,6 +1,6 @@
 --- a/bsd/dev/a5xelte_emmc.c
 +++ b/bsd/dev/a5xelte_emmc.c
-@@ -26,6 +26,10 @@
+@@ -26,8 +26,13 @@
  #include <machine/atomic.h>
  #include <kern/clock.h>
  #include <mach/mach_time.h>
@@ -10,8 +10,11 @@
 +#include <vm/vm_kern.h>
  
  extern vm_offset_t ml_io_map(vm_offset_t phys_addr, vm_size_t size);
++extern ppnum_t pmap_find_phys(pmap_t pmap, addr64_t va);
  extern kern_return_t kernel_thread_start(thread_continue_t, void *, thread_t *);
-@@ -520,6 +524,281 @@
+ extern void thread_deallocate(thread_t);
+ extern int hz;
+@@ -520,6 +525,281 @@
  	return error;
  }
  
@@ -293,7 +296,7 @@
  static int
  emmc_write_sector(uint32_t lba, const uint8_t *sector)
  {
-@@ -923,6 +1202,27 @@
+@@ -923,6 +1203,27 @@
  			printf("USB> io bench: CMD18 read %u sectors in %llu ms = %llu KB/s%s\n",
  				n, ms, ms ? (uint64_t)n * 512u / ms : 0, error ? " (error)" : "");
  		}
@@ -321,7 +324,7 @@
  		printf("USB> io: multi-block reads %s, %llu CMD18 so far\n",
  			emmc_multi_state == 1 ? "on" : "off", emmc_multi_cmds);
  		printf("USB> io: multi-block writes %s, %llu CMD25 so far, %llu read-back mismatches, check %s\n",
-@@ -1000,6 +1300,9 @@
+@@ -1000,6 +1301,9 @@
  		error = EIO;
  		goto done;
  	}
@@ -331,7 +334,7 @@
  	uint64_t io_t0 = mach_absolute_time();     /* 0146 */
  	lck_mtx_lock(&a5xelte_emmc_lock);
  	uint64_t io_t1 = mach_absolute_time();
-@@ -1012,7 +1315,7 @@
+@@ -1012,7 +1316,7 @@
  			/* 0147: whole sectors go straight into the buffer with CMD18 */
  			uint32_t run = skip == 0 ? MIN((count - n) / 512u, EMMC_MULTI_MAX) : 0;
  			if (run >= 2 && emmc_multi_on()) {
