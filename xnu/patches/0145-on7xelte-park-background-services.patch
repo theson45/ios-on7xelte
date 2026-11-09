@@ -1,0 +1,50 @@
+--- a/bsd/dev/a5xelte_usb.c
++++ b/bsd/dev/a5xelte_usb.c
+@@ -953,13 +953,28 @@
+  * Boot-arg on7deny=NAME[,NAME] replaces the list, on7deny=- allows all;
+  * on7denymode=refuse goes back to the 0141 behaviour (EACCES).
+  * 0143: mediaserverd is always refused, never parked (SpringBoard waits for it).
++ * 0145: background services with no use on this phone (Siri, Health, Find My,
++ * Screen Time, suggestions, iCloud/Store accounts, Watch...) are parked too, so
++ * launchd and logd have less to do at boot. If a WAIT line shows someone
++ * waiting for one of them, take it off the list (or `kill PID 19`).
+  */
+ static const char ud_deny_default[] =
+     "mediaserverd,audioclocksyncd,audiomxd,UARPUpdaterServiceLegacyAudio,"
+     "bluetoothd,bluetoothuserd,BlueTool,BTLEServer,"
+     "wifid,wifip2pd,wifianalyticsd,wifivelocityd,WiFiCloudAssetsClient,"
+     "CommCenter,CommCenterMobileHelper,CommCenterRootHelper,WirelessRadioManagerd,"
+-    "nfcd,carkitd";
++    "nfcd,carkitd,"
++    /* 0145: background services */
++    "suggestd,routined,assistantd,healthd,calaccessd,coreidvd,searchpartyd,"
++    "amsaccountsd,amsengagementd,homed,remindd,pipelined,ContextService,geod,"
++    "siriknowledged,siriactionsd,corespeechd,triald,duetexpertd,"
++    "fitcored,fitnesscoachingd,findmydeviced,fmfd,fmflocatord,"
++    "familycircled,familynotificationd,ScreenTimeAgent,UsageTrackingAgent,"
++    "FamilyControlsAgent,ManagedSettingsAgent,promotedcontentd,mapspushd,navd,"
++    "watchlistd,sosd,safetyalertsd,nanoregistryd,cloudpaird,nanoprefsyncd,"
++    "itunescloudd,softwareupdated,announced,voiced,CallHistorySyncHelper,"
++    "peopled,sociallayerd,contactsdonationagent,askpermissiond,transparencyd,"
++    "awdd,rtcreportingd,aggregated";
+ static char ud_deny_arg[512];
+ static int ud_deny_state;       /* 0 not read, 1 default, 2 boot-arg, 3 off */
+ static int ud_deny_refuse;      /* on7denymode=refuse */
+--- a/bsd/kern/kern_exit.c
++++ b/bsd/kern/kern_exit.c
+@@ -2132,9 +2132,12 @@
+ 		    (task_info_t)&ti, &cnt) == KERN_SUCCESS) {
+ 			absolutetime_to_nanoseconds(ti.total_user + ti.total_system, &cpu);
+ 		}
+-		printf("exit %s pid %d: lived %llu ms, cpu %llu ms, status 0x%x\n",
+-		    p->p_name, proc_pid(p), lived / NSEC_PER_MSEC, cpu / NSEC_PER_MSEC,
+-		    (unsigned)p->p_xstat);
++		/* 0145: xpcproxy "exits" with 0 each time it turns into the service */
++		if (p->p_xstat != 0 || strcmp(p->p_name, "xpcproxy") != 0) {
++			printf("exit %s pid %d: lived %llu ms, cpu %llu ms, status 0x%x\n",
++			    p->p_name, proc_pid(p), lived / NSEC_PER_MSEC,
++			    cpu / NSEC_PER_MSEC, (unsigned)p->p_xstat);
++		}
+ 	}
+ #endif
+ 
