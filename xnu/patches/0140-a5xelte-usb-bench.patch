@@ -1,0 +1,117 @@
+--- a/bsd/dev/a5xelte_usb.c
++++ b/bsd/dev/a5xelte_usb.c
+@@ -851,6 +851,96 @@
+ 	}
+ }
+ 
++/*
++ * bench: raw CPU and memory speed, to tell "slow CPU/DRAM" from "processes
++ * waiting on each other". A dependent add chain (about one add per cycle on
++ * the A53, so M adds/s is close to the clock in MHz), then 4 MiB write,
++ * read and copy (DRAM) and an 8 KiB copy (L1 cache). Own thread.
++ */
++#define UD_BENCH_SIZE   (4u << 20)
++static vm_offset_t ud_bench_buf;
++static int ud_bench_busy;
++
++static uint64_t
++ud_bench_us(uint64_t t0)
++{
++	uint64_t ns;
++	absolutetime_to_nanoseconds(mach_absolute_time() - t0, &ns);
++	return ns / 1000 ? ns / 1000 : 1;
++}
++
++static void
++ud_bench_thread(void *arg __unused, wait_result_t w __unused)
++{
++	uint64_t t0, us, x = 0;
++	t0 = mach_absolute_time();
++	for (uint32_t i = 0; i < 50000000u; i++) {
++		__asm__ volatile ("add %0, %0, #1\n\tadd %0, %0, #1\n\tadd %0, %0, #1\n\tadd %0, %0, #1" : "+r"(x));
++	}
++	us = ud_bench_us(t0);
++	printf("USB> bench: cpu %llu M dependent adds/s (~MHz), %llu us\n", x / us, us);
++
++	if (ud_bench_buf == 0 &&
++	    kmem_alloc_contig(kernel_map, &ud_bench_buf, UD_BENCH_SIZE, PAGE_MASK, 0, 0,
++	    KMA_DATA | KMA_ZERO | KMA_PERMANENT, VM_KERN_MEMORY_IOKIT) != KERN_SUCCESS) {
++		ud_bench_buf = 0;
++		printf("USB> bench: no 4 MiB buffer\n");
++		goto out;
++	}
++	char *b = (char *)ud_bench_buf;
++	const uint64_t mb = 32;          /* MiB moved per test */
++	t0 = mach_absolute_time();
++	for (int r = 0; r < 8; r++) {
++		memset(b, r, UD_BENCH_SIZE);
++	}
++	us = ud_bench_us(t0);
++	printf("USB> bench: dram write %llu MB/s\n", mb * 1000000 / us);
++
++	volatile uint64_t sum = 0;
++	t0 = mach_absolute_time();
++	for (int r = 0; r < 8; r++) {
++		const uint64_t *q = (const uint64_t *)b;
++		uint64_t s0 = 0, s1 = 0, s2 = 0, s3 = 0;
++		for (uint32_t i = 0; i < UD_BENCH_SIZE / 8; i += 4) {
++			s0 += q[i]; s1 += q[i + 1]; s2 += q[i + 2]; s3 += q[i + 3];
++		}
++		sum += s0 + s1 + s2 + s3;
++	}
++	us = ud_bench_us(t0);
++	printf("USB> bench: dram read %llu MB/s\n", mb * 1000000 / us);
++
++	t0 = mach_absolute_time();
++	for (int r = 0; r < 16; r++) {
++		memcpy(b + UD_BENCH_SIZE / 2, b, UD_BENCH_SIZE / 2);
++	}
++	us = ud_bench_us(t0);
++	printf("USB> bench: dram copy %llu MB/s (read+write counted once)\n", mb * 1000000 / us);
++
++	t0 = mach_absolute_time();
++	for (int r = 0; r < 4096; r++) {
++		memcpy(b + 8192, b, 8192);
++	}
++	us = ud_bench_us(t0);
++	printf("USB> bench: L1 copy %llu MB/s\n", 32ull * 1000000 / us);
++out:
++	__atomic_store_n(&ud_bench_busy, 0, __ATOMIC_RELEASE);
++}
++
++static void
++ud_bench(void)
++{
++	thread_t thread;
++	if (__atomic_exchange_n(&ud_bench_busy, 1, __ATOMIC_ACQ_REL)) {
++		printf("USB> bench: already running\n");
++		return;
++	}
++	if (kernel_thread_start(ud_bench_thread, NULL, &thread) == KERN_SUCCESS) {
++		thread_deallocate(thread);
++	} else {
++		__atomic_store_n(&ud_bench_busy, 0, __ATOMIC_RELEASE);
++	}
++}
++
+ static int ud_ps_count;
+ 
+ static int
+@@ -960,7 +1050,7 @@
+ 	}
+ 	printf("USB> $ %s %s\n", line, arg);
+ 	if (!strcmp(line, "help")) {
+-		printf("USB> commands: help | info | replay | ps | top [SECS] | sample NAME[,NAME]|PID | "
++		printf("USB> commands: help | info | replay | ps | top [SECS] | bench | sample NAME[,NAME]|PID | "
+ 		    "kill PID [SIG] | rd PA [N] | reboot | recovery\n");
+ 		printf("USB> dvfs: temp | pmic [REG [N]] | cpufreq [MHZ] (343..1586)\n");
+ 		printf("USB> reg OPS: r PA [N] ; w PA V ; m PA MASK V ; p PA MASK V US ; d US ; i 0|1\n");
+@@ -977,6 +1067,8 @@
+ 		ud_ps_count = 0;
+ 		proc_iterate(PROC_ALLPROCLIST, ud_ps_proc, NULL, NULL, NULL);
+ 		printf("USB> ps: %d processes\n", ud_ps_count);
++	} else if (!strcmp(line, "bench")) {
++		ud_bench();
+ 	} else if (!strcmp(line, "top")) {
+ 		const char *s = arg;
+ 		ud_top(*arg ? (unsigned)ud_num(&s) : 5);
