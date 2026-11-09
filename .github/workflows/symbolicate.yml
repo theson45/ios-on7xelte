@@ -9,7 +9,10 @@ on:
     inputs:
       lines:
         description: "SMP/CRASH console lines (header 'slide .. mh ..' line first)"
-        required: true
+        default: ""
+      disass:
+        description: "unslid cache addresses to disassemble (ADDR or ADDR:COUNT, blank separated)"
+        default: ""
       run_id:
         description: "root.yml run that holds the ios-root artifact"
         default: "42526101397"
@@ -49,6 +52,7 @@ jobs:
           ls -la work/dsc
 
       - name: Symbolicate
+        if: inputs.lines != ''
         env:
           LINES: ${{ inputs.lines }}
         run: |
@@ -59,8 +63,26 @@ jobs:
           [ -n "$cache" ] || cache=$(ls work/dsc/dyld_shared_cache_arm64* | head -1)
           python3 tools/sweet-crash.py "$cache" - work/lines.txt | tee work/symbolicated.txt
 
+      - name: Disassemble
+        if: inputs.disass != ''
+        env:
+          VADDRS: ${{ inputs.disass }}
+        run: |
+          set -ux
+          cache=$(ls work/dsc/dyld_shared_cache_arm64* | grep -v '\.' | head -1 || true)
+          [ -n "$cache" ] || cache=$(ls work/dsc/dyld_shared_cache_arm64* | head -1)
+          for item in $VADDRS; do
+            addr=${item%%:*}; count=200
+            [ "$item" != "$addr" ] && count=${item#*:}
+            echo "==== $addr ($count)"
+            ipsw dsc disass "$cache" --vaddr "$addr" --count "$count" --symbolicate 2>&1 ||
+              ipsw dsc disass "$cache" --vaddr "$addr" --count "$count" 2>&1
+          done >> work/symbolicated.txt
+          cat work/symbolicated.txt
+
       - uses: actions/upload-artifact@v4
         with:
           name: symbolicated
           path: work/symbolicated.txt
+          if-no-files-found: ignore
           retention-days: 14
