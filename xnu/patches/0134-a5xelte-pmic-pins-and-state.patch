@@ -1,0 +1,102 @@
+--- a/bsd/dev/a5xelte_dvfs.c
++++ b/bsd/dev/a5xelte_dvfs.c
+@@ -56,6 +56,16 @@
+  *     byte can select a PMIC register but never set one; BUCK1 is changed
+  *     only by "cpufreq", clamped to 1.2 V.
+  *
++ * 0134, found live with "reg" on xnu18:
++ *   - the bootloader leaves the PMIC pins gpm0-0/1 as GPIO outputs (CON
++ *     0x11, it bit-bangs the bus), so HSI2C_0 saw arbitration lost (TRANS
++ *     0x2000c) right out of reset. They are switched to function 2.
++ *   - the low nibble of TRANS_STATUS is the master state, not error bits:
++ *     0x0 idle, 0xe waiting after a message without stop, 0xb no ack,
++ *     0xc arbitration lost. A write is done when the TX FIFO is empty and
++ *     the state is 0xe (no stop) or idle (stop).
++ *   With that, ID 0x02, B1CTRL1 0x58, B1CTRL2 0x3a (762.5 mV), RAMP 0x54.
++ *
+  * Boot-arg a5cpufreq=MHZ applies a level once, 20 s after USB start.
+  * A thermal guard drops back to 902 MHz at 85 C (checked every second).
+  *
+@@ -103,7 +113,15 @@
+ #define I2C_FS1                 0x60
+ #define I2C_SLA                 0x6c
+ #define I2C_ADDR                0x70
+-#define I2C_TRANS_ERR           ((1u << 4) | (1u << 3) | (1u << 2) | (1u << 1))   /* TIMEOUT NO_DEV NO_DEV_ACK ABORT */
++#define I2C_ST(ts)              ((ts) & 0xfu)
++#define I2C_ST_IDLE             0x0
++#define I2C_ST_NO_ACK           0xb
++#define I2C_ST_LOSE             0xc
++#define I2C_ST_WAIT             0xe
++#define I2C_BUSY                (1u << 17)
++#define I2C_TX_EMPTY            (1u << 8)
++#define I2C_RX_EMPTY            (1u << 24)
++#define GPM0_PA                 0x10530000ull   /* PMIC SDA/SCL pins, CON at +0 */
+ #define BAT_RESET               (1u << 31)
+ #define BAT_START               (1u << 4)
+ #define BAT_DEDICATE            (1u << 1)
+@@ -136,7 +154,7 @@
+ #define HSI2C_INTID_MASK        ((1u << 19) | (1u << 20))  /* INTID 403, 404 in word 12 */
+ 
+ static struct {
+-	vm_offset_t i2c, cmu[2], sysreg[2], tmu, gicd;
++	vm_offset_t i2c, cmu[2], sysreg[2], tmu, gicd, gpm0;
+ 	bool        gic_checked, started;
+ 	volatile bool busy;
+ 	char        wcmd[16], warg[512];
+@@ -199,7 +217,9 @@
+ 		dv.sysreg[1] = ml_io_map((vm_offset_t)SYSREG_CPUCL1_PA, 0x1000);
+ 		dv.tmu = ml_io_map((vm_offset_t)TMU_PA, 0x1000);
+ 		dv.gicd = ml_io_map((vm_offset_t)GICD_PA, 0x1000);
+-		dv.mapped = dv.i2c && dv.cmu[0] && dv.cmu[1] && dv.sysreg[0] && dv.sysreg[1] && dv.tmu && dv.gicd;
++		dv.gpm0 = ml_io_map((vm_offset_t)GPM0_PA, 0x1000);
++		dv.mapped = dv.i2c && dv.cmu[0] && dv.cmu[1] && dv.sysreg[0] && dv.sysreg[1] && dv.tmu && dv.gicd &&
++		    dv.gpm0;
+ 		if (!dv.mapped) {
+ 			printf("USB> dvfs: map failed\n");
+ 		}
+@@ -294,6 +314,11 @@
+ 		printf("USB> pmic: direct timing fs 0x%x 0x%x 0x%x sla 0x%x conf 0x%x\n",
+ 		    dv.dtim[0], dv.dtim[1], dv.dtim[2], dv.dtim[3], dv.dconf);
+ 	}
++	uint32_t con = rd32(dv.gpm0, 0);
++	if ((con & 0xffu) != 0x22u) {
++		wr32(dv.gpm0, 0, (con & ~0xffu) | 0x22u);       /* gpm0-0 SDA, gpm0-1 SCL: HSI2C_0 */
++		printf("USB> pmic: gpm0 CON 0x%x -> 0x%x (pins to HSI2C)\n", con, rd32(dv.gpm0, 0));
++	}
+ 	wr32(r, HSI2C_BATCHER_INT_EN, 0);
+ 	wr32(r, HSI2C_BATCHER_CON, 0);
+ 	wr32(r, I2C_CTL, rd32(r, I2C_CTL) | (1u << 31));        /* SW_RST */
+@@ -341,25 +366,29 @@
+ 	wr32(r, I2C_AUTO, au);
+ 	wr32(r, I2C_AUTO, au | (1u << 31));                     /* MASTER_RUN */
+ 
++	bool sent = false;
+ 	for (int i = 0; i < 50000; i++) {                       /* 500 ms */
+ 		ts = rd32(r, I2C_TRANS);
+ 		if (rd) {
+-			while (got < len && !(rd32(r, I2C_FIFO_STAT) & (1u << 24))) {
++			while (got < len && !(rd32(r, I2C_FIFO_STAT) & I2C_RX_EMPTY)) {
+ 				buf[got++] = (uint8_t)rd32(r, I2C_RX);
+ 			}
+ 			if (got == len) {
+ 				break;
+ 			}
+-		} else if (rd32(r, I2C_INT_STAT) & (1u << 7)) {   /* TRANSFER_DONE */
++		} else if ((rd32(r, I2C_FIFO_STAT) & I2C_TX_EMPTY) &&
++		    (stop ? (I2C_ST(ts) == I2C_ST_IDLE && !(ts & I2C_BUSY)) : I2C_ST(ts) == I2C_ST_WAIT)) {
++			sent = true;
+ 			break;
+ 		}
+-		if (ts & I2C_TRANS_ERR) {
++		if (I2C_ST(ts) == I2C_ST_NO_ACK || I2C_ST(ts) == I2C_ST_LOSE) {
+ 			break;
+ 		}
+ 		delay(10);
+ 	}
+ 	is = rd32(r, I2C_INT_STAT);
+-	ok = (rd ? got == len : (is & (1u << 7)) != 0) && !(ts & I2C_TRANS_ERR);
++	/* a NACKed write with stop can end idle too: pm_set_buck1 reads back */
++	ok = rd ? got == len : sent;
+ 	wr32(r, I2C_INT_STAT, is);
+ 	if (!ok) {
+ 		printf("USB> pmic: direct %s failed, trans 0x%x int 0x%x, got %u/%u\n", rd ? "read" : "write",
