@@ -54,7 +54,7 @@
  static int
 --- a/bsd/kern/kern_exec.c
 +++ b/bsd/kern/kern_exec.c
-@@ -7414,7 +7414,17 @@
+@@ -7414,7 +7414,20 @@
  			}
  #if defined(ARM64_BOARD_CONFIG_SWEET) || defined(ARM64_BOARD_CONFIG_A5XELTE)
  			/* A short line keeps the persistent console ring useful. */
@@ -64,6 +64,9 @@
 +				/* 0141: no Wi-Fi/BT/audio/modem services (bsd/dev/a5xelte_usb.c, on7deny=) */
 +				extern bool a5xelte_exec_denied(const char *name);
 +				if (a5xelte_exec_denied(p->p_name)) {
++					/* done: asserts that a refused spawn carries a reason */
++					signature_failure_reason = os_reason_create(OS_REASON_EXEC,
++					    EXEC_EXIT_REASON_SECURITY_POLICY);
 +					error = EACCES;
 +					goto done;
 +				}
