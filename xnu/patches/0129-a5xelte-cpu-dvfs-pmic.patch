@@ -1,0 +1,637 @@
+--- a/bsd/conf/files
++++ b/bsd/conf/files
+@@ -109,6 +109,7 @@
+ bsd/dev/a5xelte_keys.c			standard
+ bsd/dev/a5xelte_touch.c			standard
+ bsd/dev/a5xelte_usb.c			standard
++bsd/dev/a5xelte_dvfs.c			standard
+ bsd/dev/sweet_sample.c			standard
+ bsd/dev/sweet_keys.c			standard
+ bsd/dev/sweet_touch.c			standard
+--- a/bsd/dev/a5xelte_usb.c
++++ b/bsd/dev/a5xelte_usb.c
+@@ -16,7 +16,9 @@
+  *      (0128): help, info, replay, ps, sample, kill, rd, reboot, recovery.
+  *      Answers are console lines "USB> ...", so they reach the PC in the
+  *      same stream and land in the console ring too. There is no command
+- *      for download mode and none that writes registers or storage.
++ *      for download mode and none that writes storage. The only register
++ *      writes are "cpufreq MHZ" (0129, bsd/dev/a5xelte_dvfs.c): stock CPU
++ *      PLL levels and the matching BUCK1 voltage, clamped to 1.2 V.
+  *
+  * Boot-arg a5sample=NAME[,NAME...] (a5usb 2 or 3): print user backtraces
+  * of those processes 90 s after USB start, then every 120 s, ten times
+@@ -51,6 +53,8 @@
+ extern uint64_t a5xelte_log_position(void);
+ extern uint32_t a5xelte_log_copy(uint64_t *pos, uint64_t limit, char *out, uint32_t max);
+ void a5xelte_usb_start(void);
++extern bool a5xelte_dvfs_command(const char *cmd, const char *arg);  /* a5xelte_dvfs.c */
++extern void a5xelte_dvfs_tick(void);
+ 
+ #include <sys/proc.h>
+ #include <sys/proc_internal.h>
+@@ -855,6 +859,7 @@
+ 	if (!strcmp(line, "help")) {
+ 		printf("USB> commands: help | info | replay | ps | sample NAME[,NAME]|PID | "
+ 		    "kill PID [SIG] | rd PA [N] | reboot | recovery\n");
++		printf("USB> dvfs: temp | pmic [REG [N]] | cpufreq [MHZ] (343..1586)\n");
+ 	} else if (!strcmp(line, "info")) {
+ 		uint64_t ns;
+ 		absolutetime_to_nanoseconds(mach_absolute_time(), &ns);
+@@ -904,6 +909,8 @@
+ 		ud_reset(A5_REASON_NORMAL, "reboot");
+ 	} else if (!strcmp(line, "recovery")) {
+ 		ud_reset(A5_REASON_RECOVERY, "recovery");
++	} else if (a5xelte_dvfs_command(line, arg)) {
++		/* handled in a5xelte_dvfs.c */
+ 	} else {
+ 		printf("USB> unknown command '%s' (help)\n", line);
+ 	}
+@@ -1012,6 +1019,9 @@
+ 		}
+ 		ud_tx_log(limit);
+ 		limit = a5xelte_log_position();
++		if ((ticks % 1000) == 999) {
++			a5xelte_dvfs_tick();
++		}
+ 		if ((++ticks % 60000) == 0) {
+ 			printf("A5XELTE USB: %llu log bytes sent, DTR %u\n", ud.tx_bytes, ud.line_state & 1);
+ 		}
+--- /dev/null
++++ b/bsd/dev/a5xelte_dvfs.c
+@@ -0,0 +1,575 @@
++/*
++ * Galaxy J7 Prime (on7xelte, Exynos 7870): CPU frequency, CPU voltage and
++ * temperature, driven from the USB command channel (a5xelte_usb.c, 0128).
++ *
++ * The bootloader leaves both CPU clusters at 902 MHz (CPUCL0/1 PLL P5 M347
++ * S1) with BUCK1 of the S2MPU05 PMIC at 875 mV. Nothing in this kernel
++ * changes that unless asked:
++ *
++ *   temp           TMU reading (read only)
++ *   pmic [REG [N]] S2MPU05 register reads over HSI2C (read only). INT1-3
++ *                  (0x01-0x03) are refused: reading them clears them.
++ *   cpufreq        show both cluster PLLs, BUCK1 and the temperature
++ *   cpufreq MHZ    set both clusters to a stock ECT level (343..1586). The
++ *                  BUCK1 voltage is the highest one of the stock ASV table
++ *                  for that level (all groups), never above 1.2 V.
++ *
++ * Boot-arg a5cpufreq=MHZ applies a level once, 20 s after USB start.
++ * A thermal guard drops back to 902 MHz at 85 C (checked every second).
++ *
++ * Sources: Samsung 3.18 kernel for the J7 Prime (i2c-exynos5.c batcher
++ * transfer, s2mpu05 regulator, pwrcal S5E7870 PLL141xx / EMA / dividers)
++ * and the ECT tables in the phone's own bootloader.
++ */
++#if defined(ARM64_BOARD_CONFIG_A5XELTE)
++#include <sys/param.h>
++#include <sys/systm.h>
++#include <kern/clock.h>
++#include <machine/machine_routines.h>
++#include <pexpert/pexpert.h>
++
++extern vm_offset_t ml_io_map(vm_offset_t, vm_size_t);
++bool a5xelte_dvfs_command(const char *cmd, const char *arg);
++void a5xelte_dvfs_tick(void);
++
++/* HSI2C_0 (PMIC bus) and its batcher */
++#define HSI2C_PA                0x10510000ull
++#define HSI2C_BATCHER_CON       0x500
++#define HSI2C_BATCHER_STATE     0x504
++#define HSI2C_BATCHER_INT_EN    0x508
++#define HSI2C_BATCHER_FIFO      0x50c
++#define HSI2C_BATCHER_INT_STAT  0x510
++#define HSI2C_BATCHER_OPCODE    0x600
++#define HSI2C_PAYLOAD           0x1000
++#define HSI2C_PAYLOAD_END       0x1060
++#define HSI2C_SMRELEASE         0x200
++#define BAT_RESET               (1u << 31)
++#define BAT_START               (1u << 4)
++#define BAT_DEDICATE            (1u << 1)
++#define BAT_ENABLE              (1u << 0)
++#define BAT_COMPLETE            (1u << 0)
++#define BAT_UNEXPECTED          (1u << 1)
++
++#define PMIC_ADDR               0x66
++#define PMIC_ID                 0x00
++#define PMIC_B1CTRL1            0x1a
++#define PMIC_B1CTRL2            0x1b    /* BUCK1 (both CPU clusters) voltage */
++#define PMIC_BUCK_RAMP          0x27
++#define BUCK1_UV(sel)           (400000u + 6250u * (sel))
++#define BUCK1_MAX_UV            1200000u
++
++#define CMU_CPUCL0_PA           0x10900000ull
++#define CMU_CPUCL1_PA           0x10800000ull
++#define SYSREG_CPUCL0_PA        0x10910000ull
++#define SYSREG_CPUCL1_PA        0x10810000ull
++#define PLL_LOCK                0x000
++#define PLL_CON0                0x100
++#define MUX_CPU_PLL             0x200   /* 0 OSC, 1 CPUCLx_PLL */
++#define DIV_HPM                 0x420
++#define STAT_MUX_CPU_PLL        0x600
++#define EMA_CON                 0x330
++#define EMA_LOW                 0x12492u
++#define EMA_HIGH                0x1b6d2u    /* pwrcal default when the fuses are 0 */
++#define TMU_PA                  0x10130000ull
++
++static struct {
++	vm_offset_t i2c, cmu[2], sysreg[2], tmu;
++	uint32_t    cmd_buf, cmd_idx, cmd_ptr, desc;
++	uint32_t    int_en;         /* batcher interrupt enable during a transfer */
++	uint32_t    cur_khz;        /* last level set here, 0 = bootloader's */
++	uint32_t    boot_khz, ticks;
++	bool        mapped;
++} dv;
++
++static const struct {
++	uint32_t khz, uv;
++	uint8_t  p, s, hpm;
++	uint16_t m;
++} dv_lv[] = {
++	{ 1586000, 1175000, 3, 0, 4, 183 },
++	{ 1482000, 1112500, 3, 0, 3, 171 },
++	{ 1352000, 1050000, 3, 0, 3, 156 },
++	{ 1248000, 1000000, 3, 0, 3, 144 },
++	{ 1144000,  950000, 3, 0, 3, 132 },
++	{ 1014000,  900000, 3, 0, 3, 117 },
++	{  902000,  875000, 5, 1, 3, 347 },
++	{  839000,  837500, 4, 1, 2, 258 },
++	{  757000,  806250, 5, 1, 2, 291 },
++	{  676000,  775000, 3, 1, 2, 156 },
++	{  546000,  743750, 3, 1, 2, 126 },
++	{  449000,  712500, 3, 2, 2, 207 },
++	{  343000,  687500, 4, 2, 2, 211 },
++};
++#define DV_BOOT_LV 6    /* 902 MHz */
++
++static uint32_t
++rd32(vm_offset_t b, uint32_t off)
++{
++	uint32_t v = *(volatile uint32_t *)(b + off);
++	__asm__ volatile ("dmb oshld" ::: "memory");
++	return v;
++}
++
++static void
++wr32(vm_offset_t b, uint32_t off, uint32_t v)
++{
++	*(volatile uint32_t *)(b + off) = v;
++	__asm__ volatile ("dsb sy" ::: "memory");
++}
++
++static bool
++dv_map(void)
++{
++	if (!dv.mapped) {
++		dv.i2c = ml_io_map((vm_offset_t)HSI2C_PA, 0x2000);
++		dv.cmu[0] = ml_io_map((vm_offset_t)CMU_CPUCL0_PA, 0x1000);
++		dv.cmu[1] = ml_io_map((vm_offset_t)CMU_CPUCL1_PA, 0x1000);
++		dv.sysreg[0] = ml_io_map((vm_offset_t)SYSREG_CPUCL0_PA, 0x1000);
++		dv.sysreg[1] = ml_io_map((vm_offset_t)SYSREG_CPUCL1_PA, 0x1000);
++		dv.tmu = ml_io_map((vm_offset_t)TMU_PA, 0x1000);
++		dv.mapped = dv.i2c && dv.cmu[0] && dv.cmu[1] && dv.sysreg[0] && dv.sysreg[1] && dv.tmu;
++		if (!dv.mapped) {
++			printf("USB> dvfs: map failed\n");
++		}
++	}
++	return dv.mapped;
++}
++
++/* ---- temperature ---- */
++
++static int
++dv_temp(void)
++{
++	uint32_t trim = rd32(dv.tmu, 0x0) & 0x1ff;
++	uint32_t code = rd32(dv.tmu, 0x40) & 0x1ff;
++	return (int)code - (int)trim + 25;      /* one-point trimming at 25 C */
++}
++
++/* ---- PMIC over the HSI2C batcher (i2c-exynos5.c, polled) ---- */
++
++static void
++pm_batch(uint32_t desc, uint32_t opcode)
++{
++	if (HSI2C_PAYLOAD + dv.desc * 4 > HSI2C_PAYLOAD_END) {
++		printf("USB> pmic: batcher full\n");
++		return;
++	}
++	dv.cmd_buf &= ~(0xffu << (8 * dv.cmd_idx));
++	dv.cmd_buf |= (opcode & 0xff) << (8 * dv.cmd_idx);
++	wr32(dv.i2c, HSI2C_BATCHER_OPCODE + dv.cmd_ptr * 4, dv.cmd_buf);
++	wr32(dv.i2c, HSI2C_PAYLOAD + dv.desc++ * 4, desc);
++	if (++dv.cmd_idx == 4) {
++		dv.cmd_idx = 0;
++		dv.cmd_ptr++;
++		dv.cmd_buf = 0xffffffff;
++	}
++}
++
++static void
++pm_recover(uint32_t st)
++{
++	if (st >= 0x40 && st <= 0x2000) {
++		wr32(dv.i2c, HSI2C_BATCHER_CON, BAT_RESET);
++		wr32(dv.i2c, HSI2C_BATCHER_CON, 0);
++		if (rd32(dv.i2c, HSI2C_BATCHER_STATE) & BAT_COMPLETE) {
++			wr32(dv.i2c, HSI2C_BATCHER_STATE, BAT_COMPLETE);
++		}
++		wr32(dv.i2c, HSI2C_SMRELEASE, 1);
++		printf("USB> pmic: batcher reset, semaphore released\n");
++	} else {
++		wr32(dv.i2c, HSI2C_BATCHER_CON, 0);
++	}
++	wr32(dv.i2c, HSI2C_BATCHER_INT_EN, 0);
++}
++
++/* One i2c message to the PMIC. Returns 0 or -1. */
++static int
++pm_xfer(bool rd, uint8_t *buf, uint32_t len, bool stop)
++{
++	vm_offset_t r = dv.i2c;
++	uint32_t rd_first, st = 0;
++
++	dv.cmd_buf = 0xffffffff;
++	dv.cmd_idx = dv.cmd_ptr = dv.desc = 0;
++
++	wr32(r, HSI2C_BATCHER_CON, 0);
++	wr32(r, HSI2C_BATCHER_CON, rd32(r, HSI2C_BATCHER_CON) | BAT_ENABLE | BAT_DEDICATE);
++
++	/* 2.5 MHz high-speed and 400 kHz fast-mode timings */
++	pm_batch((10u << 24) | (10u << 16) | (10u << 8) | 10u, 0x54);
++	pm_batch((0xfu << 16) | (5u << 24) | (10u << 8) | 2u, 0x58);
++	pm_batch(12, 0x5c);
++	pm_batch(5, 0x6c);
++	pm_batch((38u << 24) | (38u << 16) | (38u << 8), 0x60);
++	pm_batch((0xfu << 16) | (19u << 24) | (38u << 8) | 38u, 0x64);
++	pm_batch((1u << 16) | 76u, 0x68);
++	pm_batch(0x2ff, 0x08);                                  /* TRAILING */
++	pm_batch((rd ? (1u << 30) : 0) | (1u << 29) | (1u << 31) | (3u << 16) | (3u << 13) |
++	    (1u << 28) | (1u << 27) | 0xff, 0x40);              /* CONF */
++	pm_batch(0, 0x48);                                      /* TIMEOUT */
++	pm_batch(1u | 2u | (8u << 16) | (len << 4), 0x04);      /* FIFO_CTL */
++	pm_batch((1u << 3) | (rd ? ((1u << 6) | (1u << 30)) : (1u << 7)), 0x00);    /* CTL */
++	pm_batch(rd ? ((PMIC_ADDR & 0x3fffu) << 10) : ((PMIC_ADDR & 0x7fu) << 10), 0x70);
++	pm_batch(len | (rd ? (1u << 16) : 0) | (stop ? (1u << 17) : 0) | (1u << 31), 0x44);
++	wr32(r, HSI2C_BATCHER_INT_STAT, rd32(r, HSI2C_BATCHER_INT_STAT));
++	pm_batch(rd ? (1u << 1) : ((1u << 0) | (1u << 7)), 0x20); /* INT_ENABLE */
++	rd_first = dv.desc;
++	for (uint32_t i = 0; i < len; i++) {
++		if (rd) {
++			pm_batch(0x77, 0x38);
++		} else {
++			pm_batch(buf[i], 0x34);
++		}
++	}
++	pm_batch(0, 0xff);
++
++	wr32(r, HSI2C_BATCHER_INT_EN, dv.int_en);
++	wr32(r, HSI2C_BATCHER_CON, rd32(r, HSI2C_BATCHER_CON) | BAT_START);
++
++	for (int i = 0; i < 50000; i++) {          /* 500 ms, as Linux */
++		st = rd32(r, HSI2C_BATCHER_STATE);
++		if (st & (BAT_COMPLETE | BAT_UNEXPECTED)) {
++			break;
++		}
++		delay(10);
++	}
++	if (!(st & BAT_COMPLETE) || (st & BAT_UNEXPECTED)) {
++		printf("USB> pmic: %s failed, state 0x%x fifo 0x%x int 0x%x\n", rd ? "read" : "write",
++		    st, rd32(r, HSI2C_BATCHER_FIFO), rd32(r, HSI2C_BATCHER_INT_STAT));
++		pm_recover(st & ~BAT_UNEXPECTED);
++		return -1;
++	}
++	if (rd) {
++		for (uint32_t i = 0; i < len; i++) {
++			buf[i] = (uint8_t)rd32(r, HSI2C_PAYLOAD + (rd_first + i) * 4);
++		}
++	}
++	wr32(r, HSI2C_BATCHER_STATE, st | BAT_COMPLETE);
++	wr32(r, HSI2C_BATCHER_INT_STAT, rd32(r, HSI2C_BATCHER_INT_STAT));
++	wr32(r, HSI2C_BATCHER_CON, 0);
++	wr32(r, HSI2C_BATCHER_INT_EN, 0);
++	return 0;
++}
++
++static int
++pm_read(uint8_t reg, uint8_t *val)
++{
++	if (pm_xfer(false, &reg, 1, false) || pm_xfer(true, val, 1, true)) {
++		return -1;
++	}
++	return 0;
++}
++
++/* Only ever called for BUCK1 with a checked value. */
++static int
++pm_set_buck1(uint32_t uv)
++{
++	uint8_t sel, back = 0, msg[2];
++	if (uv < 500000 || uv > BUCK1_MAX_UV) {
++		printf("USB> pmic: refusing BUCK1 %u uV\n", uv);
++		return -1;
++	}
++	sel = (uint8_t)((uv - 400000 + 6249) / 6250);
++	msg[0] = PMIC_B1CTRL2;
++	msg[1] = sel;
++	if (pm_xfer(false, msg, 2, true)) {
++		return -1;
++	}
++	delay(1000);            /* ramp is 12 mV/us: 0.3 V takes 25 us */
++	if (pm_read(PMIC_B1CTRL2, &back) || back != sel) {
++		printf("USB> pmic: BUCK1 read back 0x%02x, wanted 0x%02x\n", back, sel);
++		return -1;
++	}
++	return 0;
++}
++
++/* ---- CPU clusters ---- */
++
++static uint32_t
++pll_khz(uint32_t con0)
++{
++	uint32_t m = (con0 >> 16) & 0x3ff, p = (con0 >> 8) & 0x3f, s = con0 & 7;
++	return p ? (uint32_t)(26000ull * m / ((uint64_t)p << s)) : 0;
++}
++
++static bool
++mux_wait(vm_offset_t cmu, uint32_t sel)
++{
++	for (int i = 0; i < 10000; i++) {
++		if (((rd32(cmu, STAT_MUX_CPU_PLL) >> 12) & 3) == sel + 1) {
++			return true;
++		}
++		delay(1);
++	}
++	return false;
++}
++
++static bool
++div_wait(vm_offset_t cmu, uint32_t off)
++{
++	for (int i = 0; i < 10000; i++) {
++		if (!(rd32(cmu, off) & (1u << 25))) {
++			return true;
++		}
++		delay(1);
++	}
++	return false;
++}
++
++static int
++pll_set(vm_offset_t cmu, uint32_t con0_new, uint32_t pdiv)
++{
++	uint32_t old = rd32(cmu, PLL_CON0);
++	uint32_t mux = rd32(cmu, MUX_CPU_PLL);
++	int ret = 0;
++	boolean_t istate = ml_set_interrupts_enabled(FALSE);
++
++	/* run the cluster from the 26 MHz oscillator while the PLL relocks */
++	wr32(cmu, MUX_CPU_PLL, mux & ~(1u << 12));
++	if (!mux_wait(cmu, 0)) {
++		wr32(cmu, MUX_CPU_PLL, mux);
++		ml_set_interrupts_enabled(istate);
++		return -1;
++	}
++	wr32(cmu, PLL_LOCK, pdiv * 150);
++	wr32(cmu, PLL_CON0, con0_new);
++	int i;
++	for (i = 0; i < 100000 && !(rd32(cmu, PLL_CON0) & (1u << 29)); i++) {
++		delay(1);
++	}
++	if (!(rd32(cmu, PLL_CON0) & (1u << 29))) {
++		/* no lock: put the old setting back */
++		wr32(cmu, PLL_LOCK, ((old >> 8) & 0x3f) * 150);
++		wr32(cmu, PLL_CON0, old);
++		for (i = 0; i < 100000 && !(rd32(cmu, PLL_CON0) & (1u << 29)); i++) {
++			delay(1);
++		}
++		ret = -1;
++	}
++	wr32(cmu, MUX_CPU_PLL, mux | (1u << 12));
++	if (!mux_wait(cmu, 1)) {
++		ret = -1;
++	}
++	ml_set_interrupts_enabled(istate);
++	return ret;
++}
++
++static int
++cluster_set(int cl, int lv)
++{
++	vm_offset_t cmu = dv.cmu[cl];
++	uint32_t con0 = rd32(cmu, PLL_CON0);
++	uint32_t hpm = rd32(cmu, DIV_HPM);
++	uint32_t hpm_new = dv_lv[lv].hpm;
++
++	if (!(con0 & (1u << 31)) || !((rd32(cmu, MUX_CPU_PLL) >> 12) & 1)) {
++		printf("USB> cpufreq: cluster %d PLL off or not selected (0x%08x)\n", cl, con0);
++		return -1;
++	}
++	con0 &= ~((0x3ffu << 16) | (0x3fu << 8) | 7u);
++	con0 |= ((uint32_t)dv_lv[lv].m << 16) | ((uint32_t)dv_lv[lv].p << 8) | dv_lv[lv].s;
++	con0 &= ~(1u << 26);
++	con0 |= (1u << 5);
++
++	if (hpm_new > (hpm & 7)) {
++		wr32(cmu, DIV_HPM, (hpm & ~7u) | hpm_new);
++		div_wait(cmu, DIV_HPM);
++	}
++	if (pll_set(cmu, con0, dv_lv[lv].p)) {
++		printf("USB> cpufreq: cluster %d PLL failed, now 0x%08x\n", cl, rd32(cmu, PLL_CON0));
++		return -1;
++	}
++	if (hpm_new < (hpm & 7)) {
++		wr32(cmu, DIV_HPM, (hpm & ~7u) | hpm_new);
++		div_wait(cmu, DIV_HPM);
++	}
++	return 0;
++}
++
++static void
++dv_show(void)
++{
++	uint8_t id = 0, c1 = 0, c2 = 0, ramp = 0;
++	for (int cl = 0; cl < 2; cl++) {
++		uint32_t con0 = rd32(dv.cmu[cl], PLL_CON0);
++		printf("USB> cpufreq: cluster %d PLL 0x%08x = %u kHz%s, mux 0x%08x, HPM div %u, EMA 0x%05x\n",
++		    cl, con0, pll_khz(con0), (con0 & (1u << 29)) ? " locked" : "",
++		    rd32(dv.cmu[cl], MUX_CPU_PLL), rd32(dv.cmu[cl], DIV_HPM) & 7, rd32(dv.sysreg[cl], EMA_CON));
++	}
++	if (pm_read(PMIC_ID, &id) == 0 && pm_read(PMIC_B1CTRL1, &c1) == 0 &&
++	    pm_read(PMIC_B1CTRL2, &c2) == 0 && pm_read(PMIC_BUCK_RAMP, &ramp) == 0) {
++		printf("USB> cpufreq: PMIC id 0x%02x, BUCK1 ctrl1 0x%02x, vsel 0x%02x = %u uV, ramp 0x%02x\n",
++		    id, c1, c2, BUCK1_UV(c2), ramp);
++	}
++	printf("USB> cpufreq: %d C\n", dv_temp());
++}
++
++static int
++dv_set(uint32_t khz)
++{
++	int lv = -1;
++	uint8_t vsel = 0;
++	uint32_t cur_uv;
++
++	for (int i = 0; i < (int)(sizeof(dv_lv) / sizeof(dv_lv[0])); i++) {
++		if (khz / 1000 == dv_lv[i].khz / 1000 || (khz / 1000 + 1 == dv_lv[i].khz / 1000)) {
++			lv = i;
++			break;
++		}
++	}
++	if (lv < 0) {
++		printf("USB> cpufreq: levels 1586 1482 1352 1248 1144 1014 902 839 757 676 546 449 343\n");
++		return -1;
++	}
++	if (dv_lv[lv].uv > BUCK1_MAX_UV) {
++		return -1;
++	}
++	int t = dv_temp();
++	if (dv_lv[lv].khz > 902000 && t >= 75) {
++		printf("USB> cpufreq: %d C, not raising\n", t);
++		return -1;
++	}
++	if (pm_read(PMIC_B1CTRL2, &vsel)) {
++		return -1;
++	}
++	cur_uv = BUCK1_UV(vsel);
++	if (cur_uv < 500000 || cur_uv > 1300000) {
++		printf("USB> cpufreq: BUCK1 reads %u uV, giving up\n", cur_uv);
++		return -1;
++	}
++
++	/* up: voltage, EMA, clocks. down: clocks, EMA, voltage. */
++	if (dv_lv[lv].uv > cur_uv && pm_set_buck1(dv_lv[lv].uv)) {
++		return -1;
++	}
++	if (dv_lv[lv].uv >= 950000) {
++		wr32(dv.sysreg[0], EMA_CON, EMA_HIGH);
++		wr32(dv.sysreg[1], EMA_CON, EMA_HIGH);
++	}
++	if (cluster_set(0, lv) || cluster_set(1, lv)) {
++		/* the voltage stays at the higher of the two; leave it */
++		printf("USB> cpufreq: clocks failed, voltage left at %u uV\n", cur_uv > dv_lv[lv].uv ? cur_uv : dv_lv[lv].uv);
++		dv_show();
++		return -1;
++	}
++	if (dv_lv[lv].uv < 950000) {
++		wr32(dv.sysreg[0], EMA_CON, EMA_LOW);
++		wr32(dv.sysreg[1], EMA_CON, EMA_LOW);
++	}
++	if (dv_lv[lv].uv < cur_uv) {
++		pm_set_buck1(dv_lv[lv].uv);
++	}
++	dv.cur_khz = dv_lv[lv].khz;
++	printf("USB> cpufreq: %u kHz at %u uV, %d C\n", dv_lv[lv].khz, dv_lv[lv].uv, dv_temp());
++	return 0;
++}
++
++static uint32_t
++dv_num(const char **s)
++{
++	const char *p = *s;
++	uint32_t v = 0, base = 10;
++	while (*p == ' ') {
++		p++;
++	}
++	if (p[0] == '0' && (p[1] == 'x' || p[1] == 'X')) {
++		base = 16;
++		p += 2;
++	}
++	for (;; p++) {
++		uint32_t d;
++		if (*p >= '0' && *p <= '9') {
++			d = (uint32_t)(*p - '0');
++		} else if (base == 16 && *p >= 'a' && *p <= 'f') {
++			d = (uint32_t)(*p - 'a' + 10);
++		} else if (base == 16 && *p >= 'A' && *p <= 'F') {
++			d = (uint32_t)(*p - 'A' + 10);
++		} else {
++			break;
++		}
++		v = v * base + d;
++	}
++	*s = p;
++	return v;
++}
++
++bool
++a5xelte_dvfs_command(const char *cmd, const char *arg)
++{
++	if (strcmp(cmd, "temp") && strcmp(cmd, "pmic") && strcmp(cmd, "cpufreq")) {
++		return false;
++	}
++	if (!dv_map()) {
++		return true;
++	}
++	if (!strcmp(cmd, "temp")) {
++		printf("USB> temp: %d C (TMU 0x%08x, trim 0x%08x)\n", dv_temp(),
++		    rd32(dv.tmu, 0x40), rd32(dv.tmu, 0x0));
++	} else if (!strcmp(cmd, "pmic")) {
++		if (!strncmp(arg, "int ", 4)) {
++			const char *s = arg + 4;
++			dv.int_en = dv_num(&s) ? 1 : 0;
++			printf("USB> pmic: batcher interrupt enable %u\n", dv.int_en);
++			return true;
++		}
++		if (*arg == '\0') {
++			dv_show();
++			return true;
++		}
++		const char *s = arg;
++		uint32_t reg = dv_num(&s), n = dv_num(&s);
++		if (n == 0) {
++			n = 1;
++		}
++		if (n > 16) {
++			n = 16;
++		}
++		for (uint32_t i = 0; i < n && reg + i <= 0xff; i++) {
++			uint8_t v = 0;
++			if (reg + i >= 0x01 && reg + i <= 0x03) {
++				printf("USB> pmic 0x%02x: skipped (read clears interrupts)\n", reg + i);
++				continue;
++			}
++			if (pm_read((uint8_t)(reg + i), &v)) {
++				break;
++			}
++			printf("USB> pmic 0x%02x = 0x%02x\n", reg + i, v);
++		}
++	} else {
++		if (*arg == '\0') {
++			dv_show();
++		} else {
++			const char *s = arg;
++			dv_set(dv_num(&s) * 1000);
++		}
++	}
++	return true;
++}
++
++/* Called about once a second from the USB thread. */
++void
++a5xelte_dvfs_tick(void)
++{
++	dv.ticks++;
++	if (dv.ticks == 1) {
++		uint32_t mhz = 0;
++		if (PE_parse_boot_argn("a5cpufreq", &mhz, sizeof(mhz)) && mhz) {
++			dv.boot_khz = mhz * 1000;
++		}
++	}
++	if (dv.boot_khz && dv.ticks == 20) {
++		if (dv_map()) {
++			printf("USB> cpufreq: a5cpufreq=%u\n", dv.boot_khz / 1000);
++			dv_set(dv.boot_khz);
++		}
++		dv.boot_khz = 0;
++	}
++	if (dv.cur_khz > 902000 && dv.mapped) {
++		int t = dv_temp();
++		if (t >= 85) {
++			printf("USB> cpufreq: %d C, back to 902 MHz\n", t);
++			dv_set(902000);
++		}
++	}
++}
++#endif /* ARM64_BOARD_CONFIG_A5XELTE */
