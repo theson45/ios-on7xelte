@@ -223,7 +223,7 @@
 +};
 +
 +static uint32_t
-+rd(vm_offset_t base, uint32_t off)
++reg_rd(vm_offset_t base, uint32_t off)
 +{
 +	uint32_t v = *(volatile uint32_t *)(base + off);
 +	__asm__ volatile ("dmb oshld" ::: "memory");
@@ -231,7 +231,7 @@
 +}
 +
 +static void
-+wr(vm_offset_t base, uint32_t off, uint32_t v)
++reg_wr(vm_offset_t base, uint32_t off, uint32_t v)
 +{
 +	*(volatile uint32_t *)(base + off) = v;
 +	__asm__ volatile ("dsb sy" ::: "memory");
@@ -240,11 +240,11 @@
 +static void
 +setbits(vm_offset_t base, uint32_t off, uint32_t set, uint32_t clear)
 +{
-+	wr(base, off, (rd(base, off) & ~clear) | set);
++	reg_wr(base, off, (reg_rd(base, off) & ~clear) | set);
 +}
 +
-+#define dwc_rd(off)     rd(ud.dwc, (off))
-+#define dwc_wr(off, v)  wr(ud.dwc, (off), (v))
++#define dwc_rd(off)     reg_rd(ud.dwc, (off))
++#define dwc_wr(off, v)  reg_wr(ud.dwc, (off), (v))
 +
 +/* USB_PLL output in kHz, from its PMS (pll141xx: 26 MHz * M / (P << S)). */
 +static uint32_t
@@ -277,23 +277,23 @@
 +static bool
 +usb_bus_clocks_on(void)
 +{
-+	uint32_t bus = rd(ud.fsys, EN_FSYS_BUS);
-+	return (rd(ud.mif, EN_CMU_FSYS_BUS) & 1) && (bus & (1u << 20)) && (bus & (1u << 21));
++	uint32_t bus = reg_rd(ud.fsys, EN_FSYS_BUS);
++	return (reg_rd(ud.mif, EN_CMU_FSYS_BUS) & 1) && (bus & (1u << 20)) && (bus & (1u << 21));
 +}
 +
 +static void
 +usb_probe_print(void)
 +{
-+	uint32_t pll = rd(ud.fsys, USB_PLL_CON0);
++	uint32_t pll = reg_rd(ud.fsys, USB_PLL_CON0);
 +	printf("A5XELTE USB: USB_PLL_CON0 0x%08x (%u kHz%s%s) MUX_USB_PLL 0x%08x MUX_PHYCLK 0x%08x\n",
 +	    pll, usb_pll_khz(pll), (pll & (1u << 31)) ? ", on" : ", off",
-+	    (pll & (1u << 29)) ? ", locked" : "", rd(ud.fsys, MUX_USB_PLL), rd(ud.fsys, MUX_PHYCLK_USER));
++	    (pll & (1u << 29)) ? ", locked" : "", reg_rd(ud.fsys, MUX_USB_PLL), reg_rd(ud.fsys, MUX_PHYCLK_USER));
 +	printf("A5XELTE USB: FSYS EN_BUS 0x%08x EN_REFCLK 0x%08x EN_PHYCLK 0x%08x\n",
-+	    rd(ud.fsys, EN_FSYS_BUS), rd(ud.fsys, EN_USB20DRD_REFCLK), rd(ud.fsys, EN_USB20DRD_PHYCLK));
++	    reg_rd(ud.fsys, EN_FSYS_BUS), reg_rd(ud.fsys, EN_USB20DRD_REFCLK), reg_rd(ud.fsys, EN_USB20DRD_PHYCLK));
 +	printf("A5XELTE USB: MIF MUX_BUS 0x%08x MUX_REF 0x%08x DIV_REF 0x%08x EN_BUS 0x%08x EN_REF 0x%08x\n",
-+	    rd(ud.mif, MUX_FSYS_BUS), rd(ud.mif, MUX_USB20DRD_REFCLK), rd(ud.mif, DIV_USB20DRD_REFCLK),
-+	    rd(ud.mif, EN_CMU_FSYS_BUS), rd(ud.mif, EN_CMU_USB20DRD_REFCLK));
-+	printf("A5XELTE USB: PMU USBDEV_PHY_CONTROL 0x%08x\n", rd(ud.pmu, PMU_USBDEV_PHY_CTRL));
++	    reg_rd(ud.mif, MUX_FSYS_BUS), reg_rd(ud.mif, MUX_USB20DRD_REFCLK), reg_rd(ud.mif, DIV_USB20DRD_REFCLK),
++	    reg_rd(ud.mif, EN_CMU_FSYS_BUS), reg_rd(ud.mif, EN_CMU_USB20DRD_REFCLK));
++	printf("A5XELTE USB: PMU USBDEV_PHY_CONTROL 0x%08x\n", reg_rd(ud.pmu, PMU_USBDEV_PHY_CTRL));
 +	if (!usb_bus_clocks_on()) {
 +		printf("A5XELTE USB: USB bus clocks off; DWC3 and PHY not read\n");
 +		return;
@@ -303,8 +303,8 @@
 +	printf("A5XELTE USB: DWC3 DCFG 0x%08x DCTL 0x%08x DSTS 0x%08x HWP0 0x%08x HWP1 0x%08x HWP3 0x%08x\n",
 +	    dwc_rd(DCFG), dwc_rd(DCTL), dwc_rd(DSTS), dwc_rd(GHWPARAMS0), dwc_rd(GHWPARAMS1), dwc_rd(GHWPARAMS3));
 +	printf("A5XELTE USB: PHY LINKSYSTEM 0x%08x PHYUTMI 0x%08x PHYCLKRST 0x%08x PHYPARAM0 0x%08x HSPHYCTRL 0x%08x\n",
-+	    rd(ud.phy, LINKSYSTEM), rd(ud.phy, PHYUTMI), rd(ud.phy, PHYCLKRST), rd(ud.phy, PHYPARAM0),
-+	    rd(ud.phy, HSPHYCTRL));
++	    reg_rd(ud.phy, LINKSYSTEM), reg_rd(ud.phy, PHYUTMI), reg_rd(ud.phy, PHYCLKRST), reg_rd(ud.phy, PHYPARAM0),
++	    reg_rd(ud.phy, HSPHYCTRL));
 +}
 +
 +/*
@@ -323,20 +323,20 @@
 +	setbits(ud.fsys, EN_FSYS_BUS, (1u << 20) | (1u << 21), 0);
 +	setbits(ud.fsys, EN_USB20DRD_REFCLK, 1, 0);
 +
-+	uint32_t pll = rd(ud.fsys, USB_PLL_CON0);
++	uint32_t pll = reg_rd(ud.fsys, USB_PLL_CON0);
 +	int fsel = phy_fsel(usb_pll_khz(pll));
 +	if (fsel < 0) {
 +		printf("A5XELTE USB: USB_PLL_CON0 0x%08x gives %u kHz, no PHY FSEL for it\n", pll, usb_pll_khz(pll));
 +		return -1;
 +	}
 +	if (!(pll & (1u << 31))) {
-+		wr(ud.fsys, USB_PLL_CON0, pll | (1u << 31));
++		reg_wr(ud.fsys, USB_PLL_CON0, pll | (1u << 31));
 +	}
-+	for (int i = 0; i < 1000 && !(rd(ud.fsys, USB_PLL_CON0) & (1u << 29)); i++) {
++	for (int i = 0; i < 1000 && !(reg_rd(ud.fsys, USB_PLL_CON0) & (1u << 29)); i++) {
 +		delay(10);
 +	}
-+	if (!(rd(ud.fsys, USB_PLL_CON0) & (1u << 29))) {
-+		printf("A5XELTE USB: USB_PLL does not lock (0x%08x)\n", rd(ud.fsys, USB_PLL_CON0));
++	if (!(reg_rd(ud.fsys, USB_PLL_CON0) & (1u << 29))) {
++		printf("A5XELTE USB: USB_PLL does not lock (0x%08x)\n", reg_rd(ud.fsys, USB_PLL_CON0));
 +		return -1;
 +	}
 +	setbits(ud.fsys, MUX_USB_PLL, (1u << 12) | (1u << 21), 0);
@@ -362,22 +362,22 @@
 +	setbits(ud.dwc, GUSB2PHYCFG, 1u << 31, 0);
 +
 +	/* PHY: reference clock, PLL tune, port reset pulse. */
-+	uint32_t clkrst = rd(ud.phy, PHYCLKRST);
++	uint32_t clkrst = reg_rd(ud.phy, PHYCLKRST);
 +	clkrst |= 1u << 1;                                      /* PORTRESET */
 +	clkrst = (clkrst & ~(3u << 2)) | (2u << 2);             /* REFCLKSEL = CLKCORE */
 +	clkrst = (clkrst & ~(0x3fu << 5)) | ((uint32_t)fsel << 5);
 +	clkrst |= (1u << 31) | 1u;                              /* EN_UTMISUSPEND, COMMONONN */
-+	uint32_t plltune = rd(ud.phy, HSPHYPLLTUNE);
++	uint32_t plltune = reg_rd(ud.phy, HSPHYPLLTUNE);
 +	if (fsel == 0x5) {
 +		plltune |= 1u << 6;                             /* PLL_B_TUNE for 24 MHz */
 +	} else {
 +		plltune &= ~(1u << 6);
 +	}
 +	plltune |= 0xe;                                         /* PLL_P_TUNE(0xe) */
-+	wr(ud.phy, HSPHYPLLTUNE, plltune);
-+	wr(ud.phy, PHYCLKRST, clkrst);
++	reg_wr(ud.phy, HSPHYPLLTUNE, plltune);
++	reg_wr(ud.phy, PHYCLKRST, clkrst);
 +	delay(10);
-+	wr(ud.phy, PHYCLKRST, clkrst & ~(1u << 1));
++	reg_wr(ud.phy, PHYCLKRST, clkrst & ~(1u << 1));
 +	/* Out of SIDDQ and software reset. */
 +	setbits(ud.phy, HSPHYCTRL, 0, (1u << 6) | (1u << 0) | (1u << 31));
 +	delay(500);
@@ -393,11 +393,11 @@
 +	setbits(ud.phy, HSPHYCTRL, 0, 1u << 0);
 +	/* Device-mode tuning (fill_hstune + set_hstune DEV for 7870), FLADJ. */
 +	setbits(ud.phy, LINKSYSTEM, (0x20u << 1) | (1u << 27), 0x3fu << 1);
-+	uint32_t p0 = rd(ud.phy, PHYPARAM0) & ~((0xfu << 22) | (3u << 20) | (3u << 18) | (1u << 17) |
++	uint32_t p0 = reg_rd(ud.phy, PHYPARAM0) & ~((0xfu << 22) | (3u << 20) | (3u << 18) | (1u << 17) |
 +	    (3u << 15) | (3u << 13) | (0xfu << 9) | (7u << 6) | (7u << 3) | 7u);
 +	p0 |= (0xeu << 22) | (1u << 20) | (2u << 18) | (0u << 15) | (0u << 13) | (3u << 9) |
 +	    (6u << 6) | (2u << 3) | 3u;
-+	wr(ud.phy, PHYPARAM0, p0);
++	reg_wr(ud.phy, PHYPARAM0, p0);
 +
 +	/* PHY clock to the controller: user mux and gate. */
 +	setbits(ud.fsys, MUX_PHYCLK_USER, (1u << 12) | (1u << 21), 0);
@@ -413,7 +413,7 @@
 +	setbits(ud.dwc, GCTL, 2u << 12, (3u << 12) | (3u << 4) | (1u << 3));
 +	setbits(ud.dwc, GUSB2PHYCFG, 0, 1u << 6);
 +	printf("A5XELTE USB: powered, DWC3 0x%08x GCTL 0x%08x GUSB2PHYCFG 0x%08x PHYCLKRST 0x%08x PHYUTMI 0x%08x\n",
-+	    id, dwc_rd(GCTL), dwc_rd(GUSB2PHYCFG), rd(ud.phy, PHYCLKRST), rd(ud.phy, PHYUTMI));
++	    id, dwc_rd(GCTL), dwc_rd(GUSB2PHYCFG), reg_rd(ud.phy, PHYCLKRST), reg_rd(ud.phy, PHYUTMI));
 +	return 0;
 +}
 +
