@@ -1,0 +1,65 @@
+name: dsc-disass
+
+# Disassemble code in the dyld shared cache of the ios-root image (root.yml),
+# for reading what a sampled user-space function does.
+
+on:
+  workflow_dispatch:
+    inputs:
+      vaddrs:
+        description: "unslid cache addresses, blank separated (each: ADDR or ADDR:COUNT)"
+        required: true
+      run_id:
+        description: "root.yml run that holds the ios-root artifact"
+        default: "42526101397"
+
+permissions:
+  actions: read
+  contents: read
+
+jobs:
+  disass:
+    runs-on: macos-15
+    timeout-minutes: 60
+    steps:
+      - name: Install ipsw
+        run: brew install blacktop/tap/ipsw
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: ios-root
+          path: work/in
+          run-id: ${{ inputs.run_id }}
+          github-token: ${{ github.token }}
+
+      - name: Copy the dyld shared cache out of the root image
+        run: |
+          set -euxo pipefail
+          cat work/in/ios-root.img.gz.part* | gzip -dc > work/ios-root.img
+          rm -rf work/in
+          mkdir -p work/root work/dsc
+          hdiutil attach -readonly -imagekey diskimage-class=CRawDiskImage -mountpoint work/root work/ios-root.img
+          cp work/root/System/Library/Caches/com.apple.dyld/dyld_shared_cache_arm64* work/dsc/
+          hdiutil detach work/root
+          rm -f work/ios-root.img
+
+      - name: Disassemble
+        env:
+          VADDRS: ${{ inputs.vaddrs }}
+        run: |
+          set -ux
+          cache=$(ls work/dsc/dyld_shared_cache_arm64* | grep -v '\.' | head -1 || true)
+          [ -n "$cache" ] || cache=$(ls work/dsc/dyld_shared_cache_arm64* | head -1)
+          for item in $VADDRS; do
+            addr=${item%%:*}; count=200
+            [ "$item" != "$addr" ] && count=${item#*:}
+            echo "==== $addr ($count)"
+            ipsw dsc disass "$cache" --vaddr "$addr" --count "$count" --symbolicate --quiet 2>&1 ||
+              ipsw dsc disass "$cache" --vaddr "$addr" --count "$count" 2>&1
+          done | tee work/disass.txt
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: disass
+          path: work/disass.txt
+          retention-days: 14
