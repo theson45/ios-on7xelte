@@ -1,0 +1,66 @@
+name: symbolicate
+
+# Resolve user-space addresses from the phone's console (SMP sampler lines
+# from a5sample / the USB "sample" command, or CRASH lines) against the
+# dyld shared cache of the ios-root image built by root.yml.
+
+on:
+  workflow_dispatch:
+    inputs:
+      lines:
+        description: "SMP/CRASH console lines (header 'slide .. mh ..' line first)"
+        required: true
+      run_id:
+        description: "root.yml run that holds the ios-root artifact"
+        default: "42526101397"
+
+permissions:
+  actions: read
+  contents: read
+
+jobs:
+  a2s:
+    runs-on: macos-15
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install ipsw
+        run: brew install blacktop/tap/ipsw
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: ios-root
+          path: work/in
+          run-id: ${{ inputs.run_id }}
+          github-token: ${{ github.token }}
+
+      - name: Copy the dyld shared cache out of the root image
+        run: |
+          set -euxo pipefail
+          cat work/in/ios-root.img.gz.part* | gzip -dc > work/ios-root.img
+          rm -rf work/in
+          mkdir -p work/root work/dsc
+          hdiutil attach -readonly -imagekey diskimage-class=CRawDiskImage -mountpoint work/root work/ios-root.img
+          ls -la work/root/System/Library/Caches/com.apple.dyld
+          cp work/root/System/Library/Caches/com.apple.dyld/dyld_shared_cache_arm64* work/dsc/
+          hdiutil detach work/root
+          rm -f work/ios-root.img
+          ls -la work/dsc
+
+      - name: Symbolicate
+        env:
+          LINES: ${{ inputs.lines }}
+        run: |
+          set -eux
+          # Workflow inputs are one line: split again before each record.
+          printf '%s\n' "$LINES" | sed -E 's/ (SMP|CRASH) /\n\1 /g' > work/lines.txt
+          cache=$(ls work/dsc/dyld_shared_cache_arm64* | grep -v '\.' | head -1 || true)
+          [ -n "$cache" ] || cache=$(ls work/dsc/dyld_shared_cache_arm64* | head -1)
+          python3 tools/sweet-crash.py "$cache" - work/lines.txt | tee work/symbolicated.txt
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: symbolicated
+          path: work/symbolicated.txt
+          retention-days: 14
