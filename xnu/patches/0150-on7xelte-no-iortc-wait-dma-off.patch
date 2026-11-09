@@ -1,0 +1,41 @@
+--- a/iokit/Kernel/IOStartIOKit.cpp
++++ b/iokit/Kernel/IOStartIOKit.cpp
+@@ -36,6 +36,7 @@
+ #include <IOKit/IOUserClient.h>
+ #include <IOKit/IOMemoryDescriptor.h>
+ #include <IOKit/IOPlatformExpert.h>
++#include <pexpert/pexpert.h>
+ #include <IOKit/IOKernelReporters.h>
+ #include <IOKit/IOLib.h>
+ #include <IOKit/IOKitKeys.h>
+@@ -76,9 +77,19 @@
+ 
+ 	t.tv_sec = 30;
+ 	t.tv_nsec = 0;
++	/*
++	 * on7xelte (0150): nothing publishes IORTC here, so the stock wait
++	 * cost 30 s of every boot. Boot-arg iortc_wait=SECONDS restores it.
++	 */
++	{
++		int wait = 0;
++		(void)PE_parse_boot_argn("iortc_wait", &wait, sizeof(wait));
++		t.tv_sec = wait < 0 ? 0 : wait;
++	}
+ 
+ // RTC is not present on this target
+ #ifndef BCM2837
++	if (t.tv_sec)
+ 	IOService::waitForService(
+ 		IOService::resourceMatching("IORTC"), &t );
+ #endif
+--- a/bsd/dev/a5xelte_emmc.c
++++ b/bsd/dev/a5xelte_emmc.c
+@@ -580,7 +580,7 @@
+ 	if (!os_atomic_cmpxchg(&emmc_dma_state, expected, 3, relaxed)) {
+ 		return;
+ 	}
+-	int on = 1, check = 32;
++	int on = 0, check = 32;	/* 0150: off by default, the IDMAC moved no data on xnu33 */
+ 	(void)PE_parse_boot_argn("emmcdma", &on, sizeof(on));
+ 	(void)PE_parse_boot_argn("emmcdmacheck", &check, sizeof(check));
+ 	emmc_dma_checks = check < 0 ? 0 : (uint32_t)check;
