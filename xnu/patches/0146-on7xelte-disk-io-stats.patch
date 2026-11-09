@@ -1,0 +1,204 @@
+--- a/bsd/dev/a5xelte_emmc.c
++++ b/bsd/dev/a5xelte_emmc.c
+@@ -486,6 +486,146 @@
+ static uint32_t emmc_secsize = 512;
+ static uint8_t emmc_bounce[512];
+ 
++/*
++ * 0146: disk statistics. Every request is single-sector polled PIO under one
++ * mutex, so a slow disk stalls everyone who touches a file. `io` (USB) prints
++ * totals, the processes doing the most I/O, and resets them with `io reset`;
++ * `io bench` times a 1 MiB read. A request that takes 500 ms or more prints
++ * an "IO slow" line.
++ */
++struct emmc_io_proc {
++	int pid;
++	char name[20];
++	uint64_t rd_sec, wr_sec, abs;
++};
++#define EMMC_IO_PROCS 24
++static struct emmc_io_proc emmc_io_procs[EMMC_IO_PROCS];
++static uint64_t emmc_io_rd_req, emmc_io_wr_req, emmc_io_rd_sec, emmc_io_wr_sec;
++static uint64_t emmc_io_rd_abs, emmc_io_wr_abs, emmc_io_wait_abs, emmc_io_max_abs;
++static uint64_t emmc_io_since;
++static char emmc_io_max_name[20];
++
++static uint64_t
++emmc_io_ms(uint64_t abs)
++{
++	uint64_t ns;
++	absolutetime_to_nanoseconds(abs, &ns);
++	return ns / NSEC_PER_MSEC;
++}
++
++/* called with a5xelte_emmc_lock held */
++static void
++emmc_io_account(bool rd, uint64_t sectors, uint64_t busy, uint64_t wait)
++{
++	int pid = proc_selfpid();
++	struct emmc_io_proc *e = NULL;
++	if (rd) {
++		emmc_io_rd_req++;
++		emmc_io_rd_sec += sectors;
++		emmc_io_rd_abs += busy;
++	} else {
++		emmc_io_wr_req++;
++		emmc_io_wr_sec += sectors;
++		emmc_io_wr_abs += busy;
++	}
++	emmc_io_wait_abs += wait;
++	for (int i = 0; i < EMMC_IO_PROCS; i++) {
++		if (emmc_io_procs[i].pid == pid && emmc_io_procs[i].name[0]) {
++			e = &emmc_io_procs[i];
++			break;
++		}
++		if (e == NULL && emmc_io_procs[i].name[0] == '\0') {
++			e = &emmc_io_procs[i];
++		}
++	}
++	if (e != NULL) {
++		if (e->name[0] == '\0' || e->pid != pid) {
++			e->pid = pid;
++			proc_selfname(e->name, sizeof(e->name));
++			if (e->name[0] == '\0') {
++				strlcpy(e->name, "?", sizeof(e->name));
++			}
++		}
++		if (rd) {
++			e->rd_sec += sectors;
++		} else {
++			e->wr_sec += sectors;
++		}
++		e->abs += busy;
++	}
++	if (busy + wait > emmc_io_max_abs) {
++		emmc_io_max_abs = busy + wait;
++		proc_selfname(emmc_io_max_name, sizeof(emmc_io_max_name));
++	}
++}
++
++void a5xelte_emmc_io(const char *arg);
++void
++a5xelte_emmc_io(const char *arg)
++{
++	if (!strcmp(arg, "bench")) {
++		uint64_t t0, t1;
++		int error = 0;
++		uint32_t n;
++		if (!emmc_ready) {
++			printf("USB> io: disk not ready\n");
++			return;
++		}
++		lck_mtx_lock(&a5xelte_emmc_lock);
++		t0 = mach_absolute_time();
++		for (n = 0; n < 2048 && !error && n < emmc_nsectors; n++) {
++			error = emmc_read_sector((uint32_t)(emmc_first_lba + n), emmc_bounce);
++		}
++		t1 = mach_absolute_time();
++		lck_mtx_unlock(&a5xelte_emmc_lock);
++		uint64_t ms = emmc_io_ms(t1 - t0);
++		printf("USB> io bench: read %u sectors in %llu ms = %llu KB/s, %llu us per sector%s\n",
++			n, ms, ms ? (uint64_t)n * 512u / ms : 0,
++			n ? emmc_io_ms((t1 - t0) * 1000u) / n : 0, error ? " (error)" : "");
++		return;
++	}
++	lck_mtx_lock(&a5xelte_emmc_lock);
++	uint64_t span = emmc_io_ms(mach_absolute_time() - emmc_io_since);
++	uint64_t rms = emmc_io_ms(emmc_io_rd_abs), wms = emmc_io_ms(emmc_io_wr_abs);
++	printf("USB> io: %llu s; read %llu req %llu KB in %llu ms (%llu KB/s); "
++		"write %llu req %llu KB in %llu ms (%llu KB/s)\n",
++		span / 1000, emmc_io_rd_req, emmc_io_rd_sec / 2, rms,
++		rms ? emmc_io_rd_sec * 512u / rms : 0, emmc_io_wr_req, emmc_io_wr_sec / 2,
++		wms, wms ? emmc_io_wr_sec * 512u / wms : 0);
++	printf("USB> io: disk busy %llu%% of the time; waiting for the disk lock %llu ms; "
++		"longest request %llu ms (%s)\n",
++		span ? (rms + wms) * 100u / span : 0, emmc_io_ms(emmc_io_wait_abs),
++		emmc_io_ms(emmc_io_max_abs), emmc_io_max_name);
++	{
++		static struct emmc_io_proc top[EMMC_IO_PROCS];
++		memcpy(top, emmc_io_procs, sizeof(top));
++		for (int k = 0; k < 10; k++) {
++			int best = -1;
++			for (int i = 0; i < EMMC_IO_PROCS; i++) {
++				if (top[i].name[0] && (best < 0 || top[i].abs > top[best].abs)) {
++					best = i;
++				}
++			}
++			if (best < 0) {
++				break;
++			}
++			printf("USB> io %5d %-16s read %6llu KB write %6llu KB, %6llu ms\n",
++				top[best].pid, top[best].name, top[best].rd_sec / 2,
++				top[best].wr_sec / 2, emmc_io_ms(top[best].abs));
++			top[best].name[0] = '\0';
++		}
++	}
++	if (!strcmp(arg, "reset")) {
++		memset(emmc_io_procs, 0, sizeof(emmc_io_procs));
++		emmc_io_rd_req = emmc_io_wr_req = emmc_io_rd_sec = emmc_io_wr_sec = 0;
++		emmc_io_rd_abs = emmc_io_wr_abs = emmc_io_wait_abs = emmc_io_max_abs = 0;
++		emmc_io_max_name[0] = '\0';
++		emmc_io_since = mach_absolute_time();
++		printf("USB> io: counters reset\n");
++	}
++	lck_mtx_unlock(&a5xelte_emmc_lock);
++}
++
+ static void
+ emmc_strategy(buf_t bp)
+ {
+@@ -514,7 +654,9 @@
+ 		error = EIO;
+ 		goto done;
+ 	}
++	uint64_t io_t0 = mach_absolute_time();     /* 0146 */
+ 	lck_mtx_lock(&a5xelte_emmc_lock);
++	uint64_t io_t1 = mach_absolute_time();
+ 	for (uint32_t n = 0; n < count;) {
+ 		uint64_t pos = off + n;
+ 		uint32_t skip = pos & 511u;
+@@ -540,7 +682,21 @@
+ 		n += take;
+ 		buf_setresid(bp, count - n);
+ 	}
+-	lck_mtx_unlock(&a5xelte_emmc_lock);
++	{
++		/* 0146 */
++		uint64_t io_t2 = mach_absolute_time();
++		bool rd = (buf_flags(bp) & B_READ) != 0;
++		emmc_io_account(rd, (count + 511u) / 512u, io_t2 - io_t1, io_t1 - io_t0);
++		lck_mtx_unlock(&a5xelte_emmc_lock);
++		uint64_t total_ms = emmc_io_ms(io_t2 - io_t0);
++		if (total_ms >= 500) {
++			char who[20];
++			proc_selfname(who, sizeof(who));
++			printf("IO slow %s(%d) %s %u KB at block %lld: %llu ms (%llu ms waiting for the lock)\n",
++				who, proc_selfpid(), rd ? "read" : "write", count / 1024u,
++				(long long)buf_blkno(bp), total_ms, emmc_io_ms(io_t1 - io_t0));
++		}
++	}
+ 	buf_unmap(bp);
+ done:
+ 	if (error) {
+--- a/bsd/dev/a5xelte_usb.c
++++ b/bsd/dev/a5xelte_usb.c
+@@ -1186,7 +1186,7 @@
+ 	printf("USB> $ %s %s\n", line, arg);
+ 	if (!strcmp(line, "help")) {
+ 		printf("USB> commands: help | info | replay | ps | top [SECS] | bench | sample NAME[,NAME]|PID | "
+-		    "kill PID [SIG] | rd PA [N] | reboot | recovery\n");
++		    "kill PID [SIG] | rd PA [N] | io [reset|bench] | reboot | recovery\n");
+ 		printf("USB> dvfs: temp | pmic [REG [N]] | cpufreq [MHZ] (343..1586)\n");
+ 		printf("USB> reg OPS: r PA [N] ; w PA V ; m PA MASK V ; p PA MASK V US ; d US ; i 0|1\n");
+ 	} else if (!strcmp(line, "info")) {
+@@ -1204,6 +1204,10 @@
+ 		printf("USB> ps: %d processes\n", ud_ps_count);
+ 	} else if (!strcmp(line, "bench")) {
+ 		ud_bench();
++	} else if (!strcmp(line, "io")) {
++		/* 0146: disk statistics, bsd/dev/a5xelte_emmc.c */
++		extern void a5xelte_emmc_io(const char *arg);
++		a5xelte_emmc_io(arg);
+ 	} else if (!strcmp(line, "top")) {
+ 		const char *s = arg;
+ 		ud_top(*arg ? (unsigned)ud_num(&s) : 5);
