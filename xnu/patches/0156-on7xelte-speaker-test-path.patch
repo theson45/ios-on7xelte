@@ -1,0 +1,395 @@
+--- a/bsd/dev/a5xelte_dvfs.c
++++ b/bsd/dev/a5xelte_dvfs.c
+@@ -103,6 +103,24 @@
+  *   codec REG [N]      read N registers (max 64)
+  *   codec w REG VAL [REG VAL ...]   write each and read it back
+  *
++ * 0156: speaker test path, on demand only (nothing runs at boot). The
++ * bootloader already runs AUD_PLL at 98.304 MHz (CON0 0xa01e0103, K 16213,
++ * as in the ECT table), MI2S /1, MIXER /2 (49.152 MHz) with every DISPAUD
++ * audio gate on. Following Linux (lpass-exynos7870, exynos-audmixer-v2,
++ * i2s.c with samsung,i2s-str, universal7870-cod3026, cod3026x and the
++ * "speaker" path of mixer_paths_0.xml):
++ *   aud on      reset toggle of MIXER/MI2S (SYSREG_DISPAUD 0x148F1000),
++ *               gpz1-0/2/3/4 to function 2 (i2s_pmic_bus), s1402x mixer
++ *               init (AP0 in 16 bit 32fs, MCLK on BCK4, mixer on, CH1 to
++ *               DOUT), I2S0 master TX (RCLK 512fs from MI2S, PSR 4, BCLK
++ *               32fs, 16 bit), codec init and DAC + speaker path (-6 dB).
++ *   aud tone [MS [HZ [AMP]]]   a sine written to I2S0 TXD by the CPU
++ *               (default 1000 ms, 1000 Hz, 3000 of 32767; max 5000 ms).
++ *   aud off     speaker, DAC and I2S0 off.
++ *   aud st      registers of each block.
++ * Only these defined registers are touched: block reads of CMU_DISPAUD hit
++ * holes and hang the bus. Codec writes go to 0x04 only.
++ *
+  * Boot-arg a5cpufreq=MHZ applies a level once, 20 s after USB start.
+  *
+  * Sources: Samsung 3.18 kernel for the J7 Prime (i2c-exynos5.c batcher
+@@ -1279,6 +1297,349 @@
+ 	}
+ }
+ 
++/* ---- 0156: speaker test path ---- */
++
++#define AU_CMU          0x148D0000u     /* CMU_DISPAUD */
++#define AU_SYSREG       0x148F1000u     /* DISPAUD_CFG: soft reset bits */
++#define AU_MIXER        0x14880000u     /* s1402x, register N at N * 4 */
++#define AU_I2S          0x148A0000u     /* I2S0 */
++#define AU_GPZ1         0x148C0020u     /* CON, DAT, PUD, DRV */
++
++#define I2S_CON         0x00
++#define I2S_MOD         0x04
++#define I2S_FIC         0x08
++#define I2S_PSR         0x0c
++#define I2S_TXD         0x10
++#define I2S_CON_RSTCLR  (1u << 31)
++#define I2S_CON_TXUR    (1u << 17)
++#define I2S_CON_TXFULL  (1u << 8)
++#define I2S_CON_TXPAUSE (1u << 4)
++#define I2S_CON_ACTIVE  (1u << 0)
++#define I2S_FIC_TXFLUSH (1u << 15)
++
++static bool au_on;
++
++static vm_offset_t
++au_va(uint32_t pa)
++{
++	vm_offset_t va = reg_va(pa);
++	if (!va) {
++		printf("USB> aud: cannot map 0x%08x\n", pa);
++	}
++	return va;
++}
++
++static bool
++au_rd(uint32_t pa, uint32_t *v)
++{
++	vm_offset_t va = au_va(pa);
++	if (!va) {
++		return false;
++	}
++	*v = rd32(va, 0);
++	return true;
++}
++
++static bool
++au_wr(uint32_t pa, uint32_t v)
++{
++	vm_offset_t va = au_va(pa);
++	if (!va) {
++		return false;
++	}
++	wr32(va, 0, v);
++	return true;
++}
++
++static bool
++au_mod(uint32_t pa, uint32_t mask, uint32_t v)
++{
++	uint32_t old;
++	if (!au_rd(pa, &old)) {
++		return false;
++	}
++	return au_wr(pa, (old & ~mask) | (v & mask));
++}
++
++static bool
++au_mx(uint32_t reg, uint32_t v)
++{
++	return au_wr(AU_MIXER + reg * 4, v);
++}
++
++static bool
++au_cw(uint8_t reg, uint8_t v)
++{
++	if (cd_write(reg, v)) {
++		printf("USB> aud: codec w 0x%02x = 0x%02x FAILED\n", reg, v);
++		return false;
++	}
++	return true;
++}
++
++static bool
++au_cu(uint8_t reg, uint8_t mask, uint8_t v)
++{
++	uint8_t old = 0;
++	if (cd_read(reg, &old)) {
++		printf("USB> aud: codec r 0x%02x FAILED\n", reg);
++		return false;
++	}
++	return au_cw(reg, (uint8_t)((old & ~mask) | (v & mask)));
++}
++
++/* The clocks the bootloader leaves on; nothing is touched without them. */
++static bool
++au_clocks_ok(void)
++{
++	uint32_t pll = 0, apb = 0, mi2s = 0, mix = 0;
++	if (!au_rd(AU_CMU + 0x1c0, &pll) || !au_rd(AU_CMU + 0x814, &apb) ||
++	    !au_rd(AU_CMU + 0x82c, &mi2s) || !au_rd(AU_CMU + 0x830, &mix)) {
++		return false;
++	}
++	bool ok = (pll & (1u << 31)) && (pll & (1u << 29)) && (apb & (1u << 2)) &&
++	    (mi2s & 1u) && (mix & 1u);
++	printf("USB> aud: AUD_PLL 0x%08x APB 0x%x MI2S 0x%x MIXER 0x%x -> %s\n",
++	    pll, apb, mi2s, mix, ok ? "ok" : "clocks off, nothing done");
++	return ok;
++}
++
++static bool
++au_start(void)
++{
++	if (!au_clocks_ok()) {
++		return false;
++	}
++	/* lpass_reset_toggle(MIXER), (I2S): set, 100 us, clear */
++	if (!au_mod(AU_SYSREG, 0x3, 0x3)) {
++		return false;
++	}
++	delay(100);
++	if (!au_mod(AU_SYSREG, 0x3, 0x0)) {
++		return false;
++	}
++	/* i2s_pmic_bus: gpz1-0/2/3/4 function 2, pull 3, drive 5 */
++	if (!au_mod(AU_GPZ1 + 0x0, 0x000fff0f, 0x00022202) ||
++	    !au_mod(AU_GPZ1 + 0x8, 0x3f3, 0x3f3) ||
++	    !au_mod(AU_GPZ1 + 0xc, 0x7fc7, 0x5b45)) {
++		return false;
++	}
++	/* audmixer_reset_sys_data + audmixer_init_mixer + "speaker" path */
++	if (!au_mx(0x00, 0x0)) {
++		return false;
++	}
++	delay(1000);
++	if (!au_mx(0x00, 0x3)) {
++		return false;
++	}
++	delay(1000);
++	if (!au_mx(0x02, 0x00) ||               /* IN1 (AP0): 32fs, I2S, 16 bit */
++	    !au_mx(0x05, 0x00) ||
++	    !au_mx(0x07, 0x04) ||               /* BT: slave, 32 BCK slot, I2S */
++	    !au_mx(0x08, 0x00) ||
++	    !au_mx(0x09, 0x24) ||
++	    !au_mx(0x0b, 0x01) ||               /* SLOT_L 1st, SLOT_R 2nd */
++	    !au_mx(0x0c, 0x02) ||
++	    !au_mx(0x0e, 0x01) ||               /* 2 slots */
++	    !au_mx(0x0a, 0x06) ||               /* MCKO_EN | BCK4_MODE (bck-mcko-mode), 48 kHz */
++	    !au_mx(0x0f, 0x08) ||               /* "Mixer En" */
++	    !au_mx(0x10, 0x08) ||               /* "CH1 Mixer En", MIX1_LVL 0 */
++	    !au_mx(0x11, 0x00) ||
++	    !au_mx(0x16, 0x00)) {               /* CH1 DOUT = DMIX_OUT */
++		return false;
++	}
++	/* audmixer_reset_data: toggle DATA_RSTB */
++	if (!au_mx(0x00, 0x1) || !au_mx(0x00, 0x3)) {
++		return false;
++	}
++	/*
++	 * I2S0 (i2s-str layout): master, CDCLK out, RCLKSRC 1 (MI2S 98.304 MHz),
++	 * OPCLK PCLK, RCLK 512fs (24.576 MHz, PSR 4), BCLK 32fs, I2S, TX only.
++	 */
++	if (!au_wr(AU_I2S + I2S_CON, I2S_CON_RSTCLR) ||
++	    !au_wr(AU_I2S + I2S_MOD, (3u << 30) | (1u << 10) | (1u << 3)) ||
++	    !au_wr(AU_I2S + I2S_PSR, (1u << 15) | (3u << 8)) ||
++	    !au_wr(AU_I2S + I2S_FIC, I2S_FIC_TXFLUSH) ||
++	    !au_wr(AU_I2S + I2S_FIC, 0) ||
++	    !au_wr(AU_I2S + I2S_CON, I2S_CON_RSTCLR | I2S_CON_ACTIVE)) {
++		return false;
++	}
++	/* cod3026x_post_fw_update_failure (IRQ masks and mic bias left alone) */
++	static const uint8_t init[][2] = {
++		{ 0x81, 0x42 }, { 0x81, 0x43 }, { 0x85, 0xff }, { 0x86, 0xff },
++		{ 0x87, 0x0f }, { 0x88, 0xf2 }, { 0x8b, 0x09 }, { 0x42, 0x0c },
++		{ 0x5a, 0x1a }, { 0x77, 0x02 }, { 0xdd, 0x82 }, { 0x75, 0x13 },
++		{ 0x78, 0x01 },
++	};
++	for (uint32_t i = 0; i < sizeof(init) / sizeof(init[0]); i++) {
++		if (!au_cw(init[i][0], init[i][1])) {
++			return false;
++		}
++		if (i == 0) {
++			delay(1000);
++		}
++	}
++	/* set_fmt I2S NB_NF + hw_params 24 bit (the mixer converts) */
++	if (!au_cu(0x41, 0xcf, 0x88)) {
++		return false;
++	}
++	/* dac_ev PRE_PMU */
++	if (!au_cu(0x40, 0x20, 0x20) || !au_cu(0x40, 0x10, 0x00) || !au_cu(0x40, 0x10, 0x10)) {
++		return false;
++	}
++	/* "DAC Gain" 135 (inverted from 0x97), "Speaker Volume" 0 (-6 dB) */
++	if (!au_cw(0x51, 0x97 - 135) || !au_cw(0x52, 0x97 - 135)) {
++		return false;
++	}
++	/* "SPK SPK On", then spkdrv_ev PRE_PMU for speaker only */
++	if (!au_cu(0x76, 0x04, 0x04) || !au_cw(0xd4, 0x00) || !au_cw(0xd5, 0x00) ||
++	    !au_cu(0x54, 0x80, 0x00) || !au_cw(0xdd, 0x82) || !au_cu(0x37, 0x0c, 0x00) ||
++	    !au_cu(0x32, 0x0f, 0x00) || !au_cu(0x17, 0x14, 0x14) || !au_cu(0x37, 0x0f, 0x0c)) {
++		return false;
++	}
++	delay(135000);
++	au_on = true;
++	printf("USB> aud on: done\n");
++	return true;
++}
++
++static void
++au_stop(void)
++{
++	/* spkdrv_ev / dac_ev PRE_PMD, then I2S0 idle */
++	(void)(au_cu(0x17, 0x14, 0x00) && au_cu(0x37, 0x0c, 0x00) && au_cu(0x76, 0x04, 0x00) &&
++	    au_cu(0x40, 0x10, 0x00) && au_cu(0x40, 0x20, 0x00));
++	(void)au_wr(AU_I2S + I2S_CON, I2S_CON_RSTCLR);
++	(void)au_mx(0x10, 0x00);
++	au_on = false;
++	printf("USB> aud off: done\n");
++}
++
++/* sin(2 pi i / 64) * 32767 for i = 0..16 */
++static const int16_t au_sin_q[17] = {
++	0, 3212, 6393, 9512, 12539, 15446, 18204, 20787, 23170,
++	25329, 27245, 28898, 30273, 31356, 32137, 32609, 32767,
++};
++
++static int32_t
++au_sin(uint32_t ph)          /* ph: 0..63 */
++{
++	uint32_t q = ph & 15, h = (ph >> 4) & 3;
++	int32_t v = (h & 1) ? au_sin_q[16 - q] : au_sin_q[q];
++	return h >= 2 ? -v : v;
++}
++
++static void
++au_tone(const char *arg)
++{
++	const char *s = arg;
++	uint32_t ms = dv_num(&s), hz = dv_num(&s), amp = dv_num(&s);
++	ms = ms ? (ms > 5000 ? 5000 : ms) : 1000;
++	hz = hz ? (hz > 12000 ? 12000 : hz) : 1000;
++	amp = amp ? (amp > 32767 ? 32767 : amp) : 3000;
++	if (!au_on) {
++		printf("USB> aud tone: run \"aud on\" first\n");
++		return;
++	}
++	vm_offset_t i2s = au_va(AU_I2S);
++	if (!i2s) {
++		return;
++	}
++	uint32_t frames = 48 * ms, ph = 0, step = (uint32_t)(((uint64_t)hz << 22) / 48000);
++	uint32_t ur = 0, stuck = 0;
++	uint64_t t0 = reg_us();
++	(void)au_wr(AU_I2S + I2S_CON, I2S_CON_RSTCLR | I2S_CON_ACTIVE);
++	for (uint32_t f = 0; f < frames; f++) {
++		uint32_t spin = 0;
++		while (rd32(i2s, I2S_CON) & I2S_CON_TXFULL) {
++			if (++spin > 200000) {
++				break;
++			}
++		}
++		if (spin > 200000) {
++			stuck = f + 1;
++			break;
++		}
++		int32_t v = (au_sin(ph >> 16) * (int32_t)amp) / 32767;
++		uint32_t w = (uint32_t)v & 0xffffu;
++		wr32(i2s, I2S_TXD, w | (w << 16));
++		ph = (ph + step) & ((64u << 16) - 1);
++		uint32_t con = rd32(i2s, I2S_CON);
++		if (con & I2S_CON_TXUR) {
++			ur++;
++			wr32(i2s, I2S_CON, con);        /* write 1 to clear */
++		}
++	}
++	uint64_t us = reg_us() - t0;
++	if (stuck) {
++		printf("USB> aud tone: TX FIFO never drained at frame %u (no BCLK?), CON 0x%08x FIC 0x%08x\n",
++		    stuck - 1, rd32(i2s, I2S_CON), rd32(i2s, I2S_FIC));
++		return;
++	}
++	printf("USB> aud tone: %u frames %u Hz amp %u in %llu us (48 kHz = %u us), underruns %u\n",
++	    frames, hz, amp, (unsigned long long)us, ms * 1000, ur);
++}
++
++static void
++au_status(void)
++{
++	static const uint32_t cmu[] = { 0x1c0, 0x1c4, 0x204, 0x22c, 0x40c, 0x410, 0x814, 0x82c, 0x830, 0x834 };
++	static const uint8_t mx[] = { 0x00, 0x01, 0x02, 0x0a, 0x0f, 0x10, 0x16 };
++	static const uint8_t cd[] = { 0x17, 0x32, 0x37, 0x40, 0x41, 0x50, 0x51, 0x52, 0x54, 0x76, 0x77, 0x81, 0xdd };
++	uint32_t v = 0;
++	for (uint32_t i = 0; i < sizeof(cmu) / sizeof(cmu[0]); i++) {
++		if (au_rd(AU_CMU + cmu[i], &v)) {
++			printf("USB> aud st: CMU 0x%03x = 0x%08x\n", cmu[i], v);
++		}
++	}
++	if (au_rd(AU_SYSREG, &v)) {
++		printf("USB> aud st: SYSREG DISPAUD_CFG = 0x%08x\n", v);
++	}
++	for (uint32_t i = 0; i < 4; i++) {
++		if (au_rd(AU_GPZ1 + 4 * i, &v)) {
++			printf("USB> aud st: gpz1 +0x%x = 0x%08x\n", 4 * i, v);
++		}
++	}
++	for (uint32_t i = 0; i < sizeof(mx); i++) {
++		if (au_rd(AU_MIXER + mx[i] * 4u, &v)) {
++			printf("USB> aud st: mixer 0x%02x = 0x%02x\n", mx[i], v);
++		}
++	}
++	for (uint32_t i = 0; i < 4; i++) {
++		if (au_rd(AU_I2S + 4 * i, &v)) {
++			printf("USB> aud st: I2S0 +0x%x = 0x%08x\n", 4 * i, v);
++		}
++	}
++	for (uint32_t i = 0; i < sizeof(cd); i++) {
++		uint8_t b = 0;
++		if (cd_read(cd[i], &b)) {
++			printf("USB> aud st: codec 0x%02x read FAILED\n", cd[i]);
++			return;
++		}
++		printf("USB> aud st: codec 0x%02x = 0x%02x\n", cd[i], b);
++	}
++}
++
++static void
++aud_cmd(const char *arg)
++{
++	if (dv.batch) {
++		printf("USB> aud: direct path only (pmic path direct)\n");
++		return;
++	}
++	if (!strcmp(arg, "on")) {
++		(void)au_start();
++	} else if (!strcmp(arg, "off")) {
++		au_stop();
++	} else if (!strcmp(arg, "st")) {
++		au_status();
++	} else if (!strncmp(arg, "tone", 4) && (arg[4] == ' ' || arg[4] == '\0')) {
++		au_tone(arg + 4);
++	} else {
++		printf("USB> aud: on | off | st | tone [MS [HZ [AMP]]]\n");
++	}
++}
++
+ static void
+ dv_run(const char *cmd, const char *arg)
+ {
+@@ -1293,6 +1654,8 @@
+ 		time_cmd(arg);
+ 	} else if (!strcmp(cmd, "codec")) {
+ 		codec_cmd(arg);
++	} else if (!strcmp(cmd, "aud")) {
++		aud_cmd(arg);
+ 	} else if (!strcmp(cmd, "temp")) {
+ 		printf("USB> temp: %d C (TMU 0x%08x, trim 0x%08x)\n", dv_temp(),
+ 		    rd32(dv.tmu, 0x40), rd32(dv.tmu, 0x0));
+@@ -1438,7 +1801,7 @@
+ a5xelte_dvfs_command(const char *cmd, const char *arg)
+ {
+ 	if (strcmp(cmd, "temp") && strcmp(cmd, "pmic") && strcmp(cmd, "cpufreq") && strcmp(cmd, "reg") &&
+-	    strcmp(cmd, "time") && strcmp(cmd, "codec")) {
++	    strcmp(cmd, "time") && strcmp(cmd, "codec") && strcmp(cmd, "aud")) {
+ 		return false;
+ 	}
+ 	dv_post(cmd, arg);
