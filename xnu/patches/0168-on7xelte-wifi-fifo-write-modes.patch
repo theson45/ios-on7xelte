@@ -1,0 +1,81 @@
+--- a/bsd/dev/on7xelte_wifi.c
++++ b/bsd/dev/on7xelte_wifi.c
+@@ -560,6 +560,31 @@
+ 	return wf_cmd53_once(fn, addr, wr, buf, n, false);   /* 0163: once more, and tell if that fails too */
+ }
+ 
++/*
++ * 0168: how a FIFO entry is written ('wifi fifo N'). 0167 (xnu51): one 64-bit str at 0x200 after TXDR, still
++ * FIFO count 0 and the card left waiting in TRN. 0 = 64-bit str at 0x200, 1 = 32-bit low at 0x200 and high at
++ * 0x204, 2 = both 32-bit halves at 0x200, 3 = only 32-bit words at 0x200 (no padding).
++ */
++static uint32_t wf_fifo_mode;
++
++static void
++wf_fifo_put(uint32_t lo, uint32_t hi)
++{
++	switch (wf_fifo_mode) {
++	case 1:
++		wr32(wf_mmc, M_FIFO, lo);
++		wr32(wf_mmc, M_FIFO + 4, hi);
++		break;
++	case 2:
++		wr32(wf_mmc, M_FIFO, lo);
++		wr32(wf_mmc, M_FIFO, hi);
++		break;
++	default:
++		*(volatile uint64_t *)(wf_mmc + M_FIFO) = lo | ((uint64_t)hi << 32);
++		break;
++	}
++}
++
+ static bool
+ wf_cmd53_once(uint32_t fn, uint32_t addr, bool wr, uint32_t *buf, uint32_t n, bool quiet)
+ {
+@@ -587,14 +612,23 @@
+ 		if (wr && sent < nw && (st & RINT_TXDR)) {
+ 			/* 64-bit FIFO (HCON H_DATA_WIDTH 2), depth 64: push while there is room; odd last word + zeros */
+ 			uint32_t fc = (rd32(wf_mmc, M_STATUS) >> 17) & 0x1fff;
++			uint32_t before = rd32(wf_mmc, M_STATUS);
+ 			while (sent < nw && fc < 64) {
+-				uint64_t v = buf[sent] | ((sent + 1 < nw) ? (uint64_t)buf[sent + 1] << 32 : 0);
+-				*(volatile uint64_t *)(wf_mmc + M_FIFO) = v;
+-				sent += 2;
++				if (wf_fifo_mode == 3) {
++					wr32(wf_mmc, M_FIFO, buf[sent]);
++					sent += 1;
++				} else {
++					wf_fifo_put(buf[sent], (sent + 1 < nw) ? buf[sent + 1] : 0);
++					sent += 2;
++				}
+ 				fc++;
+ 			}
+-			wr32(wf_mmc, M_RINTSTS, RINT_TXDR);
+ 			pre = rd32(wf_mmc, M_STATUS);
++			if (!quiet && wf_errs < 6) {
++				printf("USB> wifi: TXDR push (mode %u): STATUS 0x%08x -> 0x%08x, RINTSTS 0x%08x\n", wf_fifo_mode,
++				    before, pre, rd32(wf_mmc, M_RINTSTS));
++			}
++			wr32(wf_mmc, M_RINTSTS, RINT_TXDR);
+ 			continue;
+ 		}
+ 		if ((st & RINT_DTO) || (st & (RINT_HLE | RINT_DERR)) ||
+@@ -1297,6 +1331,9 @@
+ 	} else if (!strcmp(arg, "fw")) {
+ 		wf_bus4 = true;
+ 		wf_fw();
++	} else if (!strncmp(arg, "fifo ", 5) && arg[5] >= '0' && arg[5] <= '3' && !arg[6]) {
++		wf_fifo_mode = (uint32_t)(arg[5] - '0');
++		printf("USB> wifi: FIFO write mode %u\n", wf_fifo_mode);
+ 	} else if (!strcmp(arg, "fw1")) {
+ 		wf_bus4 = false;
+ 		wf_fw();
+@@ -1307,7 +1344,7 @@
+ 	} else if (!strncmp(arg, "cr ", 3)) {
+ 		wf_rd_cmd(arg + 3, true);
+ 	} else {
+-		printf("USB> wifi: probe [keep] | off | st | fw | fw1 | rd ADDR [N] | wr ADDR VAL | cr FN ADDR\n");
++		printf("USB> wifi: probe [keep] | off | st | fw | fw1 | fifo 0-3 | rd ADDR [N] | wr ADDR VAL | cr FN ADDR\n");
+ 	}
+ }
+ 
