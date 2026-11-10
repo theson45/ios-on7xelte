@@ -1,0 +1,66 @@
+--- a/bsd/dev/on7xelte_wifi.c	2026-11-11 00:39:33.545565100 +0300
++++ b/bsd/dev/on7xelte_wifi.c	2026-11-11 00:39:33.604253100 +0300
+@@ -952,6 +952,15 @@
+ 	return data;
+ }
+ 
++/*
++ * 0173: the board NVRAM has deadman_to=0xffffffff. The firmware's deadman counts backplane clocks
++ * (81.6 MHz): 2^32 of them are 52.6 s, then an NMI (TRAP 2, xnu56). Android's driver lets the chip
++ * sleep when idle, which stops that clock; here HT is forced, so the value is replaced.
++ * 'wifi dm HEX' sets it for the next fw, 'wifi dm keep' leaves the board's value.
++ */
++static uint32_t wf_dm_val = 0;
++static bool wf_dm_keep = false;
++
+ /* NVRAM text to the chip's form: key=value lines, NUL-terminated, comments and blanks dropped, a final NUL */
+ static uint32_t
+ wf_nvram(const uint8_t *s, uint32_t n, uint8_t *out, uint32_t *count)
+@@ -977,6 +986,17 @@
+ 		if (a == b || s[a] == '#' || !eq) {
+ 			continue;
+ 		}
++		if (!wf_dm_keep && b - a >= 11 && !memcmp(s + a, "deadman_to=", 11)) {
++			char dm[24];
++			snprintf(dm, sizeof(dm), "deadman_to=0x%x", wf_dm_val);
++			uint32_t dl = (uint32_t)strlen(dm);
++			memcpy(out + o, dm, dl);
++			o += dl;
++			out[o++] = 0;
++			c++;
++			printf("USB> wifi: NVRAM: %s (the board's value replaced)\n", dm);
++			continue;
++		}
+ 		memcpy(out + o, s + a, b - a);
+ 		o += b - a;
+ 		out[o++] = 0;
+@@ -2014,6 +2034,20 @@
+ 		wf_mac_cmd();
+ 	} else if (!strcmp(arg, "scan")) {
+ 		wf_scan_cmd();
++	} else if (!strcmp(arg, "dm keep")) {
++		wf_dm_keep = true;
++		printf("USB> wifi: deadman_to: the board's value for the next fw\n");
++	} else if (!strncmp(arg, "dm ", 3)) {
++		const char *a = arg + 3;
++		bool ok;
++		uint32_t v = wf_hex(&a, &ok);
++		if (ok) {
++			wf_dm_val = v;
++			wf_dm_keep = false;
++			printf("USB> wifi: deadman_to=0x%x for the next fw\n", v);
++		} else {
++			printf("USB> wifi: dm HEX | dm keep\n");
++		}
+ 	} else if (!strncmp(arg, "join ", 5)) {
+ 		wf_join_cmd(arg + 5);
+ 	} else if (!strcmp(arg, "link")) {
+@@ -2035,7 +2069,7 @@
+ 	} else if (!strncmp(arg, "cr ", 3)) {
+ 		wf_rd_cmd(arg + 3, true);
+ 	} else {
+-		printf("USB> wifi: probe [keep] | off | st | fw | fw1 | ver | mac | scan | join SSIDHEX PASSHEX|- | link | con | fifo 0-3 | div N | rd ADDR [N] | wr ADDR VAL | cr FN ADDR\n");
++		printf("USB> wifi: probe [keep] | off | st | fw | fw1 | ver | mac | scan | join SSIDHEX PASSHEX|- | link | dm HEX|keep | con | fifo 0-3 | div N | rd ADDR [N] | wr ADDR VAL | cr FN ADDR\n");
+ 	}
+ }
+ 
