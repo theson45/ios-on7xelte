@@ -1,0 +1,98 @@
+--- a/bsd/dev/on7xelte_audio.c
++++ b/bsd/dev/on7xelte_audio.c
+@@ -15,6 +15,12 @@
+  *
+  * Volume is applied here in software (Q16 gain); the codec stays at Android's speaker level.
+  * "USB> raud:" lines count frames, drops (ring full) and FIFO underruns per stretch of sound.
++ *
++ * 0159: the start of a sound is no longer thrown away.  Bringing the path up takes long enough
++ * that the old 170 ms ring overflowed and the newest-1024-frames trim then dropped most of the
++ * first ~200 ms (a short click could vanish).  Now the ring holds 680 ms and everything written
++ * is played; the latency that builds up while the path starts is won back by skipping only
++ * (near-)silent frames while more than RA_LAT frames are queued.
+  */
+ #include <sys/param.h>
+ #include <sys/systm.h>
+@@ -43,8 +49,9 @@
+ 
+ #define RA_RATE         48000u
+ #define RA_FRAME        4u
+-#define RA_RING         8192u                   /* frames, power of two: 170 ms */
+-#define RA_PREFILL      1024u                   /* frames kept when the hardware comes up */
++#define RA_RING         32768u                  /* frames, power of two: 680 ms */
++#define RA_LAT          1024u                   /* 21 ms: above this, silent frames are skipped */
++#define RA_QUIET        8                       /* |sample| <= this counts as silence */
+ #define RA_IDLE_MS      3000u
+ #define RA_WAKE_US      500u
+ #define RA_CHUNK        512u
+@@ -74,7 +81,7 @@
+ 
+ /* per stretch of sound */
+ static volatile uint32_t ra_frames, ra_dropped;
+-static uint32_t ra_underruns, ra_silent;
++static uint32_t ra_underruns, ra_silent, ra_skipped, ra_start_ms;
+ 
+ static uint32_t
+ ra_gain_for(uint32_t below, bool muted)
+@@ -169,6 +176,13 @@
+ 	return ((uint32_t)l & 0xffffu) | ((uint32_t)r << 16);
+ }
+ 
++static inline bool
++ra_quiet(uint32_t w)
++{
++	int32_t l = (int16_t)(w & 0xffff), r = (int16_t)(w >> 16);
++	return l >= -RA_QUIET && l <= RA_QUIET && r >= -RA_QUIET && r <= RA_QUIET;
++}
++
+ static void
+ ra_sleep_us(uint32_t us)
+ {
+@@ -189,10 +203,11 @@
+ static void
+ ra_report(void)
+ {
+-	printf("USB> raud: stretch done: %u frames (%u ms), dropped %u, underruns %u\n",
+-	    ra_frames, ra_frames / (RA_RATE / 1000), ra_dropped, ra_underruns);
++	printf("USB> raud: stretch done: %u frames (%u ms), path up in %u ms, silence skipped %u, "
++	    "dropped %u, underruns %u\n", ra_frames, ra_frames / (RA_RATE / 1000), ra_start_ms,
++	    ra_skipped, ra_dropped, ra_underruns);
+ 	ra_frames = ra_dropped = 0;
+-	ra_underruns = 0;
++	ra_underruns = ra_skipped = 0;
+ }
+ 
+ static void
+@@ -221,11 +236,8 @@
+ 			break;
+ 		case STARTING:
+ 			if (a5xelte_aud_running()) {
+-				/* keep only the newest RA_PREFILL frames: low latency from the start */
+-				uint32_t head = __atomic_load_n(&ra_head, __ATOMIC_ACQUIRE), tail = ra_tail;
+-				if (head - tail > RA_PREFILL) {
+-					__atomic_store_n(&ra_tail, head - RA_PREFILL, __ATOMIC_RELEASE);
+-				}
++				/* play all that queued up meanwhile; the silence skip catches up */
++				ra_start_ms = (uint32_t)ra_ms_since(t_state);
+ 				ra_silent = 0;
+ 				st = PLAYING;
+ 				break;
+@@ -247,11 +259,17 @@
+ 			uint32_t g = ra_gain, fed = 0;
+ 			while (!(*(volatile uint32_t *)(i2s + I2S_CON) & I2S_CON_TXFULL)) {
+ 				uint32_t head = __atomic_load_n(&ra_head, __ATOMIC_ACQUIRE), tail = ra_tail, wv = 0;
++				/* behind: drop quiet frames until the queue is short again */
++				while (head - tail > RA_LAT && ra_quiet(ra_ring[tail & (RA_RING - 1)])) {
++					tail++;
++					ra_skipped++;
++				}
+ 				if (head != tail) {
+ 					wv = ra_scale(ra_ring[tail & (RA_RING - 1)], g);
+-					__atomic_store_n(&ra_tail, tail + 1, __ATOMIC_RELEASE);
++					tail++;
+ 					fed++;
+ 				}
++				__atomic_store_n(&ra_tail, tail, __ATOMIC_RELEASE);
+ 				*(volatile uint32_t *)(i2s + I2S_TXD) = wv;
+ 			}
+ 			uint32_t con = *(volatile uint32_t *)(i2s + I2S_CON);
