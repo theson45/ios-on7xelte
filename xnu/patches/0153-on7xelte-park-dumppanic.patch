@@ -1,0 +1,13 @@
+--- a/bsd/dev/a5xelte_usb.c
++++ b/bsd/dev/a5xelte_usb.c
+@@ -974,7 +974,9 @@
+     "watchlistd,sosd,safetyalertsd,nanoregistryd,cloudpaird,nanoprefsyncd,"
+     "itunescloudd,softwareupdated,announced,voiced,CallHistorySyncHelper,"
+     "peopled,sociallayerd,contactsdonationagent,askpermissiond,transparencyd,"
+-    "awdd,rtcreportingd,aggregated";
++    "awdd,rtcreportingd,aggregated,"
++    /* 0153: reads panic logs for ~18 s at boot and holds the disk lock */
++    "DumpPanic";
+ static char ud_deny_arg[512];
+ static int ud_deny_state;       /* 0 not read, 1 default, 2 boot-arg, 3 off */
+ static int ud_deny_refuse;      /* on7denymode=refuse */
