@@ -1,0 +1,758 @@
+--- a/bsd/dev/on7xelte_wifi.c	2026-11-11 00:53:20.774562100 +0300
++++ b/bsd/dev/on7xelte_wifi.c	2026-11-11 00:53:20.855984800 +0300
+@@ -30,6 +30,7 @@
+ #include <kern/kalloc.h>
+ #include <sys/kauth.h>
+ #include <sys/uio.h>
++#include <sys/random.h>
+ #include <sys/vnode.h>
+ #include <sys/vnode_internal.h>
+ 
+@@ -1502,6 +1503,7 @@
+ }
+ 
+ static void wf_event(const uint8_t *eth, uint32_t len);
++static void wf_eapol(const uint8_t *e, uint32_t len);
+ 
+ /* the frame in wf_rxbuf: a control response is kept, events are handed on, data is dropped */
+ static void
+@@ -1535,6 +1537,8 @@
+ 		uint32_t o = 4u + pl[3] * 4u;
+ 		if (chan == 1) {
+ 			wf_event(pl + o, plen - o);
++		} else if (plen - o >= 14 && pl[o + 12] == 0x88 && pl[o + 13] == 0x8e) {
++			wf_eapol(pl + o, plen - o);     /* 0174: EAPOL, for the host's handshake */
+ 		}
+ 	} else {
+ 		printf("USB> wifi: rx: frame on channel %u (%u bytes)\n", chan, wf_rxlen);
+@@ -1826,6 +1830,662 @@
+ 	    ns / 1000000, wf_scan_n, wf_events, wf_bad ? " (a bus access failed)" : "");
+ }
+ 
++/*
++ * ---- 0174: WPA2-PSK in the host (this firmware has no supplicant: sup_wpa -23, xnu57) ----
++ * SHA-1, HMAC-SHA1, PBKDF2 (the PMK), the 802.11 PRF (the PTK), AES-128 decryption and the RFC 3394
++ * key unwrap (the GTK). Self-contained: nothing here needs corecrypto.
++ */
++typedef struct {
++	uint32_t h[5];
++	uint64_t n;
++	uint8_t b[64];
++	uint32_t bl;
++} wf_sha1_t;
++
++static uint32_t
++wf_rol(uint32_t x, int k)
++{
++	return (x << k) | (x >> (32 - k));
++}
++
++static void
++wf_sha1_blk(uint32_t *h, const uint8_t *p)
++{
++	uint32_t w[80], a = h[0], b = h[1], c = h[2], d = h[3], e = h[4];
++
++	for (int i = 0; i < 16; i++) {
++		w[i] = (uint32_t)p[4 * i] << 24 | (uint32_t)p[4 * i + 1] << 16 | (uint32_t)p[4 * i + 2] << 8 | p[4 * i + 3];
++	}
++	for (int i = 16; i < 80; i++) {
++		w[i] = wf_rol(w[i - 3] ^ w[i - 8] ^ w[i - 14] ^ w[i - 16], 1);
++	}
++	for (int i = 0; i < 80; i++) {
++		uint32_t f, k;
++		if (i < 20) {
++			f = (b & c) | (~b & d);
++			k = 0x5a827999u;
++		} else if (i < 40) {
++			f = b ^ c ^ d;
++			k = 0x6ed9eba1u;
++		} else if (i < 60) {
++			f = (b & c) | (b & d) | (c & d);
++			k = 0x8f1bbcdcu;
++		} else {
++			f = b ^ c ^ d;
++			k = 0xca62c1d6u;
++		}
++		uint32_t t = wf_rol(a, 5) + f + e + k + w[i];
++		e = d;
++		d = c;
++		c = wf_rol(b, 30);
++		b = a;
++		a = t;
++	}
++	h[0] += a;
++	h[1] += b;
++	h[2] += c;
++	h[3] += d;
++	h[4] += e;
++}
++
++static void
++wf_sha1_init(wf_sha1_t *s)
++{
++	s->h[0] = 0x67452301u;
++	s->h[1] = 0xefcdab89u;
++	s->h[2] = 0x98badcfeu;
++	s->h[3] = 0x10325476u;
++	s->h[4] = 0xc3d2e1f0u;
++	s->n = 0;
++	s->bl = 0;
++}
++
++static void
++wf_sha1_up(wf_sha1_t *s, const uint8_t *p, uint32_t n)
++{
++	s->n += n;
++	while (n) {
++		uint32_t k = 64 - s->bl < n ? 64 - s->bl : n;
++		memcpy(s->b + s->bl, p, k);
++		s->bl += k;
++		p += k;
++		n -= k;
++		if (s->bl == 64) {
++			wf_sha1_blk(s->h, s->b);
++			s->bl = 0;
++		}
++	}
++}
++
++static void
++wf_sha1_fin(wf_sha1_t *s, uint8_t out[20])
++{
++	uint64_t bits = s->n * 8;
++	uint8_t z = 0x80;
++
++	wf_sha1_up(s, &z, 1);
++	z = 0;
++	while (s->bl != 56) {
++		wf_sha1_up(s, &z, 1);
++	}
++	uint8_t L[8];
++	for (int i = 0; i < 8; i++) {
++		L[i] = (uint8_t)(bits >> (56 - 8 * i));
++	}
++	wf_sha1_up(s, L, 8);
++	for (int i = 0; i < 5; i++) {
++		out[4 * i] = (uint8_t)(s->h[i] >> 24);
++		out[4 * i + 1] = (uint8_t)(s->h[i] >> 16);
++		out[4 * i + 2] = (uint8_t)(s->h[i] >> 8);
++		out[4 * i + 3] = (uint8_t)s->h[i];
++	}
++}
++
++typedef struct {
++	wf_sha1_t i, o;
++} wf_hmac_t;
++
++static void
++wf_hmac_init(wf_hmac_t *c, const uint8_t *k, uint32_t kl)
++{
++	uint8_t pad[64], kh[20];
++
++	if (kl > 64) {
++		wf_sha1_t t;
++		wf_sha1_init(&t);
++		wf_sha1_up(&t, k, kl);
++		wf_sha1_fin(&t, kh);
++		k = kh;
++		kl = 20;
++	}
++	for (int i = 0; i < 64; i++) {
++		pad[i] = (uint8_t)(((uint32_t)i < kl ? k[i] : 0) ^ 0x36);
++	}
++	wf_sha1_init(&c->i);
++	wf_sha1_up(&c->i, pad, 64);
++	for (int i = 0; i < 64; i++) {
++		pad[i] = (uint8_t)(((uint32_t)i < kl ? k[i] : 0) ^ 0x5c);
++	}
++	wf_sha1_init(&c->o);
++	wf_sha1_up(&c->o, pad, 64);
++	bzero(pad, sizeof(pad));
++	bzero(kh, sizeof(kh));
++}
++
++static void
++wf_hmac(const wf_hmac_t *c, const uint8_t *m, uint32_t ml, uint8_t out[20])
++{
++	wf_sha1_t t = c->i;
++	uint8_t d[20];
++
++	wf_sha1_up(&t, m, ml);
++	wf_sha1_fin(&t, d);
++	t = c->o;
++	wf_sha1_up(&t, d, 20);
++	wf_sha1_fin(&t, out);
++	bzero(d, sizeof(d));
++}
++
++/* PMK = PBKDF2-HMAC-SHA1(passphrase, SSID, 4096, 32) */
++static void
++wf_pmk(const uint8_t *pw, uint32_t pl, const uint8_t *ssid, uint32_t sl, uint8_t pmk[32])
++{
++	wf_hmac_t c;
++	uint8_t m[36], u[20], t[20];
++
++	wf_hmac_init(&c, pw, pl);
++	for (uint32_t blk = 1; blk <= 2; blk++) {
++		memcpy(m, ssid, sl);
++		m[sl] = 0;
++		m[sl + 1] = 0;
++		m[sl + 2] = 0;
++		m[sl + 3] = (uint8_t)blk;
++		wf_hmac(&c, m, sl + 4, u);
++		memcpy(t, u, 20);
++		for (int j = 1; j < 4096; j++) {
++			wf_hmac(&c, u, 20, u);
++			for (int k = 0; k < 20; k++) {
++				t[k] ^= u[k];
++			}
++		}
++		memcpy(pmk + (blk - 1) * 20, t, blk == 1 ? 20 : 12);
++	}
++	bzero(&c, sizeof(c));
++	bzero(u, sizeof(u));
++	bzero(t, sizeof(t));
++}
++
++/* PRF-384: HMAC-SHA1(key, label 0 data i) for i = 0.. */
++static void
++wf_prf(const uint8_t *key, uint32_t kl, const char *label, const uint8_t *data, uint32_t dl, uint8_t *out,
++    uint32_t ol)
++{
++	wf_hmac_t c;
++	uint8_t m[128], h[20];
++	uint32_t ll = (uint32_t)strlen(label);
++
++	wf_hmac_init(&c, key, kl);
++	memcpy(m, label, ll);
++	m[ll] = 0;
++	memcpy(m + ll + 1, data, dl);
++	for (uint32_t i = 0, o = 0; o < ol; i++) {
++		m[ll + 1 + dl] = (uint8_t)i;
++		wf_hmac(&c, m, ll + 2 + dl, h);
++		uint32_t k = ol - o < 20 ? ol - o : 20;
++		memcpy(out + o, h, k);
++		o += k;
++	}
++	bzero(&c, sizeof(c));
++	bzero(h, sizeof(h));
++}
++
++static uint8_t wf_sb[256], wf_isb[256];
++
++static uint8_t
++wf_rol8(uint8_t x, int k)
++{
++	return (uint8_t)((x << k) | (x >> (8 - k)));
++}
++
++static void
++wf_aes_tables(void)
++{
++	uint8_t p = 1, q = 1;
++
++	if (wf_sb[0] == 0x63) {
++		return;
++	}
++	do {
++		p = (uint8_t)(p ^ (uint8_t)(p << 1) ^ ((p & 0x80) ? 0x1b : 0));
++		q ^= (uint8_t)(q << 1);
++		q ^= (uint8_t)(q << 2);
++		q ^= (uint8_t)(q << 4);
++		if (q & 0x80) {
++			q ^= 0x09;
++		}
++		wf_sb[p] = (uint8_t)(q ^ wf_rol8(q, 1) ^ wf_rol8(q, 2) ^ wf_rol8(q, 3) ^ wf_rol8(q, 4) ^ 0x63);
++	} while (p != 1);
++	wf_sb[0] = 0x63;
++	for (int i = 0; i < 256; i++) {
++		wf_isb[wf_sb[i]] = (uint8_t)i;
++	}
++}
++
++static uint8_t
++wf_gmul(uint8_t a, uint8_t b)
++{
++	uint8_t r = 0;
++
++	while (b) {
++		if (b & 1) {
++			r ^= a;
++		}
++		a = (uint8_t)((a << 1) ^ ((a & 0x80) ? 0x1b : 0));
++		b >>= 1;
++	}
++	return r;
++}
++
++static void
++wf_aes_keyexp(const uint8_t key[16], uint8_t rk[176])
++{
++	uint8_t rc = 1;
++
++	wf_aes_tables();
++	memcpy(rk, key, 16);
++	for (int i = 4; i < 44; i++) {
++		uint8_t t[4];
++		memcpy(t, rk + 4 * (i - 1), 4);
++		if (i % 4 == 0) {
++			uint8_t x = t[0];
++			t[0] = (uint8_t)(wf_sb[t[1]] ^ rc);
++			t[1] = wf_sb[t[2]];
++			t[2] = wf_sb[t[3]];
++			t[3] = wf_sb[x];
++			rc = (uint8_t)((rc << 1) ^ ((rc & 0x80) ? 0x1b : 0));
++		}
++		for (int k = 0; k < 4; k++) {
++			rk[4 * i + k] = rk[4 * (i - 4) + k] ^ t[k];
++		}
++	}
++}
++
++static void
++wf_aes_dec(const uint8_t rk[176], uint8_t s[16])
++{
++	uint8_t t[16];
++
++	for (int i = 0; i < 16; i++) {
++		s[i] ^= rk[160 + i];
++	}
++	for (int r = 9; r >= 0; r--) {
++		for (int c = 0; c < 4; c++) {           /* InvShiftRows + InvSubBytes */
++			for (int w = 0; w < 4; w++) {
++				t[c * 4 + w] = wf_isb[s[((c - w + 4) % 4) * 4 + w]];
++			}
++		}
++		for (int i = 0; i < 16; i++) {
++			s[i] = t[i] ^ rk[16 * r + i];
++		}
++		if (r == 0) {
++			break;
++		}
++		for (int c = 0; c < 4; c++) {           /* InvMixColumns */
++			uint8_t a0 = s[4 * c], a1 = s[4 * c + 1], a2 = s[4 * c + 2], a3 = s[4 * c + 3];
++			s[4 * c] = wf_gmul(a0, 14) ^ wf_gmul(a1, 11) ^ wf_gmul(a2, 13) ^ wf_gmul(a3, 9);
++			s[4 * c + 1] = wf_gmul(a0, 9) ^ wf_gmul(a1, 14) ^ wf_gmul(a2, 11) ^ wf_gmul(a3, 13);
++			s[4 * c + 2] = wf_gmul(a0, 13) ^ wf_gmul(a1, 9) ^ wf_gmul(a2, 14) ^ wf_gmul(a3, 11);
++			s[4 * c + 3] = wf_gmul(a0, 11) ^ wf_gmul(a1, 13) ^ wf_gmul(a2, 9) ^ wf_gmul(a3, 14);
++		}
++	}
++	bzero(t, sizeof(t));
++}
++
++/* RFC 3394 unwrap: in has n+1 64-bit blocks, out gets n; false if the integrity check fails */
++static bool
++wf_unwrap(const uint8_t kek[16], const uint8_t *in, uint32_t len, uint8_t *out)
++{
++	uint8_t rk[176], a[8], b[16];
++	uint32_t n = len / 8 - 1;
++
++	if (len < 24 || len % 8) {
++		return false;
++	}
++	wf_aes_keyexp(kek, rk);
++	memcpy(a, in, 8);
++	memcpy(out, in + 8, 8 * n);
++	for (int j = 5; j >= 0; j--) {
++		for (uint32_t i = n; i >= 1; i--) {
++			uint64_t t = (uint64_t)n * (uint64_t)j + i;
++			memcpy(b, a, 8);
++			for (int k = 0; k < 8; k++) {
++				b[7 - k] ^= (uint8_t)(t >> (8 * k));
++			}
++			memcpy(b + 8, out + 8 * (i - 1), 8);
++			wf_aes_dec(rk, b);
++			memcpy(a, b, 8);
++			memcpy(out + 8 * (i - 1), b + 8, 8);
++		}
++	}
++	bzero(rk, sizeof(rk));
++	bzero(b, sizeof(b));
++	for (int k = 0; k < 8; k++) {
++		if (a[k] != 0xa6) {
++			return false;
++		}
++	}
++	return true;
++}
++
++/*
++ * 0174: the 4-way handshake (IEEE 802.11-2016 12.7.6) and the group key handshake, EAPOL-Key
++ * descriptor version 2 (HMAC-SHA1-128 MIC, AES key wrap). EAPOL frames come on SDPCM channel 2
++ * (wf_frame); the work that needs a dcmd is left to the join loop (wf_hs_step), as a dcmd polls.
++ * No key, PMK or passphrase is ever printed.
++ */
++#define KI_VER2         0x0002u
++#define KI_PAIRWISE     0x0008u
++#define KI_INSTALL      0x0040u
++#define KI_ACK          0x0080u
++#define KI_MIC          0x0100u
++#define KI_SECURE       0x0200u
++#define KI_ENCDATA      0x1000u
++
++static struct {
++	bool on, msg1, msg3, grp, keys_set, ptk_ok;
++	uint8_t pmk[32], ptk[48], anonce[32], snonce[32], aa[6], spa[6];
++	uint8_t ie[64];
++	uint32_t iel;
++	uint8_t replay[8];
++	uint8_t gtk[32];
++	uint32_t gtkl, gid;
++	uint8_t rsc[8];
++	uint32_t steps;                 /* bit per message handled: 1..4, group 5 */
++} wf_hs;
++
++static uint32_t
++wf_be16(const uint8_t *p)
++{
++	return (uint32_t)p[0] << 8 | p[1];
++}
++
++static void
++wf_hs_clear(void)
++{
++	bzero(&wf_hs, sizeof(wf_hs));
++}
++
++/* KCK = PTK[0..15], KEK = PTK[16..31], TK = PTK[32..47] */
++static void
++wf_hs_ptk(void)
++{
++	uint8_t d[76];
++	bool alo = memcmp(wf_hs.aa, wf_hs.spa, 6) < 0, nlo = memcmp(wf_hs.anonce, wf_hs.snonce, 32) < 0;
++
++	memcpy(d, alo ? wf_hs.aa : wf_hs.spa, 6);
++	memcpy(d + 6, alo ? wf_hs.spa : wf_hs.aa, 6);
++	memcpy(d + 12, nlo ? wf_hs.anonce : wf_hs.snonce, 32);
++	memcpy(d + 44, nlo ? wf_hs.snonce : wf_hs.anonce, 32);
++	wf_prf(wf_hs.pmk, 32, "Pairwise key expansion", d, sizeof(d), wf_hs.ptk, 48);
++	bzero(d, sizeof(d));
++	wf_hs.ptk_ok = true;
++}
++
++static void
++wf_hs_mic(const uint8_t *eapol, uint32_t len, uint8_t mic[16])
++{
++	wf_hmac_t c;
++	uint8_t h[20];
++
++	wf_hmac_init(&c, wf_hs.ptk, 16);
++	wf_hmac(&c, eapol, len, h);
++	memcpy(mic, h, 16);
++	bzero(&c, sizeof(c));
++	bzero(h, sizeof(h));
++}
++
++/* one EAPOL-Key frame to the AP: key_info, replay counter, nonce (or zero), key data; MIC filled in */
++static bool
++wf_hs_send(uint32_t ki, const uint8_t *nonce, const uint8_t *kd, uint32_t kdl)
++{
++	static uint8_t f[4 + 14 + 4 + 95 + 64];
++	uint8_t *e = f + 4, *x = e + 14, *k = x + 4;
++	uint32_t bl = 95 + kdl;
++
++	if (kdl > 64) {
++		return false;
++	}
++	bzero(f, sizeof(f));
++	f[0] = 0x20;                            /* BDC: protocol version 2; priority 0, interface 0 */
++	memcpy(e, wf_hs.aa, 6);
++	memcpy(e + 6, wf_hs.spa, 6);
++	e[12] = 0x88;
++	e[13] = 0x8e;
++	x[0] = 1;                               /* 802.1X-2001, as wpa_supplicant sends by default */
++	x[1] = 3;                               /* EAPOL-Key */
++	x[2] = (uint8_t)(bl >> 8);
++	x[3] = (uint8_t)bl;
++	k[0] = 2;                               /* RSN key descriptor */
++	k[1] = (uint8_t)(ki >> 8);
++	k[2] = (uint8_t)ki;
++	memcpy(k + 5, wf_hs.replay, 8);
++	if (nonce) {
++		memcpy(k + 13, nonce, 32);
++	}
++	k[93] = (uint8_t)(kdl >> 8);
++	k[94] = (uint8_t)kdl;
++	if (kdl) {
++		memcpy(k + 95, kd, kdl);
++	}
++	wf_hs_mic(x, 4 + bl, k + 77);
++	bool ok = wf_sdpcm_send(2, f, 4 + 14 + 4 + bl);
++	bzero(f, sizeof(f));
++	return ok;
++}
++
++/* key data of message 3 or group 1: unwrapped, the GTK KDE taken */
++static bool
++wf_hs_gtk(const uint8_t *k, uint32_t kdl)
++{
++	static uint8_t p[256];
++
++	if (kdl < 24 || kdl > sizeof(p) + 8 || !wf_unwrap(wf_hs.ptk + 16, k + 95, kdl, p)) {
++		printf("USB> wifi: EAPOL: key data did not unwrap (%u bytes)\n", kdl);
++		return false;
++	}
++	bool got = false;
++	for (uint32_t o = 0; o + 2 <= kdl - 8;) {
++		uint32_t id = p[o], l = p[o + 1];
++		if (id == 0xdd && l == 0) {
++			break;                          /* padding */
++		}
++		if (o + 2 + l > kdl - 8) {
++			break;
++		}
++		if (id == 0xdd && l >= 6 + 16 && p[o + 2] == 0x00 && p[o + 3] == 0x0f && p[o + 4] == 0xac &&
++		    p[o + 5] == 1) {
++			wf_hs.gid = p[o + 6] & 3;
++			wf_hs.gtkl = l - 6 > 32 ? 32 : l - 6;
++			memcpy(wf_hs.gtk, p + o + 8, wf_hs.gtkl);
++			got = true;
++		}
++		o += 2 + l;
++	}
++	bzero(p, sizeof(p));
++	if (!got) {
++		printf("USB> wifi: EAPOL: no GTK in the key data\n");
++	}
++	return got;
++}
++
++/* an EAPOL frame from the AP (ethernet frame, 0x888e) */
++static void
++wf_eapol(const uint8_t *e, uint32_t len)
++{
++	static uint8_t c[4 + 95 + 256];
++
++	if (!wf_hs.on || len < 14 + 4 + 95) {
++		printf("USB> wifi: EAPOL frame (%u bytes) %s\n", len, wf_hs.on ? "too short" : "with no handshake running");
++		return;
++	}
++	const uint8_t *x = e + 14, *k = x + 4;
++	uint32_t bl = wf_be16(x + 2), ki = wf_be16(k + 1), kdl = wf_be16(k + 93);
++	if (x[1] != 3 || k[0] != 2 || bl < 95 || 14 + 4 + bl > len || 95 + kdl > bl || 4 + bl > sizeof(c)) {
++		printf("USB> wifi: EAPOL: not an RSN EAPOL-Key frame (type %u desc %u len %u)\n", x[1], k[0], bl);
++		return;
++	}
++	if ((ki & 7) != KI_VER2) {
++		printf("USB> wifi: EAPOL: key descriptor version %u (only 2, HMAC-SHA1/AES, is done)\n", ki & 7);
++		return;
++	}
++	if ((ki & KI_PAIRWISE) && (ki & KI_ACK) && !(ki & KI_MIC)) {
++		/* message 1: ANonce; the reply waits for the join loop, which knows our RSN IE */
++		memcpy(wf_hs.aa, e + 6, 6);
++		memcpy(wf_hs.anonce, k + 13, 32);
++		memcpy(wf_hs.replay, k + 5, 8);
++		wf_hs.ptk_ok = false;
++		wf_hs.msg1 = true;
++		wf_hs.steps |= 1u << 1;
++		printf("USB> wifi: EAPOL 1/4 from the AP\n");
++		return;
++	}
++	if (!wf_hs.ptk_ok) {
++		printf("USB> wifi: EAPOL: key frame 0x%04x before message 1\n", ki);
++		return;
++	}
++	/* the MIC, over the frame with the MIC field zero */
++	uint8_t mic[16];
++	memcpy(c, x, 4 + bl);
++	bzero(c + 4 + 77, 16);
++	wf_hs_mic(c, 4 + bl, mic);
++	bool micok = !memcmp(mic, k + 77, 16);
++	bzero(c, sizeof(c));
++	if (!micok) {
++		printf("USB> wifi: EAPOL: MIC wrong in key frame 0x%04x (wrong password?)\n", ki);
++		return;
++	}
++	memcpy(wf_hs.replay, k + 5, 8);
++	if ((ki & KI_PAIRWISE) && (ki & KI_INSTALL)) {
++		/* message 3: GTK, then message 4 and the keys */
++		if (!(ki & KI_ENCDATA) || !wf_hs_gtk(k, kdl)) {
++			return;
++		}
++		memcpy(wf_hs.rsc, k + 61, 8);
++		wf_hs.steps |= 1u << 3;
++		printf("USB> wifi: EAPOL 3/4 from the AP: MIC ok, group key id %u (%u bytes)\n", wf_hs.gid, wf_hs.gtkl);
++		bool ok = wf_hs_send(KI_VER2 | KI_PAIRWISE | KI_MIC | KI_SECURE, NULL, NULL, 0);
++		printf("USB> wifi: EAPOL 4/4 %s\n", ok ? "sent" : "send FAILED");
++		if (ok) {
++			wf_hs.steps |= 1u << 4;
++			wf_hs.msg3 = true;              /* the join loop installs the keys */
++		}
++	} else if (!(ki & KI_PAIRWISE) && (ki & KI_ACK)) {
++		/* group key handshake 1/2 */
++		if (!(ki & KI_ENCDATA) || !wf_hs_gtk(k, kdl)) {
++			return;
++		}
++		memcpy(wf_hs.rsc, k + 61, 8);
++		bool ok = wf_hs_send(KI_VER2 | KI_MIC | KI_SECURE, NULL, NULL, 0);
++		printf("USB> wifi: EAPOL group 1/2: key id %u, 2/2 %s\n", wf_hs.gid, ok ? "sent" : "send FAILED");
++		wf_hs.steps |= 1u << 5;
++		wf_hs.grp = true;
++	} else {
++		printf("USB> wifi: EAPOL: key frame 0x%04x not handled\n", ki);
++	}
++}
++
++/* wl_wsec_key (brcmfmac brcmf_wsec_key_le), 164 bytes, by WLC_SET_KEY */
++static int
++wf_set_key(uint32_t index, const uint8_t *key, uint32_t kl, const uint8_t *ea, uint32_t flags, const uint8_t *rsc)
++{
++	uint8_t b[164];
++	uint32_t v;
++
++	bzero(b, sizeof(b));
++	memcpy(b, &index, 4);
++	memcpy(b + 4, &kl, 4);
++	memcpy(b + 8, key, kl);
++	v = 4;                                  /* CRYPTO_ALGO_AES_CCM */
++	memcpy(b + 112, &v, 4);
++	memcpy(b + 116, &flags, 4);
++	if (rsc) {
++		v = 1;                          /* iv_initialized, rxiv from the RSC (little-endian, 48 bits) */
++		memcpy(b + 132, &v, 4);
++		v = (uint32_t)rsc[2] | (uint32_t)rsc[3] << 8 | (uint32_t)rsc[4] << 16 | (uint32_t)rsc[5] << 24;
++		memcpy(b + 140, &v, 4);
++		b[144] = rsc[0];
++		b[145] = rsc[1];
++	}
++	if (ea) {
++		memcpy(b + 156, ea, 6);
++	}
++	int st = wf_dcmd(45, true, b, sizeof(b));       /* WLC_SET_KEY */
++	bzero(b, sizeof(b));
++	return st;
++}
++
++/* from the join loop, after each poll: message 2 sent, keys installed */
++static void
++wf_hs_step(void)
++{
++	if (!wf_hs.on) {
++		return;
++	}
++	if (wf_hs.msg1) {
++		wf_hs.msg1 = false;
++		if (!wf_hs.iel) {
++			/* our RSN IE as the firmware sent it in the association request */
++			int st = wf_iovar_get("assoc_req_ies", 400);
++			for (uint32_t o = 0; st == 0 && o + 2 <= wf_ctl_len;) {
++				uint32_t l = wf_ctl[o + 1];
++				if (o + 2 + l > wf_ctl_len) {
++					break;
++				}
++				if (wf_ctl[o] == 0x30 && l + 2 <= sizeof(wf_hs.ie)) {
++					wf_hs.iel = l + 2;
++					memcpy(wf_hs.ie, wf_ctl + o, wf_hs.iel);
++					break;
++				}
++				o += 2 + l;
++			}
++			if (!wf_hs.iel) {
++				/* RSN, CCMP group and pairwise, PSK, no capabilities */
++				static const uint8_t rsn[] = { 0x30, 0x14, 1, 0, 0, 0x0f, 0xac, 4, 1, 0, 0, 0x0f, 0xac, 4, 1,
++					                       0, 0, 0x0f, 0xac, 2, 0, 0 };
++				memcpy(wf_hs.ie, rsn, sizeof(rsn));
++				wf_hs.iel = sizeof(rsn);
++				printf("USB> wifi: EAPOL: assoc_req_ies status %d (%u bytes), the default RSN IE used\n", st,
++				    wf_ctl_len);
++			} else {
++				printf("USB> wifi: EAPOL: our RSN IE from the association request, %u bytes\n", wf_hs.iel);
++			}
++		}
++		if (!wf_hs.ptk_ok) {
++			read_random(wf_hs.snonce, sizeof(wf_hs.snonce));
++			wf_hs_ptk();
++		}
++		bool ok = wf_hs_send(KI_VER2 | KI_PAIRWISE | KI_MIC, wf_hs.snonce, wf_hs.ie, wf_hs.iel);
++		printf("USB> wifi: EAPOL 2/4 %s\n", ok ? "sent" : "send FAILED");
++		if (ok) {
++			wf_hs.steps |= 1u << 2;
++		}
++	}
++	if (wf_hs.msg3) {
++		wf_hs.msg3 = false;
++		int p = wf_set_key(0, wf_hs.ptk + 32, 16, wf_hs.aa, 0, NULL);
++		int g = wf_set_key(wf_hs.gid, wf_hs.gtk, wf_hs.gtkl, NULL, 2u /* WL_PRIMARY_KEY */, wf_hs.rsc);
++		printf("USB> wifi: keys installed: pairwise status %d, group (id %u) status %d\n", p, wf_hs.gid, g);
++		wf_hs.keys_set = p == 0 && g == 0;
++		bzero(wf_hs.gtk, sizeof(wf_hs.gtk));
++	}
++	if (wf_hs.grp) {
++		wf_hs.grp = false;
++		int g = wf_set_key(wf_hs.gid, wf_hs.gtk, wf_hs.gtkl, NULL, 2u, wf_hs.rsc);
++		printf("USB> wifi: group key (id %u) installed: status %d\n", wf_hs.gid, g);
++		bzero(wf_hs.gtk, sizeof(wf_hs.gtk));
++	}
++}
++
+ /* hex text to bytes, up to a space or the end; -1 if not hex or too long */
+ static int
+ wf_unhex(const char **pp, uint8_t *out, uint32_t max)
+@@ -1958,22 +2618,31 @@
+ 	int auth = wf_ioc_int(22, 0);                   /* WLC_SET_AUTH: open system */
+ 	int wsec = wf_ioc_int(134, pl ? 4u : 0u);       /* WLC_SET_WSEC: AES */
+ 	int wpa = wf_ioc_int(165, pl ? 0x80u : 0u);     /* WLC_SET_WPA_AUTH: WPA2_AUTH_PSK */
+-	int sup = wf_iovar_int("sup_wpa", pl ? 1u : 0u);
+-	int pmk = 0;
++	/* 0174: this firmware has no supplicant (sup_wpa -23, xnu57): the host does the handshake */
++	int sup = wf_iovar_int("sup_wpa", 0);
++	int mac = wf_iovar_get("cur_etheraddr", 8);
++	uint64_t ms = 0;
++	wf_hs_clear();
++	if (mac == 0 && wf_ctl_len >= 6) {
++		memcpy(wf_hs.spa, wf_ctl, 6);
++	} else {
++		mac = mac ? mac : -1;
++	}
+ 	if (pl) {
+-		/* wsec_pmk: key_len, flags WSEC_PASSPHRASE, the passphrase */
+-		uint8_t k[68];
+-		bzero(k, sizeof(k));
+-		k[0] = (uint8_t)pl;
+-		k[2] = 1;
+-		memcpy(k + 4, pw, (size_t)pl);
+-		pmk = wf_dcmd(268, true, k, sizeof(k));     /* WLC_SET_WSEC_PMK */
+-		bzero(k, sizeof(k));
++		uint64_t p0 = mach_absolute_time();
++		wf_pmk(pw, (uint32_t)pl, ssid, (uint32_t)sl, wf_hs.pmk);
++		absolutetime_to_nanoseconds(mach_absolute_time() - p0, &ms);
++		ms /= 1000000;
++		wf_hs.on = mac == 0;
+ 	}
+ 	bzero(pw, sizeof(pw));
+-	printf("USB> wifi: JOIN setup: up %d event_msgs %d infra %d auth %d wsec %d wpa_auth %d sup_wpa %d pmk %d\n", up,
+-	    em, infra, auth, wsec, wpa, sup, pmk);
+-	if (up == -999 || infra == -999 || pmk == -999) {
++	printf("USB> wifi: JOIN setup: up %d event_msgs %d infra %d auth %d wsec %d wpa_auth %d sup_wpa %d mac %d%s\n", up,
++	    em, infra, auth, wsec, wpa, sup, mac, pl ? "; PMK computed" : "");
++	if (pl) {
++		printf("USB> wifi: JOIN: PBKDF2 took %llu ms\n", ms);
++	}
++	if (up == -999 || infra == -999 || (pl && !wf_hs.on)) {
++		wf_hs_clear();
+ 		return;
+ 	}
+ 	uint8_t sj[36];
+@@ -1985,15 +2654,18 @@
+ 	int st = wf_dcmd(26, true, sj, sizeof(sj));     /* WLC_SET_SSID */
+ 	printf("USB> wifi: JOIN: SET_SSID status %d\n", st);
+ 	uint64_t t0 = mach_absolute_time(), ns = 0;
+-	for (int t = 0; st == 0 && t < 10000 && !wf_bad && !wf_j_fail && !(wf_j_link && (wf_j_keyed || !pl)); t++) {
++	for (int t = 0; st == 0 && t < 10000 && !wf_bad && !wf_j_fail && !(wf_j_link && (wf_hs.keys_set || !pl)); t++) {
+ 		wf_poll();
++		wf_hs_step();
+ 		delay(2000);
+ 	}
+ 	wf_joining = false;
+ 	absolutetime_to_nanoseconds(mach_absolute_time() - t0, &ns);
+-	bool ok = wf_j_link && (wf_j_keyed || !pl);
+-	printf("USB> wifi: JOIN %s after %llu ms (link %u keyed %u fail %u set_ssid %u)%s\n", ok ? "DONE: associated" :
+-	    "FAILED", ns / 1000000, wf_j_link, wf_j_keyed, wf_j_fail, wf_j_ssid, wf_bad ? " (a bus access failed)" : "");
++	bool ok = wf_j_link && (wf_hs.keys_set || !pl);
++	printf("USB> wifi: JOIN %s after %llu ms (link %u keys %u EAPOL steps 0x%02x fail %u set_ssid %u)%s\n",
++	    ok ? "DONE: associated" : "FAILED", ns / 1000000, wf_j_link, wf_hs.keys_set, wf_hs.steps, wf_j_fail, wf_j_ssid,
++	    wf_bad ? " (a bus access failed)" : "");
++	wf_hs_clear();
+ 	if (ok) {
+ 		wf_link_cmd();
+ 	}
