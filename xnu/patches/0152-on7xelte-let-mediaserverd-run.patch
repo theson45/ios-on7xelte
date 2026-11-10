@@ -1,0 +1,27 @@
+--- a/bsd/dev/a5xelte_usb.c
++++ b/bsd/dev/a5xelte_usb.c
+@@ -1061,6 +1061,24 @@
+ 		return 0;
+ 	}
+ 	/*
++	 * 0152: SpringBoard's main thread waits in +[AVSystemController
++	 * sharedInstance] (FigSystemControllerRemoteCreate, a synchronous XPC
++	 * message to mediaserverd). Refused, mediaserverd never answers either:
++	 * xnu34/xnu35 sat on the Apple logo for good. Let it run; boot-arg
++	 * on7media=0 refuses it again.
++	 */
++	if (st == 1 && ud_name_in("mediaserverd", name)) {
++		static int media = -1;
++		if (media < 0) {
++			int v = 1;
++			(void)PE_parse_boot_argn("on7media", &v, sizeof(v));
++			media = v;
++		}
++		if (media) {
++			return 0;
++		}
++	}
++	/*
+ 	 * 0143: SpringBoard waits for mediaserverd at boot. Parked, it never
+ 	 * answers and the UI never comes (xnu27: logo for 20 minutes, back the
+ 	 * moment it was continued). Refused, SpringBoard gets an error at once.
