@@ -1,0 +1,165 @@
+--- a/bsd/dev/on7xelte_wifi.c
++++ b/bsd/dev/on7xelte_wifi.c
+@@ -105,6 +105,7 @@
+ static vm_offset_t wf_mmc, wf_pinr, wf_pind;
+ static uint32_t wf_win = 0xffffffffu;   /* the backplane window function 1 is set to (0161) */
+ static uint32_t wf_chipid;              /* chipcommon's ID register, as the probe read it */
++static uint32_t wf_last_e, wf_last_r;   /* 0162: the last CMD52's RINTSTS error bits and R5 */
+ 
+ static inline uint32_t
+ rd32(vm_offset_t b, uint32_t off)
+@@ -264,6 +265,8 @@
+ {
+ 	uint32_t arg = (wr ? (1u << 31) : 0) | ((fn & 7) << 28) | ((addr & 0x1ffff) << 9) | data;
+ 	uint32_t r = 0, e = wf_cmd(52, arg, CMD_RESP | CMD_CRC, &r);
++	wf_last_e = e;
++	wf_last_r = r;
+ 	if (e || (r & 0xcb00u)) {       /* R5: CRC, illegal command, error, function number, out of range */
+ 		return -1;
+ 	}
+@@ -290,6 +293,7 @@
+ 		return;
+ 	}
+ 	wf_regon(false);
++	wf_chipid = 0;
+ 	wr32(wf_mmc, M_CLKENA, 0);
+ 	(void)wf_clk_update();
+ 	wr32(wf_mmc, M_PWREN, 0);
+@@ -582,11 +586,25 @@
+ 	if (w == wf_win) {
+ 		return true;
+ 	}
+-	if (!wf_wr8(1, SB_SBADDRLOW, (w >> 8) & 0x80) || !wf_wr8(1, SB_SBADDRMID, (w >> 16) & 0xff) ||
+-	    !wf_wr8(1, SB_SBADDRHIGH, (w >> 24) & 0xff)) {
+-		wf_win = 0xffffffffu;
+-		wf_bad = true;
+-		return false;
++	static const uint32_t reg[3] = { SB_SBADDRLOW, SB_SBADDRMID, SB_SBADDRHIGH };
++	uint8_t val[3] = { (uint8_t)((w >> 8) & 0x80), (uint8_t)((w >> 16) & 0xff), (uint8_t)((w >> 24) & 0xff) };
++	for (uint32_t i = 0; i < 3; i++) {
++		if (!wf_wr8(1, reg[i], val[i])) {
++			/* 0162: say which byte and why; one retry, as the card may still be busy from a CMD53 */
++			uint32_t e1 = wf_last_e, r1 = wf_last_r;
++			delay(1000);
++			bool again = wf_wr8(1, reg[i], val[i]);
++			if (wf_errs++ < 6) {
++				printf("USB> wifi: window 0x%08x: CMD52 write 0x%05x = 0x%02x failed: err 0x%08x R5 0x%08x "
++				    "STATUS 0x%08x; retry %s (err 0x%08x R5 0x%08x)\n", w, reg[i], val[i], e1, r1,
++				    rd32(wf_mmc, M_STATUS), again ? "ok" : "failed", wf_last_e, wf_last_r);
++			}
++			if (!again) {
++				wf_win = 0xffffffffu;
++				wf_bad = true;
++				return false;
++			}
++		}
+ 	}
+ 	wf_win = w;
+ 	return true;
+@@ -1071,8 +1089,9 @@
+ 	goto out;
+ 
+ off:
+-	printf("USB> wifi: firmware step stopped%s\n", wf_bad ? " (a backplane access failed)" : "");
+-	wf_off();
++	printf("USB> wifi: firmware step stopped%s; left powered for 'wifi rd' ('wifi off' turns it off)\n",
++	    wf_bad ? " (a backplane access failed)" : "");
++	wf_bad = false;
+ out:
+ 	if (vars) {
+ 		kfree_data(vars, vcap);
+@@ -1085,6 +1104,80 @@
+ 	}
+ }
+ 
++/* 0162: a hex number of the command line; *ok false if there was none */
++static uint32_t
++wf_hex(const char **pp, bool *ok)
++{
++	const char *p = *pp;
++	uint32_t v = 0, n = 0;
++
++	while (*p == ' ') {
++		p++;
++	}
++	if (p[0] == '0' && (p[1] == 'x' || p[1] == 'X')) {
++		p += 2;
++	}
++	for (;; p++, n++) {
++		char c = *p;
++		uint32_t d;
++		if (c >= '0' && c <= '9') {
++			d = (uint32_t)(c - '0');
++		} else if (c >= 'a' && c <= 'f') {
++			d = (uint32_t)(c - 'a' + 10);
++		} else if (c >= 'A' && c <= 'F') {
++			d = (uint32_t)(c - 'A' + 10);
++		} else {
++			break;
++		}
++		v = (v << 4) | d;
++	}
++	*ok = n > 0;
++	*pp = p;
++	return v;
++}
++
++/* 0162: 'wifi rd ADDR [N]': N (hex, <= 0x40) words of the backplane; 'wifi cr FN ADDR': one CMD52 read */
++static void
++wf_rd_cmd(const char *a, bool c52)
++{
++	bool ok1, ok2;
++	uint32_t x = wf_hex(&a, &ok1), y = wf_hex(&a, &ok2);
++
++	if (!wf_chipid || !wf_mmc) {
++		printf("USB> wifi: not powered (wifi probe keep, or a stopped wifi fw, first)\n");
++		return;
++	}
++	if (c52) {
++		if (!ok1 || !ok2) {
++			printf("USB> wifi: cr FN ADDR\n");
++			return;
++		}
++		int v = wf_rd8(x & 7, y);
++		printf("USB> wifi: CMD52 fn %u 0x%05x = %d (0x%02x) err 0x%08x R5 0x%08x\n", x & 7, y & 0x1ffff, v,
++		    v & 0xff, wf_last_e, wf_last_r);
++		return;
++	}
++	if (!ok1) {
++		printf("USB> wifi: rd ADDR [N]\n");
++		return;
++	}
++	uint32_t n = ok2 ? y : 1;
++	if (n == 0 || n > 0x40) {
++		n = 1;
++	}
++	x &= ~3u;
++	wf_bad = false;
++	for (uint32_t i = 0; i < n && !wf_bad; i += 4) {
++		uint32_t v[4] = { 0, 0, 0, 0 };
++		for (uint32_t k = 0; k < 4 && i + k < n; k++) {
++			v[k] = wf_rd32(x + 4 * (i + k));
++		}
++		printf("USB> wifi: 0x%08x: %08x %08x %08x %08x%s\n", x + 4 * i, v[0], v[1], v[2], v[3],
++		    wf_bad ? " (a read failed)" : "");
++	}
++	wf_bad = false;
++}
++
+ /* From the dvfs worker (a5xelte_dvfs.c dv_run), which may sleep. */
+ void on7xelte_wifi_cmd(const char *arg);
+ void
+@@ -1100,8 +1193,12 @@
+ 		wf_st();
+ 	} else if (!strcmp(arg, "fw")) {
+ 		wf_fw();
++	} else if (!strncmp(arg, "rd ", 3)) {
++		wf_rd_cmd(arg + 3, false);
++	} else if (!strncmp(arg, "cr ", 3)) {
++		wf_rd_cmd(arg + 3, true);
+ 	} else {
+-		printf("USB> wifi: probe [keep] | off | st | fw\n");
++		printf("USB> wifi: probe [keep] | off | st | fw | rd ADDR [N] | cr FN ADDR\n");
+ 	}
+ }
+ 
