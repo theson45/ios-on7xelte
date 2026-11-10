@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Apply the SWEET bring-up changes to an iOS root made by tools/mkiosroot.sh.
 
-  sudo sweet-root-tweaks.py MOUNTED_ROOT
+  sudo sweet-root-tweaks.py MOUNTED_ROOT [--hal-plugin DIR]
 
 MOUNTED_ROOT is the HFS+ image mounted read-write (Linux: run
 `fsck.hfsplus -fy` on the image, then `mount -t hfsplus -o loop,force`).
@@ -21,7 +21,13 @@ screen (image versions v8-v14 in NOTES.md):
                   (on iOS they live on the data volume)
   migration       LastSystemVersion so DataMigration does not run for an hour
                   on every boot
-  audio           VirtualAudio HAL plug-in disabled (mediaserverd crash)
+  audio           VirtualAudio HAL plug-in disabled (mediaserverd crash);
+                  with --hal-plugin DIR (on7xelte, xnu 0158) instead the
+                  RedwoodAudio plug-in from DIR (RedwoodAudio + RedwoodAudio.plist,
+                  tools/RedwoodAudio) is installed as
+                  /System/Library/Audio/Plug-Ins/HAL/RedwoodAudio.driver and
+                  VirtualAudio stays (or is moved back from HAL.disabled): it
+                  finds the "Speaker" device it wants there
   MediaToolbox    StartRecorderServer=false (camera filter prewarm calls a
                   NULL OpenGL function without a GPU -> mediaserverd crash loop)
   SpringBoard     BKNoWatchdogs (one slow CPU path, no scene-create watchdog
@@ -135,10 +141,33 @@ def activation(root):
     print('data ark', d)
 
 
-def audio(root):
+def hal_plugin(root, plugdir):
+    drv = os.path.join(root, 'System/Library/Audio/Plug-Ins/HAL/RedwoodAudio.driver')
+    os.makedirs(drv, exist_ok=True)
+    os.chown(drv, 0, 0)
+    os.chmod(drv, 0o755)
+    exe = os.path.join(drv, 'RedwoodAudio')
+    shutil.copyfile(os.path.join(plugdir, 'RedwoodAudio'), exe)
+    os.chown(exe, 0, 0)
+    os.chmod(exe, 0o755)
+    info = os.path.join(drv, 'Info.plist')
+    shutil.copyfile(os.path.join(plugdir, 'RedwoodAudio.plist'), info)
+    os.chown(info, 0, 0)
+    os.chmod(info, 0o644)
+    print('RedwoodAudio.driver installed')
+    src = os.path.join(root, 'Library/Audio/Plug-Ins/HAL.disabled/VirtualAudio.plugin')
+    dst = os.path.join(root, 'Library/Audio/Plug-Ins/HAL/VirtualAudio.plugin')
+    if os.path.exists(src) and not os.path.exists(dst):
+        shutil.move(src, dst)
+        print('VirtualAudio.plugin enabled again')
+
+
+def audio(root, plugdir=None):
     src = os.path.join(root, 'Library/Audio/Plug-Ins/HAL/VirtualAudio.plugin')
     dst_dir = os.path.join(root, 'Library/Audio/Plug-Ins/HAL.disabled')
-    if os.path.exists(src):
+    if plugdir:
+        hal_plugin(root, plugdir)
+    elif os.path.exists(src):
         os.makedirs(dst_dir, exist_ok=True)
         shutil.move(src, dst_dir)
         print('VirtualAudio.plugin disabled')
@@ -151,13 +180,18 @@ def audio(root):
 
 
 def main():
-    if len(sys.argv) != 2 or not os.path.isdir(os.path.join(sys.argv[1], 'System/Library/xpc')):
+    args = sys.argv[1:]
+    plugdir = None
+    if len(args) == 3 and args[1] == '--hal-plugin':
+        plugdir = args[2]
+        args = args[:1]
+    if len(args) != 1 or not os.path.isdir(os.path.join(args[0], 'System/Library/xpc')):
         sys.exit(__doc__)
-    root = sys.argv[1]
+    root = args[0]
     launchd(root)
     containers(root)
     activation(root)
-    audio(root)
+    audio(root, plugdir)
     merge_pref(root, 'com.apple.migration', {
         'LastSystemVersion': BUILD,
         'DMUserDataDisposition': {'SyntheticDidUpgrade': False, 'buildVersion': BUILD}})

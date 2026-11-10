@@ -14,6 +14,10 @@ on:
       base_sha256:
         description: "SHA-256 of ios-root.img in that artifact"
         default: "52fec8bc052d5022063e1db7492e3e2210fb3d05e2e2d1fabd57763d98862689"
+      hal_plugin:
+        description: "install the RedwoodAudio HAL plug-in and keep VirtualAudio (xnu 0158)"
+        type: boolean
+        default: true
 
 permissions:
   actions: read
@@ -47,13 +51,40 @@ jobs:
           python3 tools/chunk-sums.py work/ios-root.img > work/base.sums
           df -h /
 
+      - name: Build the RedwoodAudio HAL plug-in
+        if: ${{ inputs.hal_plugin }}
+        run: |
+          set -eux
+          SDK=$(xcrun --sdk iphoneos --show-sdk-path)
+          CC="$(xcrun --sdk iphoneos --find clang) -isysroot $SDK -arch arm64 -miphoneos-version-min=16.0"
+          mkdir -p work/plugin
+          $CC -O2 -Wall -bundle -framework CoreFoundation -o work/plugin/RedwoodAudio tools/RedwoodAudio/audio_plugin.c
+          codesign -f -s - work/plugin/RedwoodAudio
+          cp tools/RedwoodAudio/audio_plugin.plist work/plugin/RedwoodAudio.plist
+          file work/plugin/RedwoodAudio
+          plutil -lint work/plugin/RedwoodAudio.plist
+
+      - uses: actions/upload-artifact@v4
+        if: ${{ inputs.hal_plugin }}
+        with:
+          name: RedwoodAudio
+          path: work/plugin
+          retention-days: 14
+
       - name: Apply the tweaks
         run: |
           set -eux
           mkdir -p work/root
+          plug=""
+          if [ "${{ inputs.hal_plugin }}" = "true" ]; then plug="--hal-plugin work/plugin"; fi
           hdiutil attach -owners on -imagekey diskimage-class=CRawDiskImage \
             -mountpoint work/root work/ios-root.img
-          sudo python3 tools/sweet-root-tweaks.py work/root | tee work/tweak.log
+          sudo python3 tools/sweet-root-tweaks.py work/root $plug | tee work/tweak.log
+          if [ -n "$plug" ]; then
+            grep -q 'RedwoodAudio.driver installed' work/tweak.log
+            sudo ls -lnR work/root/System/Library/Audio/Plug-Ins/HAL/RedwoodAudio.driver
+            sudo ls -ln work/root/Library/Audio/Plug-Ins/HAL
+          fi
           grep -q 'disabled job .* fairplayd.H2$' work/tweak.log
           grep -q 'disabled job .* bluetoothd$' work/tweak.log
           sudo ls -ln work/root/System/Library/xpc
