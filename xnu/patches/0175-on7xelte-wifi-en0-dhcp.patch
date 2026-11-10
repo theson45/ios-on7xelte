@@ -1,0 +1,878 @@
+--- a/bsd/dev/on7xelte_wifi.c
++++ b/bsd/dev/on7xelte_wifi.c
+@@ -33,6 +33,26 @@
+ #include <sys/random.h>
+ #include <sys/vnode.h>
+ #include <sys/vnode_internal.h>
++#include <kern/locks.h>
++#include <kern/thread.h>
++#include <kern/sched_prim.h>
++#include <sys/proc.h>
++#include <sys/socket.h>
++#include <sys/kpi_mbuf.h>
++#include <sys/kpi_socket.h>
++#include <sys/sockio.h>
++#include <net/if.h>
++#include <net/if_types.h>
++#include <net/ethernet.h>
++#include <net/if_ether.h>
++#include <net/ether_if_module.h>
++#include <net/kpi_interface.h>
++#include <net/kpi_protocol.h>
++#include <net/route.h>
++#include <netinet/in.h>
++#include <net/if_media.h>
++#include <net/dlil.h>
++#include <sys/kern_event.h>
+ 
+ #if defined(ARM64_BOARD_CONFIG_A5XELTE)
+ 
+@@ -1440,7 +1460,7 @@
+ static bool
+ wf_sdpcm_send(uint32_t chan, const uint8_t *pl, uint32_t len)
+ {
+-	static uint32_t tx[128];
++	static uint32_t tx[(12 + 4 + 1518 + 3) / 4 + 1];        /* 0175: a whole ethernet frame */
+ 	uint32_t total = 12 + len, n = (total + 3) & ~3u;
+ 
+ 	if (n > sizeof(tx)) {
+@@ -1454,8 +1474,12 @@
+ 	if (!wf_setwin(0x18000000u)) {
+ 		return false;
+ 	}
+-	if (!wf_cmd53_once(2, WF_F2ADDR, true, tx, n, false)) {
+-		return false;
++	for (uint32_t o = 0; o < n; o += 512) {
++		/* 0175: byte mode carries at most 512 bytes; F2 takes a frame over several CMD53s (Linux
++		 * sdio_io_rw_ext_helper splits the same way) */
++		if (!wf_cmd53_once(2, WF_F2ADDR, true, tx + o / 4, n - o < 512 ? n - o : 512, false)) {
++			return false;
++		}
+ 	}
+ 	wf_txseq++;
+ 	return true;
+@@ -1504,6 +1528,9 @@
+ 
+ static void wf_event(const uint8_t *eth, uint32_t len);
+ static void wf_eapol(const uint8_t *e, uint32_t len);
++static void wf_net_rx(const uint8_t *e, uint32_t len);
++static bool wf_net_event(uint32_t type, uint32_t status, uint32_t reason, uint32_t flags);
++static uint64_t wf_rxn;
+ 
+ /* the frame in wf_rxbuf: a control response is kept, events are handed on, data is dropped */
+ static void
+@@ -1512,6 +1539,8 @@
+ 	uint8_t *f = (uint8_t *)wf_rxbuf;
+ 	uint32_t chan = (wf_rxbuf[1] >> 8) & 0xf, doff = wf_rxbuf[1] >> 24;
+ 
++	wf_rxn++;
++
+ 	if (doff < 12 || doff > wf_rxlen) {
+ 		printf("USB> wifi: rx: chan %u doffset %u of %u?\n", chan, doff, wf_rxlen);
+ 		return;
+@@ -1539,6 +1568,8 @@
+ 			wf_event(pl + o, plen - o);
+ 		} else if (plen - o >= 14 && pl[o + 12] == 0x88 && pl[o + 13] == 0x8e) {
+ 			wf_eapol(pl + o, plen - o);     /* 0174: EAPOL, for the host's handshake */
++		} else {
++			wf_net_rx(pl + o, plen - o);    /* 0175: data, to en0 */
+ 		}
+ 	} else {
+ 		printf("USB> wifi: rx: frame on channel %u (%u bytes)\n", chan, wf_rxlen);
+@@ -1744,6 +1775,9 @@
+ 		wf_join_event(type, status, wf_be32(m + 12), (uint32_t)m[2] << 8 | m[3]);
+ 		return;
+ 	}
++	if (type != 69 && wf_net_event(type, status, wf_be32(m + 12), (uint32_t)m[2] << 8 | m[3])) {
++		return;                         /* 0175: link changes after the join */
++	}
+ 	if (type != 69) {                       /* WLC_E_ESCAN_RESULT */
+ 		if (wf_events < 20) {
+ 			printf("USB> wifi: event %u status %u (%u bytes)\n", type, status, dlen);
+@@ -2567,6 +2601,706 @@
+ }
+ 
+ /*
++ * 0175, W5b: the data path. After a join the interface en0 carries IPv4 over the chip's SDPCM channel 2
++ * (BDC header 0x20, then the ethernet frame). A kernel thread owns the bus between commands: it polls the
++ * chip (frames in, events, EAPOL rekeys), sends what the stack queued (within the firmware's credit
++ * window) and runs the DHCP client. Commands from the dvfs worker take the same lock (wf_bus), so the
++ * SDIO bus is only ever driven by one thread. The ifnet follows bsd/dev/sweet_usb.c (ue0).
++ */
++static LCK_GRP_DECLARE(wf_lck_grp, "on7xelte_wifi");
++static LCK_MTX_DECLARE(wf_bus, &wf_lck_grp);           /* the SDIO bus and all W4 state */
++static LCK_MTX_DECLARE(wf_qlock, &wf_lck_grp);         /* the tx queue */
++
++#define WF_TXQ          64u
++static mbuf_t wf_txq[WF_TXQ];
++static uint32_t wf_txq_head, wf_txq_n;
++static ifnet_t wf_ifp;
++static bool wf_net_link;                /* associated, keys in: frames may go */
++static bool wf_thread_on;
++static uint8_t wf_mac[6];
++static uint64_t wf_rx_frames, wf_tx_frames, wf_rx_drop, wf_tx_drop;
++static uint32_t wf_bad_runs;
++
++static bool
++wf_txok(void)
++{
++	uint8_t d = (uint8_t)(wf_txmax - wf_txseq);
++	return d != 0 && !(d & 0x80);
++}
++
++/* a frame from channel 2 that is not EAPOL: DHCP for us, the rest to the stack */
++static bool wf_dhcp_rx(const uint8_t *e, uint32_t len);
++
++static void
++wf_net_rx(const uint8_t *e, uint32_t len)
++{
++	if (len < ETHER_HDR_LEN || len > ETHER_MAX_LEN) {
++		wf_rx_drop++;
++		return;
++	}
++	if (wf_dhcp_rx(e, len)) {
++		return;
++	}
++	if (wf_ifp == NULL || !wf_net_link) {
++		wf_rx_drop++;
++		return;
++	}
++	mbuf_t m = NULL;
++	if (mbuf_gethdr(MBUF_DONTWAIT, MBUF_TYPE_DATA, &m) == 0 && mbuf_mclget(MBUF_DONTWAIT, MBUF_TYPE_DATA, &m) == 0 &&
++	    (mbuf_flags(m) & MBUF_EXT) && mbuf_maxlen(m) >= len) {
++		struct ifnet_stat_increment_param stats = {};
++		memcpy(mbuf_data(m), e, len);
++		mbuf_setlen(m, len);
++		mbuf_pkthdr_setlen(m, len);
++		void *fh = mbuf_data(m);
++		mbuf_pkthdr_setrcvif(m, wf_ifp);
++		mbuf_pkthdr_setheader(m, fh);
++		mbuf_pkthdr_adjustlen(m, -ETHER_HDR_LEN);
++		(void)mbuf_setdata(m, (char *)mbuf_data(m) + ETHER_HDR_LEN, mbuf_len(m) - ETHER_HDR_LEN);
++		stats.packets_in = 1;
++		stats.bytes_in = len;
++		wf_rx_frames++;
++		ifnet_input(wf_ifp, m, &stats);
++	} else {
++		if (m != NULL) {
++			mbuf_freem(m);
++		}
++		wf_rx_drop++;
++	}
++}
++
++/* one ethernet frame to the chip; the bus lock held */
++static bool
++wf_net_send(const uint8_t *frame, uint32_t len)
++{
++	static uint8_t f[4 + ETHER_MAX_LEN];
++
++	if (len > ETHER_MAX_LEN - ETHER_CRC_LEN) {
++		return false;
++	}
++	f[0] = 0x20;                    /* BDC: protocol version 2 */
++	f[1] = 0;                       /* priority (best effort) */
++	f[2] = 0;                       /* interface 0 */
++	f[3] = 0;                       /* no data offset */
++	memcpy(f + 4, frame, len);
++	return wf_sdpcm_send(2, f, 4 + len);
++}
++
++/* what the stack queued, while the firmware gives credit; the bus lock held. Returns frames sent */
++static uint32_t
++wf_net_tx(void)
++{
++	static uint8_t fr[ETHER_MAX_LEN];
++	uint32_t sent = 0;
++
++	while (wf_txok() && !wf_bad) {
++		lck_mtx_lock(&wf_qlock);
++		if (!wf_txq_n) {
++			lck_mtx_unlock(&wf_qlock);
++			break;
++		}
++		mbuf_t m = wf_txq[wf_txq_head];
++		wf_txq_head = (wf_txq_head + 1) % WF_TXQ;
++		wf_txq_n--;
++		lck_mtx_unlock(&wf_qlock);
++		size_t len = mbuf_pkthdr_len(m);
++		bool ok = len >= ETHER_HDR_LEN && len <= ETHER_MAX_LEN - ETHER_CRC_LEN &&
++		    mbuf_copydata(m, 0, len, fr) == 0;
++		mbuf_freem(m);
++		if (ok && wf_net_link && wf_net_send(fr, (uint32_t)len)) {
++			wf_tx_frames++;
++			sent++;
++		} else {
++			wf_tx_drop++;
++		}
++	}
++	return sent;
++}
++
++static void
++wf_txq_flush(void)
++{
++	lck_mtx_lock(&wf_qlock);
++	while (wf_txq_n) {
++		mbuf_freem(wf_txq[wf_txq_head]);
++		wf_txq_head = (wf_txq_head + 1) % WF_TXQ;
++		wf_txq_n--;
++		wf_tx_drop++;
++	}
++	lck_mtx_unlock(&wf_qlock);
++}
++
++static errno_t
++wf_if_output(ifnet_t ifp, mbuf_t m)
++{
++	lck_mtx_lock(&wf_qlock);
++	if (wf_txq_n == WF_TXQ || !wf_net_link) {
++		wf_tx_drop++;
++		lck_mtx_unlock(&wf_qlock);
++		mbuf_freem(m);
++		ifnet_stat_increment_out(ifp, 0, 0, 1);
++		return 0;
++	}
++	ifnet_stat_increment_out(ifp, 1, (uint32_t)mbuf_pkthdr_len(m), 0);
++	wf_txq[(wf_txq_head + wf_txq_n) % WF_TXQ] = m;
++	wf_txq_n++;
++	wakeup(&wf_txq_n);
++	lck_mtx_unlock(&wf_qlock);
++	return 0;
++}
++
++static errno_t
++wf_if_ioctl(ifnet_t ifp, unsigned long cmd, void *data)
++{
++	switch (cmd) {
++	case SIOCGIFMEDIA32:
++	case SIOCGIFMEDIA64: {
++		struct ifmediareq *ifmr = (struct ifmediareq *)data;
++		user_addr_t list = (cmd == SIOCGIFMEDIA64) ? ((struct ifmediareq64 *)ifmr)->ifmu_ulist :
++		    CAST_USER_ADDR_T(((struct ifmediareq32 *)ifmr)->ifmu_ulist);
++		int media = IFM_ETHER | IFM_AUTO;
++		ifmr->ifm_current = media;
++		ifmr->ifm_active = media;
++		ifmr->ifm_mask = 0;
++		ifmr->ifm_status = IFM_AVALID | (wf_net_link ? IFM_ACTIVE : 0);
++		ifmr->ifm_count = 1;
++		if (list != USER_ADDR_NULL && ifmr->ifm_count > 0) {
++			return copyout(&media, list, sizeof(media));
++		}
++		return 0;
++	}
++	case SIOCSIFADDR:
++	case SIOCAIFADDR:
++		ifnet_set_flags(ifp, IFF_UP, IFF_UP);
++		return 0;
++	case SIOCSIFFLAGS:
++	case SIOCADDMULTI:
++	case SIOCDELMULTI:
++		return 0;
++	default:
++		return EOPNOTSUPP;
++	}
++}
++
++static void
++wf_if_detach(ifnet_t ifp __unused)
++{
++}
++
++/* en0 (or the first free enN), the chip's MAC; IPv4 plumbed, no address until DHCP */
++static void
++wf_net_attach(void)
++{
++	struct ifnet_init_eparams init;
++	errno_t err = 0;
++	uint32_t unit;
++
++	if (wf_ifp != NULL) {
++		return;
++	}
++	for (unit = 0; unit < 4; unit++) {
++		bzero(&init, sizeof(init));
++		init.ver = IFNET_INIT_CURRENT_VERSION;
++		init.len = sizeof(init);
++		init.flags = IFNET_INIT_LEGACY;
++		init.uniqueid = "on7xelte-wifi";
++		init.uniqueid_len = sizeof("on7xelte-wifi") - 1;
++		init.name = "en";
++		init.unit = unit;
++		init.family = IFNET_FAMILY_ETHERNET;
++		init.type = IFT_ETHER;
++		init.output = wf_if_output;
++		init.demux = ether_demux;
++		init.add_proto = ether_add_proto;
++		init.del_proto = ether_del_proto;
++		init.check_multi = ether_check_multi;
++		init.framer_extended = ether_frameout_extended;
++		init.ioctl = wf_if_ioctl;
++		init.detach = wf_if_detach;
++		init.broadcast_addr = etherbroadcastaddr;
++		init.broadcast_len = ETHER_ADDR_LEN;
++		ifnet_t ifp = NULL;
++		err = ifnet_allocate_extended(&init, &ifp);
++		if (err) {
++			continue;
++		}
++		ifnet_set_addrlen(ifp, ETHER_ADDR_LEN);
++		ifnet_set_hdrlen(ifp, sizeof(struct ether_header));
++		ifnet_set_mtu(ifp, ETHERMTU);
++		ifnet_set_baudrate(ifp, 72200000);
++		ifnet_set_flags(ifp, IFF_BROADCAST | IFF_SIMPLEX | IFF_MULTICAST, 0xffff);
++		err = ifnet_attach(ifp, NULL);
++		if (err) {
++			ifnet_release(ifp);
++			continue;
++		}
++		ifnet_set_lladdr(ifp, wf_mac, ETHER_ADDR_LEN);
++		wf_ifp = ifp;
++		break;
++	}
++	if (wf_ifp == NULL) {
++		printf("USB> wifi: NET: no interface (ifnet error %d)\n", err);
++		return;
++	}
++	err = proto_plumb(PF_INET, wf_ifp);
++	ifnet_set_flags(wf_ifp, IFF_UP | IFF_RUNNING, IFF_UP | IFF_RUNNING);
++	printf("USB> wifi: NET: %s%u attached, MAC %02x:%02x:%02x:%02x:%02x:%02x, IPv4 plumbed (%d)\n", ifnet_name(wf_ifp),
++	    ifnet_unit(wf_ifp), wf_mac[0], wf_mac[1], wf_mac[2], wf_mac[3], wf_mac[4], wf_mac[5], err);
++}
++
++static void
++wf_net_link_set(bool up)
++{
++	if (wf_net_link == up) {
++		return;
++	}
++	wf_net_link = up;
++	if (!up) {
++		wf_txq_flush();
++	}
++	if (wf_ifp != NULL) {
++		dlil_post_msg(wf_ifp, KEV_DL_SUBCLASS, up ? KEV_DL_LINK_ON : KEV_DL_LINK_OFF, NULL, 0, FALSE);
++	}
++	printf("USB> wifi: NET: link %s\n", up ? "up" : "down");
++}
++
++/* ---- DHCP (RFC 2131), on raw frames: the interface has no address before it ---- */
++static struct {
++	uint32_t state;                 /* 0 idle, 1 DISCOVER sent, 2 REQUEST sent, 3 bound */
++	uint32_t xid, tries;
++	uint32_t offer, srv, ip, mask, gw, dns, lease;
++	uint32_t set_ip;                /* the address the interface has (host order), 0 none */
++	bool apply;                     /* the thread puts the lease on en0 (outside the bus lock) */
++	uint64_t next, renew;           /* mach_absolute_time */
++} wf_dh;
++
++static uint64_t
++wf_ms_abs(uint32_t ms)
++{
++	uint64_t a;
++	nanoseconds_to_absolutetime((uint64_t)ms * 1000000ull, &a);
++	return a;
++}
++
++static uint16_t
++wf_ipsum(const uint8_t *p, uint32_t n)
++{
++	uint32_t s = 0;
++	for (uint32_t i = 0; i + 1 < n; i += 2) {
++		s += (uint32_t)p[i] << 8 | p[i + 1];
++	}
++	if (n & 1) {
++		s += (uint32_t)p[n - 1] << 8;
++	}
++	while (s >> 16) {
++		s = (s & 0xffff) + (s >> 16);
++	}
++	return (uint16_t)~s;
++}
++
++static void
++wf_put32(uint8_t *p, uint32_t v)
++{
++	p[0] = (uint8_t)(v >> 24);
++	p[1] = (uint8_t)(v >> 16);
++	p[2] = (uint8_t)(v >> 8);
++	p[3] = (uint8_t)v;
++}
++
++static void
++wf_ipstr(uint32_t a, char *s, size_t n)
++{
++	snprintf(s, n, "%u.%u.%u.%u", a >> 24, (a >> 16) & 0xff, (a >> 8) & 0xff, a & 0xff);
++}
++
++/* DISCOVER (type 1) or REQUEST (type 3), broadcast; the bus lock held */
++static bool
++wf_dhcp_send(uint32_t type)
++{
++	static uint8_t f[14 + 20 + 8 + 300];
++	uint8_t *ip = f + 14, *udp = ip + 20, *b = udp + 8;
++
++	bzero(f, sizeof(f));
++	memset(f, 0xff, 6);
++	memcpy(f + 6, wf_mac, 6);
++	f[12] = 0x08;
++	f[13] = 0x00;
++	b[0] = 1;                       /* BOOTREQUEST */
++	b[1] = 1;                       /* ethernet */
++	b[2] = 6;
++	wf_put32(b + 4, wf_dh.xid);
++	b[10] = 0x80;                   /* the broadcast flag: we cannot take unicast before we have the address */
++	memcpy(b + 28, wf_mac, 6);
++	wf_put32(b + 236, 0x63825363);  /* magic cookie */
++	uint8_t *o = b + 240;
++	*o++ = 53;
++	*o++ = 1;
++	*o++ = (uint8_t)type;
++	*o++ = 61;                      /* client identifier: type 1, the MAC */
++	*o++ = 7;
++	*o++ = 1;
++	memcpy(o, wf_mac, 6);
++	o += 6;
++	if (type == 3) {
++		*o++ = 50;              /* requested address */
++		*o++ = 4;
++		wf_put32(o, wf_dh.offer);
++		o += 4;
++		*o++ = 54;              /* server identifier */
++		*o++ = 4;
++		wf_put32(o, wf_dh.srv);
++		o += 4;
++	}
++	*o++ = 12;                      /* host name */
++	*o++ = 6;
++	memcpy(o, "iPhone", 6);
++	o += 6;
++	*o++ = 55;                      /* parameters: mask, router, DNS, domain, lease, server */
++	*o++ = 6;
++	*o++ = 1;
++	*o++ = 3;
++	*o++ = 6;
++	*o++ = 15;
++	*o++ = 51;
++	*o++ = 54;
++	*o++ = 255;
++	uint32_t blen = 300, ulen = 8 + blen, ilen = 20 + ulen;
++	ip[0] = 0x45;
++	ip[2] = (uint8_t)(ilen >> 8);
++	ip[3] = (uint8_t)ilen;
++	ip[8] = 64;
++	ip[9] = 17;                     /* UDP */
++	memset(ip + 16, 0xff, 4);       /* from 0.0.0.0 to 255.255.255.255 */
++	uint16_t cs = wf_ipsum(ip, 20);
++	ip[10] = (uint8_t)(cs >> 8);
++	ip[11] = (uint8_t)cs;
++	udp[1] = 68;
++	udp[3] = 67;
++	udp[4] = (uint8_t)(ulen >> 8);
++	udp[5] = (uint8_t)ulen;         /* UDP checksum 0: none */
++	return wf_net_send(f, 14 + ilen);
++}
++
++static void
++wf_dhcp_start(void)
++{
++	uint32_t x;
++	read_random(&x, sizeof(x));
++	wf_dh.xid = x;
++	wf_dh.state = 1;
++	wf_dh.tries = 0;
++	wf_dh.next = mach_absolute_time();
++	printf("USB> wifi: DHCP: started\n");
++}
++
++/* the thread's timer: (re)sends, gives up, renews; the bus lock held */
++static void
++wf_dhcp_tick(void)
++{
++	uint64_t now = mach_absolute_time();
++
++	if (!wf_net_link) {
++		return;
++	}
++	if (wf_dh.state == 3 && wf_dh.renew && now >= wf_dh.renew) {
++		wf_dh.offer = wf_dh.ip;         /* renewal: the same address asked for again */
++		wf_dh.state = 2;
++		wf_dh.tries = 0;
++		wf_dh.next = now;
++		printf("USB> wifi: DHCP: renewing\n");
++	}
++	if ((wf_dh.state != 1 && wf_dh.state != 2) || now < wf_dh.next) {
++		return;
++	}
++	if (wf_dh.tries >= 8) {
++		if (wf_dh.state == 2 && wf_dh.set_ip) {
++			wf_dh.state = 3;        /* a renewal that got no answer: keep the lease, ask again later */
++			wf_dh.renew = now + wf_ms_abs(60000);
++			return;
++		}
++		printf("USB> wifi: DHCP: no answer after %u tries ('wifi dhcp' to try again)\n", wf_dh.tries);
++		wf_dh.state = 0;
++		return;
++	}
++	if (wf_dh.state == 2 && wf_dh.tries == 5 && !wf_dh.set_ip) {
++		wf_dh.state = 1;                /* no ACK: start over */
++		wf_dh.tries = 0;
++	}
++	bool ok = wf_dhcp_send(wf_dh.state == 1 ? 1 : 3);
++	printf("USB> wifi: DHCP: %s %s (try %u)\n", wf_dh.state == 1 ? "DISCOVER" : "REQUEST", ok ? "sent" : "send FAILED",
++	    wf_dh.tries + 1);
++	wf_dh.tries++;
++	wf_dh.next = now + wf_ms_abs(wf_dh.tries < 3 ? 2000 : 4000);
++}
++
++/* a DHCP reply to us: true when the frame was one (it is not given to the stack) */
++static bool
++wf_dhcp_rx(const uint8_t *e, uint32_t len)
++{
++	if (len < 14 + 20 + 8 + 240 || e[12] != 0x08 || e[13] != 0x00) {
++		return false;
++	}
++	const uint8_t *ip = e + 14;
++	uint32_t ihl = (ip[0] & 15u) * 4u;
++	if ((ip[0] >> 4) != 4 || ip[9] != 17 || ihl < 20 || 14 + ihl + 8 + 240 > len) {
++		return false;
++	}
++	const uint8_t *udp = ip + ihl, *b = udp + 8;
++	if (wf_be16(udp) != 67 || wf_be16(udp + 2) != 68) {
++		return false;
++	}
++	if (b[0] != 2 || wf_be32(b + 4) != wf_dh.xid || memcmp(b + 28, wf_mac, 6) || wf_be32(b + 236) != 0x63825363) {
++		return true;
++	}
++	uint32_t type = 0, mask = 0, gw = 0, dns = 0, lease = 0, srv = 0, yi = wf_be32(b + 16);
++	const uint8_t *o = b + 240, *end = e + len;
++	while (o < end && *o != 255) {
++		if (*o == 0) {
++			o++;
++			continue;
++		}
++		if (o + 2 > end || o + 2 + o[1] > end) {
++			break;
++		}
++		uint32_t c = o[0], l = o[1];
++		const uint8_t *v = o + 2;
++		if (c == 53 && l >= 1) {
++			type = v[0];
++		} else if (c == 1 && l >= 4) {
++			mask = wf_be32(v);
++		} else if (c == 3 && l >= 4) {
++			gw = wf_be32(v);
++		} else if (c == 6 && l >= 4) {
++			dns = wf_be32(v);
++		} else if (c == 51 && l >= 4) {
++			lease = wf_be32(v);
++		} else if (c == 54 && l >= 4) {
++			srv = wf_be32(v);
++		}
++		o += 2 + l;
++	}
++	char a[16], s[16];
++	wf_ipstr(yi, a, sizeof(a));
++	wf_ipstr(srv, s, sizeof(s));
++	if (type == 2 && wf_dh.state == 1) {
++		wf_dh.offer = yi;
++		wf_dh.srv = srv;
++		wf_dh.state = 2;
++		wf_dh.tries = 0;
++		wf_dh.next = mach_absolute_time();
++		printf("USB> wifi: DHCP: OFFER %s from %s\n", a, s);
++	} else if (type == 5 && wf_dh.state == 2) {
++		wf_dh.ip = yi;
++		wf_dh.mask = mask ? mask : 0xffffff00u;
++		wf_dh.gw = gw;
++		wf_dh.dns = dns;
++		wf_dh.lease = lease;
++		if (srv) {
++			wf_dh.srv = srv;
++		}
++		wf_dh.state = 3;
++		uint32_t half = lease == 0xffffffffu ? 0 : lease / 2;
++		wf_dh.renew = half ? mach_absolute_time() + wf_ms_abs((half < 60 ? 60 : (half > 86400 ? 86400 : half)) * 1000)
++		    : 0;
++		wf_dh.apply = true;
++		char m[16], g[16], d[16];
++		wf_ipstr(wf_dh.mask, m, sizeof(m));
++		wf_ipstr(gw, g, sizeof(g));
++		wf_ipstr(dns, d, sizeof(d));
++		printf("USB> wifi: DHCP: ACK %s mask %s router %s DNS %s lease %u s (server %s)\n", a, m, g, d, lease, s);
++	} else if (type == 6) {
++		printf("USB> wifi: DHCP: NAK from %s, starting over\n", s);
++		wf_dh.state = 1;
++		wf_dh.tries = 0;
++		wf_dh.next = mach_absolute_time() + wf_ms_abs(1000);
++	}
++	return true;
++}
++
++static void
++wf_sin(struct sockaddr_in *a, uint32_t v)
++{
++	bzero(a, sizeof(*a));
++	a->sin_len = sizeof(*a);
++	a->sin_family = AF_INET;
++	a->sin_addr.s_addr = htonl(v);
++}
++
++/* the default route through the router (a PF_ROUTE message, as route(8) sends it) */
++static int
++wf_route(uint32_t gw)
++{
++	struct {
++		struct rt_msghdr h;
++		struct sockaddr_in dst, gw, mask;
++	} m;
++	socket_t so = NULL;
++	int err = sock_socket(PF_ROUTE, SOCK_RAW, 0, NULL, NULL, &so);
++
++	if (err) {
++		return err;
++	}
++	for (int pass = 0; pass < 2; pass++) {
++		bzero(&m, sizeof(m));
++		m.h.rtm_msglen = sizeof(m);
++		m.h.rtm_version = RTM_VERSION;
++		m.h.rtm_type = pass ? RTM_CHANGE : RTM_ADD;
++		m.h.rtm_flags = RTF_UP | RTF_GATEWAY | RTF_STATIC;
++		m.h.rtm_addrs = RTA_DST | RTA_GATEWAY | RTA_NETMASK;
++		m.h.rtm_seq = pass + 1;
++		wf_sin(&m.dst, 0);
++		wf_sin(&m.gw, gw);
++		wf_sin(&m.mask, 0);
++		struct iovec iov = { .iov_base = &m, .iov_len = sizeof(m) };
++		struct msghdr msg = { .msg_iov = &iov, .msg_iovlen = 1 };
++		size_t sent = 0;
++		err = sock_send(so, &msg, 0, &sent);
++		if (err != EEXIST) {
++			break;
++		}
++	}
++	sock_close(so);
++	return err;
++}
++
++/* the lease on the interface; the thread, without the bus lock */
++static void
++wf_dhcp_apply(void)
++{
++	socket_t so = NULL;
++	int e1 = -1, e2 = -1, e0 = 0;
++	uint32_t ip = wf_dh.ip, mask = wf_dh.mask, gw = wf_dh.gw;
++
++	if (wf_ifp == NULL) {
++		return;
++	}
++	int err = sock_socket(PF_INET, SOCK_DGRAM, 0, NULL, NULL, &so);
++	if (err == 0) {
++		if (wf_dh.set_ip && wf_dh.set_ip != ip) {
++			struct ifreq ifr;
++			bzero(&ifr, sizeof(ifr));
++			snprintf(ifr.ifr_name, sizeof(ifr.ifr_name), "%s%u", ifnet_name(wf_ifp), ifnet_unit(wf_ifp));
++			wf_sin((struct sockaddr_in *)&ifr.ifr_addr, wf_dh.set_ip);
++			e0 = sock_ioctl(so, SIOCDIFADDR, &ifr);
++			wf_dh.set_ip = 0;
++		}
++		struct ifaliasreq ifra;
++		bzero(&ifra, sizeof(ifra));
++		snprintf(ifra.ifra_name, sizeof(ifra.ifra_name), "%s%u", ifnet_name(wf_ifp), ifnet_unit(wf_ifp));
++		wf_sin((struct sockaddr_in *)&ifra.ifra_addr, ip);
++		wf_sin((struct sockaddr_in *)&ifra.ifra_mask, mask);
++		wf_sin((struct sockaddr_in *)&ifra.ifra_broadaddr, (ip & mask) | ~mask);
++		e1 = sock_ioctl(so, SIOCAIFADDR, &ifra);
++		sock_close(so);
++		if (e1 == 0) {
++			wf_dh.set_ip = ip;
++		}
++	}
++	if (e1 == 0 && gw) {
++		e2 = wf_route(gw);
++	}
++	char a[16], g[16];
++	wf_ipstr(ip, a, sizeof(a));
++	wf_ipstr(gw, g, sizeof(g));
++	printf("USB> wifi: NET: %s%u address %s (%d%s), default route via %s (%d)\n", ifnet_name(wf_ifp), ifnet_unit(wf_ifp),
++	    a, err ? err : e1, e0 ? ", old address delete failed" : "", g, e2);
++}
++
++/* the bus between commands: polled every few ms, at once while there is traffic */
++static void
++wf_net_thread(void *a __unused, wait_result_t w __unused)
++{
++	struct timespec ts = { 0, 4 * 1000 * 1000 };
++
++	for (;;) {
++		bool busy = false, apply = false;
++		lck_mtx_lock(&wf_bus);
++		if (wf_fwup && wf_w4init && wf_mmc && wf_sd()) {
++			bool was = wf_bad;
++			wf_bad = false;
++			uint64_t n0 = wf_rxn;
++			wf_poll();
++			wf_hs_step();
++			uint32_t sent = wf_net_tx();
++			wf_dhcp_tick();
++			busy = wf_rxn != n0 || sent;
++			if (wf_bad) {
++				if (!was && wf_bad_runs < 10) {
++					printf("USB> wifi: NET: a bus access failed in the poll thread\n");
++				}
++				wf_bad_runs++;
++				busy = false;
++			}
++			apply = wf_dh.apply;
++			wf_dh.apply = false;
++		}
++		lck_mtx_unlock(&wf_bus);
++		if (apply) {
++			wf_dhcp_apply();
++		}
++		if (!busy) {
++			lck_mtx_lock(&wf_qlock);
++			if (!wf_txq_n || !wf_txok()) {
++				(void)msleep(&wf_txq_n, &wf_qlock, PZERO, "wifinet", &ts);
++			}
++			lck_mtx_unlock(&wf_qlock);
++		}
++	}
++}
++
++/* after a join: en0, the link up, the poll thread, DHCP. The bus lock held */
++static void
++wf_net_up(void)
++{
++	wf_net_attach();
++	wf_net_link_set(true);
++	if (!wf_thread_on) {
++		thread_t t;
++		if (kernel_thread_start(wf_net_thread, NULL, &t) == KERN_SUCCESS) {
++			thread_deallocate(t);
++			wf_thread_on = true;
++		} else {
++			printf("USB> wifi: NET: the poll thread did not start\n");
++		}
++	}
++	wf_dhcp_start();
++}
++
++/* a link event after the join (the join loop takes them itself); false before en0 exists */
++static bool
++wf_net_event(uint32_t type, uint32_t status, uint32_t reason, uint32_t flags)
++{
++	if (wf_ifp == NULL) {
++		return false;
++	}
++	if (type == 16) {                       /* WLC_E_LINK */
++		printf("USB> wifi: NET: LINK event, %s (reason %u)\n", (flags & 1) ? "up" : "down", reason);
++		if (!(flags & 1) || wf_hs.keys_set || !wf_hs.on) {
++			wf_net_link_set(flags & 1);
++		}
++	} else if (type == 5 || type == 6 || type == 11 || type == 12) {
++		printf("USB> wifi: NET: %s (%u) status %u reason %u\n", wf_evname(type), type, status, reason);
++		wf_net_link_set(false);
++	}
++	return true;
++}
++
++static void
++wf_net_cmd(void)
++{
++	char a[16], m[16], g[16], d[16];
++	wf_ipstr(wf_dh.ip, a, sizeof(a));
++	wf_ipstr(wf_dh.mask, m, sizeof(m));
++	wf_ipstr(wf_dh.gw, g, sizeof(g));
++	wf_ipstr(wf_dh.dns, d, sizeof(d));
++	printf("USB> wifi: NET: %s%u link %u thread %u; DHCP state %u: %s mask %s router %s DNS %s lease %u (on en: %u)\n",
++	    wf_ifp ? ifnet_name(wf_ifp) : "-", wf_ifp ? ifnet_unit(wf_ifp) : 0, wf_net_link, wf_thread_on, wf_dh.state, a, m,
++	    g, d, wf_dh.lease, wf_dh.set_ip != 0);
++	printf("USB> wifi: NET: rx %llu (dropped %llu), tx %llu (dropped %llu), queued %u, txseq %u window %u, poll bus errors %u\n",
++	    wf_rx_frames, wf_rx_drop, wf_tx_frames, wf_tx_drop, wf_txq_n, wf_txseq, wf_txmax, wf_bad_runs);
++}
++
++/*
+  * 'wifi join SSIDHEX PASSHEX|-' (sent by tools/on7xelte-wifi-join.py; the echo lines hide the arguments).
+  * WPA2-PSK (AES) with the firmware supplicant, or an open network for '-'.
+  */
+@@ -2600,7 +3334,7 @@
+ 		bzero(pw, sizeof(pw));
+ 		return;
+ 	}
+-	printf("USB> wifi: JOIN \"%s\" (%s)\n", name, pl ? "WPA2-PSK, firmware supplicant" : "open");
++	printf("USB> wifi: JOIN \"%s\" (%s)\n", name, pl ? "WPA2-PSK, host handshake" : "open");
+ 	wf_cap_show();
+ 	int up = wf_ioc_int(WLC_UP, 0);
+ 	/* events of a join on, ESCAN kept */
+@@ -2623,8 +3357,10 @@
+ 	int mac = wf_iovar_get("cur_etheraddr", 8);
+ 	uint64_t ms = 0;
+ 	wf_hs_clear();
++	wf_net_link_set(false);
+ 	if (mac == 0 && wf_ctl_len >= 6) {
+ 		memcpy(wf_hs.spa, wf_ctl, 6);
++		memcpy(wf_mac, wf_ctl, 6);
+ 	} else {
+ 		mac = mac ? mac : -1;
+ 	}
+@@ -2665,16 +3401,16 @@
+ 	printf("USB> wifi: JOIN %s after %llu ms (link %u keys %u EAPOL steps 0x%02x fail %u set_ssid %u)%s\n",
+ 	    ok ? "DONE: associated" : "FAILED", ns / 1000000, wf_j_link, wf_hs.keys_set, wf_hs.steps, wf_j_fail, wf_j_ssid,
+ 	    wf_bad ? " (a bus access failed)" : "");
+-	wf_hs_clear();
+ 	if (ok) {
+ 		wf_link_cmd();
++		wf_net_up();                    /* 0175: the handshake stays on for rekeys */
++	} else {
++		wf_hs_clear();
+ 	}
+ }
+ 
+-/* From the dvfs worker (a5xelte_dvfs.c dv_run), which may sleep. */
+-void on7xelte_wifi_cmd(const char *arg);
+-void
+-on7xelte_wifi_cmd(const char *arg)
++static void
++wf_cmd_locked(const char *arg)
+ {
+ 	if (!strcmp(arg, "probe")) {
+ 		wf_probe(false);
+@@ -2724,6 +3460,14 @@
+ 		wf_join_cmd(arg + 5);
+ 	} else if (!strcmp(arg, "link")) {
+ 		wf_link_cmd();
++	} else if (!strcmp(arg, "net")) {
++		wf_net_cmd();
++	} else if (!strcmp(arg, "dhcp")) {
++		if (wf_net_link) {
++			wf_dhcp_start();
++		} else {
++			printf("USB> wifi: DHCP: no link ('wifi join' first)\n");
++		}
+ 	} else if (!strcmp(arg, "con")) {
+ 		if (wf_fwup && wf_fw_cons) {
+ 			wf_bad = false;
+@@ -2741,8 +3485,21 @@
+ 	} else if (!strncmp(arg, "cr ", 3)) {
+ 		wf_rd_cmd(arg + 3, true);
+ 	} else {
+-		printf("USB> wifi: probe [keep] | off | st | fw | fw1 | ver | mac | scan | join SSIDHEX PASSHEX|- | link | dm HEX|keep | con | fifo 0-3 | div N | rd ADDR [N] | wr ADDR VAL | cr FN ADDR\n");
++		printf("USB> wifi: probe [keep] | off | st | fw | fw1 | ver | mac | scan | join SSIDHEX PASSHEX|- | link | net | dhcp | dm HEX|keep | con | fifo 0-3 | div N | rd ADDR [N] | wr ADDR VAL | cr FN ADDR\n");
++	}
++}
++
++/* From the dvfs worker (a5xelte_dvfs.c dv_run), which may sleep. 0175: under the bus lock */
++void on7xelte_wifi_cmd(const char *arg);
++void
++on7xelte_wifi_cmd(const char *arg)
++{
++	lck_mtx_lock(&wf_bus);
++	wf_cmd_locked(arg);
++	if (!wf_fwup) {
++		wf_net_link_set(false);         /* off, or the chip restarted: no link */
+ 	}
++	lck_mtx_unlock(&wf_bus);
+ }
+ 
+ #endif /* ARM64_BOARD_CONFIG_A5XELTE */
