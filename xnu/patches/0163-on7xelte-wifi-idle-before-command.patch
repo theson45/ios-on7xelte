@@ -1,0 +1,80 @@
+--- a/bsd/dev/on7xelte_wifi.c
++++ b/bsd/dev/on7xelte_wifi.c
+@@ -233,10 +233,28 @@
+ 	return true;
+ }
+ 
++/*
++ * 0163: wait until the controller can take a command: the previous one started (CMD bit 31 clear), the
++ * command FSM idle (STATUS 7:4 == 0: after a response it still waits Ncc clocks, 20 us at 400 kHz, and a
++ * command written then is refused with HLE), and no data busy (STATUS 9, 10).
++ */
++static bool
++wf_idle(void)
++{
++	for (uint32_t t = 0; t < 100000; t += 2) {
++		if (!(rd32(wf_mmc, M_CMD) & CMD_START) && !(rd32(wf_mmc, M_STATUS) & 0x6f0u)) {
++			return true;
++		}
++		delay(2);
++	}
++	return false;
++}
++
+ /* One command without data; 0 = response in *resp, else the RINTSTS error bits (or 1: stuck). */
+ static uint32_t
+ wf_cmd(uint32_t idx, uint32_t arg, uint32_t flags, uint32_t *resp)
+ {
++	(void)wf_idle();
+ 	wr32(wf_mmc, M_RINTSTS, 0xffffffffu);
+ 	wr32(wf_mmc, M_CMDARG, arg);
+ 	wr32(wf_mmc, M_CMD, CMD_START | CMD_HOLD | CMD_WAIT_PRV | flags | (idx & 0x3f));
+@@ -529,12 +547,25 @@
+ static uint32_t wf_errs;                /* data-transfer errors, the first few of which are told */
+ 
+ /* CMD53 in byte mode, incrementing: n (4..64, a multiple of 4) bytes of function fn at addr */
++static bool wf_cmd53_once(uint32_t fn, uint32_t addr, bool wr, uint32_t *buf, uint32_t n, bool quiet);
++
+ static bool
+ wf_cmd53(uint32_t fn, uint32_t addr, bool wr, uint32_t *buf, uint32_t n)
+ {
++	if (wf_cmd53_once(fn, addr, wr, buf, n, true)) {
++		return true;
++	}
++	delay(1000);
++	return wf_cmd53_once(fn, addr, wr, buf, n, false);   /* 0163: once more, and tell if that fails too */
++}
++
++static bool
++wf_cmd53_once(uint32_t fn, uint32_t addr, bool wr, uint32_t *buf, uint32_t n, bool quiet)
++{
+ 	uint32_t arg = (wr ? (1u << 31) : 0) | ((fn & 7) << 28) | (1u << 26) | ((addr & 0x1ffff) << 9) | (n & 0x1ff);
+ 	uint32_t st = 0, r = 0;
+ 
++	(void)wf_idle();
+ 	wr32(wf_mmc, M_CTRL, rd32(wf_mmc, M_CTRL) | CTRL_FIFO_RST);
+ 	if (!wf_wait_clear(M_CTRL, CTRL_FIFO_RST, 10000)) {
+ 		goto bad;
+@@ -570,8 +601,11 @@
+ 	}
+ 	return true;
+ bad:
++	if (quiet) {
++		return false;
++	}
+ 	if (wf_errs++ < 6) {
+-		printf("USB> wifi: CMD53 %s fn %u addr 0x%05x n %u failed: RINTSTS 0x%08x R5 0x%08x STATUS 0x%08x\n",
++		printf("USB> wifi: CMD53 %s fn %u addr 0x%05x n %u failed twice: RINTSTS 0x%08x R5 0x%08x STATUS 0x%08x\n",
+ 		    wr ? "write" : "read", fn, addr, n, st, r, rd32(wf_mmc, M_STATUS));
+ 	}
+ 	wf_bad = true;
+@@ -690,7 +724,8 @@
+ 	struct wf_core *c = NULL;
+ 
+ 	wf_ncores = 0;
+-	printf("USB> wifi: EROM at 0x%08x\n", p);
++	printf("USB> wifi: EROM at 0x%08x: %08x %08x %08x %08x\n", p, wf_rd32(p), wf_rd32(p + 4), wf_rd32(p + 8),
++	    wf_rd32(p + 12));
+ 	for (uint32_t i = 0; i < 256 && !wf_bad; i++) {
+ 		uint32_t e = wf_rd32(p);
+ 		p += 4;

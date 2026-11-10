@@ -158,7 +158,14 @@ jobs:
         run: |
           mkdir -p out
           cp -R dxb/fakeroot/System/Library/Kernels/. out/ 2>/dev/null || true
-          ls -la out
+          # For relinking on a PC (tools/xnu-relink.sh): the archives the .link kit's
+          # linkarchives/linkarguments name but do not carry.
+          mkdir -p out/relink-libs
+          cp dxb/fakeroot/usr/local/lib/kernel/libfirehose_kernel.a out/relink-libs/ 2>/dev/null || true
+          TC=$(dirname "$(dirname "$(xcrun --find clang)")")
+          find "$TC" -name '*cc_kext*.a' -exec cp {} out/relink-libs/ \; 2>/dev/null || true
+          find "$TC" -name '*cc_kext*.a' > out/relink-libs/where.txt 2>/dev/null || true
+          ls -la out out/relink-libs
           (cd out && shasum -a 256 kernel.* > SHA256SUMS) || true
 
       - name: Check for ARMv8.1 LSE instructions (Cortex-A53 has none)
