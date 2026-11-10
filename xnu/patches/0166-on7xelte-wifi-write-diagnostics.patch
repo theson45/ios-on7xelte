@@ -1,0 +1,119 @@
+--- a/bsd/dev/on7xelte_wifi.c
++++ b/bsd/dev/on7xelte_wifi.c
+@@ -209,7 +209,7 @@
+ 	wr32(wf_mmc, M_RINTSTS, 0xffffffffu);
+ 	wr32(wf_mmc, M_TMOUT, 0xffffffffu);
+ 	wr32(wf_mmc, M_CTYPE, 0);                       /* 1-bit while enumerating */
+-	wr32(wf_mmc, M_FIFOTH, 0x203f0040u);            /* MSIZE 8, RX 63, TX 64 (fifo-depth 0x40) */
++	wr32(wf_mmc, M_FIFOTH, 0x201f0020u);            /* 0166: as dw_mmc: MSIZE 8, RX 31, TX 32 (depth 64 / 2) */
+ 	wr32(wf_mmc, M_CLKSEL, WF_CLKSEL);
+ 	wr32(wf_mmc, M_PWREN, 1);
+ 	delay(10000);
+@@ -563,7 +563,7 @@
+ wf_cmd53_once(uint32_t fn, uint32_t addr, bool wr, uint32_t *buf, uint32_t n, bool quiet)
+ {
+ 	uint32_t arg = (wr ? (1u << 31) : 0) | ((fn & 7) << 28) | (1u << 26) | ((addr & 0x1ffff) << 9) | (n & 0x1ff);
+-	uint32_t st = 0, r = 0;
++	uint32_t st = 0, r = 0, pre = 0;
+ 
+ 	(void)wf_idle();
+ 	wr32(wf_mmc, M_CTRL, rd32(wf_mmc, M_CTRL) | CTRL_FIFO_RST);
+@@ -582,6 +582,7 @@
+ 			uint64_t v = buf[i] | ((i + 1 < n / 4) ? (uint64_t)buf[i + 1] << 32 : 0);
+ 			*(volatile uint64_t *)(wf_mmc + M_FIFO) = v;
+ 		}
++		pre = rd32(wf_mmc, M_STATUS);     /* 0166: FIFO count (29:17) before the command */
+ 	}
+ 	wr32(wf_mmc, M_RINTSTS, 0xffffffffu);
+ 	wr32(wf_mmc, M_CMDARG, arg);
+@@ -624,8 +625,10 @@
+ 		return false;
+ 	}
+ 	if (wf_errs++ < 6) {
+-		printf("USB> wifi: CMD53 %s fn %u addr 0x%05x n %u failed twice: RINTSTS 0x%08x R5 0x%08x STATUS 0x%08x\n",
+-		    wr ? "write" : "read", fn, addr, n, st, r, rd32(wf_mmc, M_STATUS));
++		printf("USB> wifi: CMD53 %s fn %u addr 0x%05x n %u failed twice: RINTSTS 0x%08x R5 0x%08x STATUS 0x%08x"
++		    " (FIFO after fill: STATUS 0x%08x, %u words; bus %u-bit)\n",
++		    wr ? "write" : "read", fn, addr, n, st, r, rd32(wf_mmc, M_STATUS), pre, (pre >> 17) & 0x1fff,
++		    rd32(wf_mmc, M_CTYPE) ? 4 : 1);
+ 	}
+ 	wf_bad = true;
+ 	return false;
+@@ -951,6 +954,8 @@
+ 	}
+ }
+ 
++static bool wf_bus4 = true;     /* 0166: 'wifi fw1' keeps the 1-bit bus */
++
+ static void
+ wf_fw(void)
+ {
+@@ -988,7 +993,9 @@
+ 	}
+ 	/* 4-bit bus (CCCR bus interface control), then function 1's block size */
+ 	int bic = wf_rd8(0, 0x07);
+-	if (bic >= 0 && wf_wr8(0, 0x07, (uint8_t)((bic & ~3) | 2))) {
++	if (!wf_bus4) {
++		printf("USB> wifi: 1-bit bus kept (CCCR 0x07 0x%02x, CTYPE %u)\n", bic, rd32(wf_mmc, M_CTYPE));
++	} else if (bic >= 0 && wf_wr8(0, 0x07, (uint8_t)((bic & ~3) | 2))) {
+ 		wr32(wf_mmc, M_CTYPE, 1);
+ 		printf("USB> wifi: 4-bit bus (CCCR 0x07 0x%02x -> 0x%02x)\n", bic, wf_rd8(0, 0x07));
+ 	}
+@@ -1237,6 +1244,36 @@
+ 	wf_bad = false;
+ }
+ 
++/* 0166: 'wifi wr ADDR VAL': one 32-bit backplane write (CMD53), then the word read back */
++static void
++wf_wr_cmd(const char *a)
++{
++	bool ok1, ok2;
++	uint32_t x = wf_hex(&a, &ok1), v = wf_hex(&a, &ok2);
++
++	if (!wf_chipid || !wf_mmc) {
++		printf("USB> wifi: not powered (wifi probe keep, or a stopped wifi fw, first)\n");
++		return;
++	}
++	if (!ok1 || !ok2) {
++		printf("USB> wifi: wr ADDR VAL\n");
++		return;
++	}
++	x &= ~3u;
++	wf_bad = false;
++	wf_errs = 0;
++	uint32_t before = wf_rd32(x);
++	bool rb = !wf_bad;
++	wf_wr32(x, v);
++	bool wok = !wf_bad;
++	wf_bad = false;
++	uint32_t after = wf_rd32(x);
++	printf("USB> wifi: wr 0x%08x = 0x%08x: before 0x%08x%s, write %s, after 0x%08x%s (bus %u-bit)\n", x, v, before,
++	    rb ? "" : " (read failed)", wok ? "ok" : "FAILED", after, wf_bad ? " (read failed)" : "",
++	    rd32(wf_mmc, M_CTYPE) ? 4 : 1);
++	wf_bad = false;
++}
++
+ /* From the dvfs worker (a5xelte_dvfs.c dv_run), which may sleep. */
+ void on7xelte_wifi_cmd(const char *arg);
+ void
+@@ -1251,13 +1288,19 @@
+ 	} else if (!strcmp(arg, "st")) {
+ 		wf_st();
+ 	} else if (!strcmp(arg, "fw")) {
++		wf_bus4 = true;
++		wf_fw();
++	} else if (!strcmp(arg, "fw1")) {
++		wf_bus4 = false;
+ 		wf_fw();
++	} else if (!strncmp(arg, "wr ", 3)) {
++		wf_wr_cmd(arg + 3);
+ 	} else if (!strncmp(arg, "rd ", 3)) {
+ 		wf_rd_cmd(arg + 3, false);
+ 	} else if (!strncmp(arg, "cr ", 3)) {
+ 		wf_rd_cmd(arg + 3, true);
+ 	} else {
+-		printf("USB> wifi: probe [keep] | off | st | fw | rd ADDR [N] | cr FN ADDR\n");
++		printf("USB> wifi: probe [keep] | off | st | fw | fw1 | rd ADDR [N] | wr ADDR VAL | cr FN ADDR\n");
+ 	}
+ }
+ 
