@@ -1,0 +1,465 @@
+--- a/bsd/dev/on7xelte_wifi.c
++++ b/bsd/dev/on7xelte_wifi.c
+@@ -105,6 +105,9 @@
+ static vm_offset_t wf_mmc, wf_pinr, wf_pind;
+ static uint32_t wf_win = 0xffffffffu;   /* the backplane window function 1 is set to (0161) */
+ static uint32_t wf_chipid;              /* chipcommon's ID register, as the probe read it */
++static bool wf_fwup;                    /* 0170: the firmware runs (W3 done), W4 commands may talk to it */
++static bool wf_w4init;                  /* 0170: F2 block size etc. set for this power-up */
++static uint32_t wf_fw_cons, wf_fw_ram;  /* 0170: its console address and RAM size */
+ static uint32_t wf_last_e, wf_last_r;   /* 0162: the last CMD52's RINTSTS error bits and R5 */
+ 
+ static inline uint32_t
+@@ -312,6 +315,8 @@
+ 	}
+ 	wf_regon(false);
+ 	wf_chipid = 0;
++	wf_fwup = false;
++	wf_w4init = false;
+ 	wr32(wf_mmc, M_CLKENA, 0);
+ 	(void)wf_clk_update();
+ 	wr32(wf_mmc, M_PWREN, 0);
+@@ -566,7 +571,7 @@
+  * 0x204, 2 = both 32-bit halves at 0x200, 3 = only 32-bit words at 0x200 (no padding).
+  */
+ static uint32_t wf_fifo_mode = 1;      /* 0169: mode 1 works (xnu52): SOCRAM written right */
+-static uint32_t wf_div = WF_CLKDIV_SLOW; /* 0169: 'wifi div N' (hex), the clock after the 4-bit switch */
++static uint32_t wf_div = 4;             /* 0169: 'wifi div N' (hex); 0170: 4 by default (xnu53: 2.4 s, clean) */
+ 
+ static void
+ wf_fifo_put(uint32_t lo, uint32_t hi)
+@@ -1212,6 +1217,10 @@
+ 	if (s[5] && s[5] < ramsize) {
+ 		wf_console(s[5], ramsize);
+ 	}
++	wf_fw_cons = (s[5] && s[5] < ramsize) ? s[5] : 0;
++	wf_fw_ram = ramsize;
++	wf_fwup = true;
++	wf_w4init = false;
+ 	printf("USB> wifi: W3 done; left powered with the firmware running (wifi off turns it off)\n");
+ 	goto out;
+ 
+@@ -1335,6 +1344,394 @@
+ 	wf_bad = false;
+ }
+ 
++/*
++ * ---- W4 (0170): SDPCM frames on function 2, BCDC control messages, escan ----
++ * After Linux brcmfmac (sdio.c brcmf_sdio_readframes / brcmf_sdio_bus_txctl, bcdc.c, fwil.c, cfg80211.c escan).
++ * Frames: hw header (len, ~len), sw header (seq | chan << 8 | doffset << 24, then tx window << 8),
++ * then the payload at doffset. Channel 0 = control (BCDC), 1 = events, 2 = data. Polled, no SDIO interrupt.
++ */
++#define SD_HOSTINTMASK          0x24u
++#define SD_TOSBMAILBOX          0x40u
++#define SD_TOHOSTMAILBOXDATA    0x4cu
++#define I_HMB_FRAME_IND         (1u << 6)
++#define I_HMB_HOST_INT          (1u << 7)
++#define WF_F2ADDR               ((0x18000000u & SB_OFT_MASK) | SB_ACCESS_4B)
++#define WF_RXMAX                4096u
++#define WLC_UP                  2u
++#define WLC_GET_VAR             262u
++#define WLC_SET_VAR             263u
++
++static uint8_t wf_txseq, wf_txmax = 4;
++static uint16_t wf_reqid;
++static uint32_t wf_rxbuf[WF_RXMAX / 4];
++static uint32_t wf_rxlen;
++static uint8_t wf_ctl[1600];            /* the last control response's payload */
++static uint32_t wf_ctl_len;
++static int wf_ctl_status;
++static uint16_t wf_ctl_id;
++static bool wf_ctl_got;
++static uint32_t wf_events, wf_scan_n, wf_scan_done;
++static uint8_t wf_seen[32][6];
++
++static struct wf_core *
++wf_sd(void)
++{
++	return wf_core(CORE_SDIOD);
++}
++
++static bool
++wf_w4_ready(void)
++{
++	if (!wf_fwup || !wf_chipid || !wf_mmc || !wf_sd()) {
++		printf("USB> wifi: the firmware is not running ('wifi fw' first)\n");
++		return false;
++	}
++	wf_bad = false;
++	wf_errs = 0;
++	if (!wf_w4init) {
++		/* function 2 block size 512 (FBR 0x210), host interrupt mask for the mailbox/frame bits */
++		(void)wf_wr8(0, 0x210, 0x00);
++		(void)wf_wr8(0, 0x211, 0x02);
++		wf_wr32(wf_sd()->base + SD_HOSTINTMASK, 0xf0u);
++		wf_txseq = 0;
++		wf_w4init = true;
++		printf("USB> wifi: W4: F2 block size %u, hostintmask 0x%08x, intstatus 0x%08x\n",
++		    (uint32_t)wf_rd8(0, 0x210) | ((uint32_t)wf_rd8(0, 0x211) << 8),
++		    wf_rd32(wf_sd()->base + SD_HOSTINTMASK), wf_rd32(wf_sd()->base + SD_INTSTATUS));
++	}
++	return !wf_bad;
++}
++
++static bool
++wf_sdpcm_send(uint32_t chan, const uint8_t *pl, uint32_t len)
++{
++	static uint32_t tx[128];
++	uint32_t total = 12 + len, n = (total + 3) & ~3u;
++
++	if (n > sizeof(tx)) {
++		return false;
++	}
++	bzero(tx, n);
++	tx[0] = (total & 0xffff) | ((~total & 0xffffu) << 16);
++	tx[1] = wf_txseq | (chan << 8) | (12u << 24);
++	tx[2] = 0;
++	memcpy((uint8_t *)tx + 12, pl, len);
++	if (!wf_setwin(0x18000000u)) {
++		return false;
++	}
++	if (!wf_cmd53_once(2, WF_F2ADDR, true, tx, n, false)) {
++		return false;
++	}
++	wf_txseq++;
++	return true;
++}
++
++/* one frame into wf_rxbuf: 1 = got one (wf_rxlen), 0 = none, -1 = error */
++static int
++wf_sdpcm_recv(void)
++{
++	static uint32_t junk[128];
++
++	if (!wf_setwin(0x18000000u) || !wf_cmd53_once(2, WF_F2ADDR, false, wf_rxbuf, 64, false)) {
++		return -1;
++	}
++	uint32_t len = wf_rxbuf[0] & 0xffff, chk = wf_rxbuf[0] >> 16;
++	if (len == 0 && chk == 0) {
++		return 0;
++	}
++	if ((len ^ chk) != 0xffffu || len < 12) {
++		printf("USB> wifi: rx: bad frame header 0x%08x\n", wf_rxbuf[0]);
++		return -1;
++	}
++	uint32_t got = 64;
++	while (got < len) {
++		uint32_t k = (len - got + 3) & ~3u;
++		if (k > 512) {
++			k = 512;
++		}
++		uint32_t *dst = (got + k <= WF_RXMAX) ? wf_rxbuf + got / 4 : junk;
++		if (!wf_cmd53_once(2, WF_F2ADDR, false, dst, k, false)) {
++			return -1;
++		}
++		got += k;
++	}
++	if (len > WF_RXMAX) {
++		printf("USB> wifi: rx: frame of %u bytes dropped (buffer %u)\n", len, WF_RXMAX);
++		return 0;
++	}
++	wf_rxlen = len;
++	uint8_t win = (uint8_t)((wf_rxbuf[2] >> 8) & 0xff);
++	if ((uint8_t)(win - wf_txseq) <= 0x40) {
++		wf_txmax = win;
++	}
++	return 1;
++}
++
++static void wf_event(const uint8_t *eth, uint32_t len);
++
++/* the frame in wf_rxbuf: a control response is kept, events are handed on, data is dropped */
++static void
++wf_frame(void)
++{
++	uint8_t *f = (uint8_t *)wf_rxbuf;
++	uint32_t chan = (wf_rxbuf[1] >> 8) & 0xf, doff = wf_rxbuf[1] >> 24;
++
++	if (doff < 12 || doff > wf_rxlen) {
++		printf("USB> wifi: rx: chan %u doffset %u of %u?\n", chan, doff, wf_rxlen);
++		return;
++	}
++	uint8_t *pl = f + doff;
++	uint32_t plen = wf_rxlen - doff;
++	if (chan == 0) {
++		if (plen < 16) {
++			return;
++		}
++		uint32_t h[4];
++		memcpy(h, pl, 16);
++		wf_ctl_id = (uint16_t)(h[2] >> 16);
++		wf_ctl_status = (h[2] & 1) ? (int)h[3] : 0;
++		wf_ctl_len = plen - 16 < sizeof(wf_ctl) ? plen - 16 : (uint32_t)sizeof(wf_ctl);
++		memcpy(wf_ctl, pl + 16, wf_ctl_len);
++		wf_ctl_got = true;
++	} else if (chan == 1 || chan == 2) {
++		/* BDC header: flags, priority, flags2, data offset in words; then the ethernet frame */
++		if (plen < 4 || 4u + pl[3] * 4u > plen) {
++			return;
++		}
++		uint32_t o = 4u + pl[3] * 4u;
++		if (chan == 1) {
++			wf_event(pl + o, plen - o);
++		}
++	} else {
++		printf("USB> wifi: rx: frame on channel %u (%u bytes)\n", chan, wf_rxlen);
++	}
++}
++
++/* what the dongle flagged: mailbox data acked, frames read until it has none */
++static void
++wf_poll(void)
++{
++	uint32_t base = wf_sd()->base, st = wf_rd32(base + SD_INTSTATUS);
++
++	if (wf_bad || !st) {
++		return;
++	}
++	wf_wr32(base + SD_INTSTATUS, st);
++	if (st & I_HMB_HOST_INT) {
++		uint32_t mb = wf_rd32(base + SD_TOHOSTMAILBOXDATA);
++		wf_wr32(base + SD_TOSBMAILBOX, 1u << 1);        /* SMB_INT_ACK */
++		printf("USB> wifi: mailbox from the dongle: 0x%08x\n", mb);
++	}
++	if (st & I_HMB_FRAME_IND) {
++		for (int k = 0; k < 64; k++) {
++			if (wf_sdpcm_recv() <= 0) {
++				break;
++			}
++			wf_frame();
++		}
++	}
++}
++
++/* one BCDC request; the answer's payload is left in wf_ctl. Returns the firmware's status, or -999 */
++static int
++wf_dcmd(uint32_t cmd, bool set, const uint8_t *data, uint32_t len)
++{
++	static uint8_t m[16 + 400];
++
++	if (len > sizeof(m) - 16) {
++		return -999;
++	}
++	uint16_t id = ++wf_reqid;
++	uint32_t h[4] = { cmd, len, ((uint32_t)id << 16) | (set ? 2u : 0u), 0 };
++	memcpy(m, h, 16);
++	memcpy(m + 16, data, len);
++	wf_ctl_got = false;
++	if (!wf_sdpcm_send(0, m, 16 + len)) {
++		printf("USB> wifi: dcmd %u: send failed\n", cmd);
++		return -999;
++	}
++	for (int t = 0; t < 1000 && !wf_bad; t++) {
++		wf_poll();
++		if (wf_ctl_got && wf_ctl_id == id) {
++			return wf_ctl_status;
++		}
++		delay(2000);
++	}
++	printf("USB> wifi: dcmd %u: no answer (id %u, last id %u, txseq %u window %u)\n", cmd, id, wf_ctl_id, wf_txseq,
++	    wf_txmax);
++	return -999;
++}
++
++/* iovar get: name, then room for the answer */
++static int
++wf_iovar_get(const char *name, uint32_t room)
++{
++	static uint8_t b[400];
++	uint32_t nl = (uint32_t)strlen(name) + 1;
++
++	if (room < nl) {
++		room = nl;
++	}
++	if (room > sizeof(b)) {
++		room = sizeof(b);
++	}
++	bzero(b, room);
++	memcpy(b, name, nl);
++	return wf_dcmd(WLC_GET_VAR, false, b, room);
++}
++
++static int
++wf_iovar_set(const char *name, const void *v, uint32_t vlen)
++{
++	static uint8_t b[400];
++	uint32_t nl = (uint32_t)strlen(name) + 1;
++
++	if (nl + vlen > sizeof(b)) {
++		return -999;
++	}
++	memcpy(b, name, nl);
++	memcpy(b + nl, v, vlen);
++	return wf_dcmd(WLC_SET_VAR, true, b, nl + vlen);
++}
++
++static void
++wf_ver_cmd(void)
++{
++	if (!wf_w4_ready()) {
++		return;
++	}
++	int st = wf_iovar_get("ver", 256);
++	if (st) {
++		printf("USB> wifi: ver: status %d\n", st);
++		return;
++	}
++	char v[120];
++	uint32_t k = 0;
++	for (; k < wf_ctl_len && k < sizeof(v) - 1 && wf_ctl[k]; k++) {
++		v[k] = (wf_ctl[k] >= 0x20 && wf_ctl[k] < 0x7f) ? (char)wf_ctl[k] : ' ';
++	}
++	v[k] = 0;
++	printf("USB> wifi: BCDC works: ver = \"%s\"\n", v);
++}
++
++static void
++wf_mac_cmd(void)
++{
++	if (!wf_w4_ready()) {
++		return;
++	}
++	int st = wf_iovar_get("cur_etheraddr", 8);
++	if (st || wf_ctl_len < 6) {
++		printf("USB> wifi: cur_etheraddr: status %d (%u bytes)\n", st, wf_ctl_len);
++		return;
++	}
++	printf("USB> wifi: MAC %02x:%02x:%02x:%02x:%02x:%02x\n", wf_ctl[0], wf_ctl[1], wf_ctl[2], wf_ctl[3], wf_ctl[4],
++	    wf_ctl[5]);
++}
++
++static uint32_t
++wf_be32(const uint8_t *p)
++{
++	return ((uint32_t)p[0] << 24) | ((uint32_t)p[1] << 16) | ((uint32_t)p[2] << 8) | p[3];
++}
++
++/* a Broadcom event (ethertype 0x886c): escan results printed, the rest told briefly */
++static void
++wf_event(const uint8_t *e, uint32_t len)
++{
++	if (len < 72 || e[12] != 0x88 || e[13] != 0x6c) {
++		return;
++	}
++	const uint8_t *m = e + 24;              /* after the ethernet (14) and bcmeth (10) headers */
++	uint32_t type = wf_be32(m + 4), status = wf_be32(m + 8), dlen = wf_be32(m + 20);
++	const uint8_t *d = m + 48;
++	wf_events++;
++	if (type != 69) {                       /* WLC_E_ESCAN_RESULT */
++		if (wf_events < 20) {
++			printf("USB> wifi: event %u status %u (%u bytes)\n", type, status, dlen);
++		}
++		return;
++	}
++	if (status != 8) {                      /* not PARTIAL: the scan is over */
++		wf_scan_done = status + 1;
++		return;
++	}
++	if (dlen < 12 + 80 || 72 + dlen > len) {
++		return;
++	}
++	const uint8_t *b = d + 12;              /* escan_result: buflen, version, sync_id, bss_count; then bss_info */
++	const uint8_t *bssid = b + 8;
++	for (uint32_t i = 0; i < wf_scan_n && i < 32; i++) {
++		if (!memcmp(wf_seen[i], bssid, 6)) {
++			return;
++		}
++	}
++	if (wf_scan_n < 32) {
++		memcpy(wf_seen[wf_scan_n], bssid, 6);
++	}
++	wf_scan_n++;
++	char ssid[33];
++	uint32_t sl = b[18] > 32 ? 32 : b[18];
++	for (uint32_t k = 0; k < sl; k++) {
++		ssid[k] = (b[19 + k] >= 0x20 && b[19 + k] < 0x7f) ? (char)b[19 + k] : '?';
++	}
++	ssid[sl] = 0;
++	uint32_t chanspec = (uint32_t)b[71] | ((uint32_t)b[72] << 8);
++	int rssi = (int16_t)(b[76] | (b[77] << 8));
++	printf("USB> wifi: AP %02x:%02x:%02x:%02x:%02x:%02x ch %u rssi %d \"%s\"\n", bssid[0], bssid[1], bssid[2],
++	    bssid[3], bssid[4], bssid[5], chanspec & 0xff, rssi, ssid);
++}
++
++static void
++wf_scan_cmd(void)
++{
++	if (!wf_w4_ready()) {
++		return;
++	}
++	static const uint8_t zero4[4] = { 0, 0, 0, 0 };
++	int st = wf_dcmd(WLC_UP, true, zero4, 4);
++	printf("USB> wifi: WLC_UP: status %d\n", st);
++	if (st == -999) {
++		return;
++	}
++	/* event_msgs: ESCAN_RESULT (69) on */
++	st = wf_iovar_get("event_msgs", 16);
++	if (st == 0 && wf_ctl_len >= 16) {
++		uint8_t mask[16];
++		memcpy(mask, wf_ctl, 16);
++		mask[69 / 8] |= (uint8_t)(1u << (69 % 8));
++		st = wf_iovar_set("event_msgs", mask, 16);
++	}
++	printf("USB> wifi: event_msgs: status %d\n", st);
++	/* escan_params: version 1, action START, sync id; scan_params: any SSID/BSSID/BSS type, all channels */
++	uint8_t ep[76];
++	bzero(ep, sizeof(ep));
++	ep[0] = 1;
++	ep[4] = 1;
++	ep[6] = 0x34;
++	ep[7] = 0x12;
++	memset(ep + 8 + 36, 0xff, 6);
++	ep[8 + 42] = 2;
++	ep[8 + 43] = 0;
++	memset(ep + 8 + 44, 0xff, 16);          /* nprobes, active, passive, home time: -1 (defaults) */
++	wf_events = 0;
++	wf_scan_n = 0;
++	wf_scan_done = 0;
++	st = wf_iovar_set("escan", ep, sizeof(ep));
++	printf("USB> wifi: escan: status %d\n", st);
++	if (st) {
++		return;
++	}
++	uint64_t t0 = mach_absolute_time(), ns = 0;
++	for (int t = 0; t < 6000 && !wf_scan_done && !wf_bad; t++) {
++		wf_poll();
++		delay(2000);
++	}
++	absolutetime_to_nanoseconds(mach_absolute_time() - t0, &ns);
++	printf("USB> wifi: scan %s after %llu ms: %u networks, %u events%s\n", wf_scan_done ? "done" : "NOT done",
++	    ns / 1000000, wf_scan_n, wf_events, wf_bad ? " (a bus access failed)" : "");
++}
++
+ /* From the dvfs worker (a5xelte_dvfs.c dv_run), which may sleep. */
+ void on7xelte_wifi_cmd(const char *arg);
+ void
+@@ -1364,6 +1761,19 @@
+ 		} else {
+ 			printf("USB> wifi: div N (hex, 4..ff)\n");
+ 		}
++	} else if (!strcmp(arg, "ver")) {
++		wf_ver_cmd();
++	} else if (!strcmp(arg, "mac")) {
++		wf_mac_cmd();
++	} else if (!strcmp(arg, "scan")) {
++		wf_scan_cmd();
++	} else if (!strcmp(arg, "con")) {
++		if (wf_fwup && wf_fw_cons) {
++			wf_bad = false;
++			wf_console(wf_fw_cons, wf_fw_ram);
++		} else {
++			printf("USB> wifi: the firmware is not running\n");
++		}
+ 	} else if (!strcmp(arg, "fw1")) {
+ 		wf_bus4 = false;
+ 		wf_fw();
+@@ -1374,7 +1784,7 @@
+ 	} else if (!strncmp(arg, "cr ", 3)) {
+ 		wf_rd_cmd(arg + 3, true);
+ 	} else {
+-		printf("USB> wifi: probe [keep] | off | st | fw | fw1 | fifo 0-3 | div N | rd ADDR [N] | wr ADDR VAL | cr FN ADDR\n");
++		printf("USB> wifi: probe [keep] | off | st | fw | fw1 | ver | mac | scan | con | fifo 0-3 | div N | rd ADDR [N] | wr ADDR VAL | cr FN ADDR\n");
+ 	}
+ }
+ 
