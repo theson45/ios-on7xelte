@@ -1,0 +1,155 @@
+--- a/bsd/dev/a5xelte_dvfs.c
++++ b/bsd/dev/a5xelte_dvfs.c
+@@ -95,6 +95,14 @@
+  *                  RUDR, FREEZE and AUDR cleared, 1 ms, and read it back.
+  *                  So the phone keeps the time without the PC. UTC.
+  *
++ * 0155: the cod3026x audio codec (10-bit address 0x04 in Linux's DT, the
++ * same plain 7-bit form as the PMIC and the RTC on the direct path), on the
++ * PMIC bus. Writes to it were approved by the user; they go to 0x04 only:
++ *   codec              dump 0x00-0xff (IRQ pending 0x01-0x05 and 0x62
++ *                      skipped: reading them clears them)
++ *   codec REG [N]      read N registers (max 64)
++ *   codec w REG VAL [REG VAL ...]   write each and read it back
++ *
+  * Boot-arg a5cpufreq=MHZ applies a level once, 20 s after USB start.
+  *
+  * Sources: Samsung 3.18 kernel for the J7 Prime (i2c-exynos5.c batcher
+@@ -568,6 +576,119 @@
+ 	return 0;
+ }
+ 
++/* ---- 0155: cod3026x codec at 0x04 ---- */
++
++#define CODEC_ADDR      0x04
++
++static uint32_t dv_num(const char **s);
++
++/* A number must start here (after spaces), else nothing is written. */
++static bool
++cd_num(const char **s, uint32_t *v)
++{
++	while (**s == ' ') {
++		(*s)++;
++	}
++	if (**s < '0' || **s > '9') {
++		return false;
++	}
++	*v = dv_num(s);
++	return true;
++}
++
++static bool
++cd_skip(uint32_t reg)
++{
++	return (reg >= 0x01 && reg <= 0x05) || reg == 0x62;
++}
++
++static int
++cd_read(uint8_t reg, uint8_t *v)
++{
++	dv.slave = CODEC_ADDR;
++	int e = pm_read(reg, v);
++	dv.slave = 0;
++	return e;
++}
++
++static int
++cd_write(uint8_t reg, uint8_t val)
++{
++	uint8_t m[2] = { reg, val };
++	dv.slave = CODEC_ADDR;          /* never the PMIC: pm_xfer_direct uses dv.slave */
++	int e = pm_xfer(false, m, 2, true);
++	dv.slave = 0;
++	return e;
++}
++
++static void
++codec_cmd(const char *arg)
++{
++	if (dv.batch) {
++		printf("USB> codec: direct path only (pmic path direct)\n");
++		return;
++	}
++	if (arg[0] == 'w' && (arg[1] == ' ' || arg[1] == '\0')) {
++		const char *s = arg + 1;
++		for (int k = 0; k < 32; k++) {
++			while (*s == ' ') {
++				s++;
++			}
++			if (*s == '\0') {
++				break;
++			}
++			uint32_t reg = 0, val = 0;
++			uint8_t back = 0;
++			if (!cd_num(&s, &reg) || !cd_num(&s, &val) || reg > 0xff || val > 0xff ||
++			    (*s != ' ' && *s != '\0')) {
++				printf("USB> codec: bad pair near '%s'\n", s);
++				return;
++			}
++			if (cd_write((uint8_t)reg, (uint8_t)val)) {
++				printf("USB> codec w 0x%02x: FAILED\n", reg);
++				return;
++			}
++			if (cd_skip(reg) || cd_read((uint8_t)reg, &back)) {
++				printf("USB> codec w 0x%02x = 0x%02x\n", reg, val);
++			} else {
++				printf("USB> codec w 0x%02x = 0x%02x, reads 0x%02x\n", reg, val, back);
++			}
++		}
++		return;
++	}
++	uint32_t reg = 0, n = 256;
++	if (*arg != '\0') {
++		const char *s = arg;
++		reg = dv_num(&s);
++		n = dv_num(&s);
++		if (n == 0) {
++			n = 1;
++		}
++		if (n > 64) {
++			n = 64;
++		}
++	}
++	for (uint32_t row = reg & ~0xfu; row < reg + n && row <= 0xff; row += 16) {
++		char line[16 * 3 + 1];
++		uint32_t len = 0;
++		for (uint32_t i = 0; i < 16; i++) {
++			uint32_t r = row + i;
++			uint8_t v = 0;
++			if (r < reg || r >= reg + n) {
++				len += snprintf(line + len, sizeof(line) - len, " ..");
++			} else if (cd_skip(r)) {
++				len += snprintf(line + len, sizeof(line) - len, " --");
++			} else if (cd_read((uint8_t)r, &v)) {
++				printf("USB> codec 0x%02x: read FAILED (no answer at 0x%02x?)\n", r, CODEC_ADDR);
++				return;
++			} else {
++				len += snprintf(line + len, sizeof(line) - len, " %02x", v);
++			}
++		}
++		printf("USB> codec %02x:%s\n", row, line);
++	}
++}
++
+ /* ---- RTC (S2MPU05 at 0x06, read only apart from the RUDR latch) ---- */
+ 
+ #define RTC_ADDR        0x06
+@@ -1170,6 +1291,8 @@
+ 	}
+ 	if (!strcmp(cmd, "time")) {
+ 		time_cmd(arg);
++	} else if (!strcmp(cmd, "codec")) {
++		codec_cmd(arg);
+ 	} else if (!strcmp(cmd, "temp")) {
+ 		printf("USB> temp: %d C (TMU 0x%08x, trim 0x%08x)\n", dv_temp(),
+ 		    rd32(dv.tmu, 0x40), rd32(dv.tmu, 0x0));
+@@ -1315,7 +1438,7 @@
+ a5xelte_dvfs_command(const char *cmd, const char *arg)
+ {
+ 	if (strcmp(cmd, "temp") && strcmp(cmd, "pmic") && strcmp(cmd, "cpufreq") && strcmp(cmd, "reg") &&
+-	    strcmp(cmd, "time")) {
++	    strcmp(cmd, "time") && strcmp(cmd, "codec")) {
+ 		return false;
+ 	}
+ 	dv_post(cmd, arg);
