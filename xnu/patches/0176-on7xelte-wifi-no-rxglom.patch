@@ -1,0 +1,22 @@
+--- a/bsd/dev/on7xelte_wifi.c
++++ b/bsd/dev/on7xelte_wifi.c
+@@ -1572,7 +1572,8 @@
+ 			wf_net_rx(pl + o, plen - o);    /* 0175: data, to en0 */
+ 		}
+ 	} else {
+-		printf("USB> wifi: rx: frame on channel %u (%u bytes)\n", chan, wf_rxlen);
++		printf("USB> wifi: rx: frame on channel %u (%u bytes): %02x %02x %02x %02x %02x %02x %02x %02x\n", chan,
++		    wf_rxlen, pl[0], pl[1], pl[2], pl[3], pl[4], pl[5], pl[6], pl[7]);
+ 	}
+ }
+ 
+@@ -3337,6 +3338,9 @@
+ 	printf("USB> wifi: JOIN \"%s\" (%s)\n", name, pl ? "WPA2-PSK, host handshake" : "open");
+ 	wf_cap_show();
+ 	int up = wf_ioc_int(WLC_UP, 0);
++	/* 0176: no rx superframes (SDPCM channel 3, glom; xnu60 dropped them): one frame per read */
++	int glom = wf_iovar_int("bus:rxglom", 0);
++	printf("USB> wifi: JOIN: bus:rxglom 0, status %d\n", glom);
+ 	/* events of a join on, ESCAN kept */
+ 	int em = wf_iovar_get("event_msgs", 16);
+ 	if (em == 0 && wf_ctl_len >= 16) {
