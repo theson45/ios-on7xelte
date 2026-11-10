@@ -1,0 +1,740 @@
+--- a/bsd/dev/on7xelte_wifi.c
++++ b/bsd/dev/on7xelte_wifi.c
+@@ -11,6 +11,11 @@
+  *                everything off again (REG_ON low, controller unpowered) unless "wifi probe keep"
+  *   wifi off     REG_ON low, controller clock and power off
+  *   wifi st      the controller's and the pins' registers
++ *   wifi fw      (0161, W3) the firmware: /usr/share/firmware/wifi/on7xelte/bcm43430a1-sdio.{bin,txt} of the
++ *                root (put there by sweet-root-tweaks.py --wifi-fw: the phone's own Android files) read whole,
++ *                the probe above, a 4-bit bus, the backplane's cores from its EROM, the image written to the
++ *                chip's RAM with CMD53 and read back, the NVRAM under its length token, the ARM let go, the HT
++ *                clock, function 2, and the firmware's sdpcm_shared and console read; left powered
+  *
+  * Linux references: drivers/mmc/core/sdio*.c (enumeration), drivers/mmc/host/dw_mmc.c + dw_mmc-exynos.c
+  * (the host; CLKSEL from the DT's samsung,dw-mshc-sdr-timing <3 0 2 0>), brcmfmac sdio.c/bcmsdh.c
+@@ -22,6 +27,11 @@
+ #include <kern/clock.h>
+ #include <machine/machine_routines.h>
+ #include <libkern/libkern.h>
++#include <kern/kalloc.h>
++#include <sys/kauth.h>
++#include <sys/uio.h>
++#include <sys/vnode.h>
++#include <sys/vnode_internal.h>
+ 
+ #if defined(ARM64_BOARD_CONFIG_A5XELTE)
+ 
+@@ -93,6 +103,8 @@
+ #define SI_ENUM_BASE    0x18000000u
+ 
+ static vm_offset_t wf_mmc, wf_pinr, wf_pind;
++static uint32_t wf_win = 0xffffffffu;   /* the backplane window function 1 is set to (0161) */
++static uint32_t wf_chipid;              /* chipcommon's ID register, as the probe read it */
+ 
+ static inline uint32_t
+ rd32(vm_offset_t b, uint32_t off)
+@@ -349,12 +361,14 @@
+ 	return true;
+ }
+ 
+-static void
+-wf_probe(bool keep)
++static bool
++wf_bringup(void)
+ {
+ 	if (!wf_map()) {
+-		return;
++		return false;
+ 	}
++	wf_win = 0xffffffffu;
++	wf_chipid = 0;
+ 	printf("USB> wifi: probe: pins to SD, REG_ON high\n");
+ 	wf_regon(false);
+ 	delay(20000);
+@@ -362,7 +376,7 @@
+ 	wf_regon(true);
+ 	delay(200000);                  /* dhd: the chip's power-on and its SDIO core */
+ 	if (!wf_host_init() || !wf_enumerate()) {
+-		goto out;
++		return false;
+ 	}
+ 
+ 	int cccr = wf_rd8(0, 0x00), sdr = wf_rd8(0, 0x01), caps = wf_rd8(0, 0x08), hs = wf_rd8(0, 0x13);
+@@ -370,7 +384,7 @@
+ 	printf("USB> wifi: CCCR rev 0x%02x SD 0x%02x caps 0x%02x high-speed 0x%02x CIS 0x%06x\n",
+ 	    cccr, sdr, caps, hs, cis);
+ 	if (cccr < 0) {
+-		goto out;
++		return false;
+ 	}
+ 	/* the first CIS tuples: MANFID 0x20 gives vendor (0x02d0 Broadcom) and device */
+ 	for (int a = cis, n = 0; a > 0 && n < 8; n++) {
+@@ -398,7 +412,7 @@
+ 	}
+ 	printf("USB> wifi: function 1 %s (IORx 0x%02x)\n", (ready & 0x02) ? "ready" : "NOT ready", ready);
+ 	if (!(ready & 0x02)) {
+-		goto out;
++		return false;
+ 	}
+ 
+ 	/* ALP clock, as brcmf_sdio_probe_attach() asks for it */
+@@ -414,7 +428,7 @@
+ 	printf("USB> wifi: ALP clock %s (CHIPCLKCSR 0x%02x)\n", (clk & CLK_ALP_AVAIL) ? "available" : "NOT available",
+ 	    clk);
+ 	if (!(clk & CLK_ALP_AVAIL)) {
+-		goto out;
++		return false;
+ 	}
+ 	wf_wr8(1, SB_CHIPCLKCSR, CLK_HW_OFF | CLK_FORCE_ALP);
+ 	wf_wr8(1, SB_SDIOPULLUP, 0);
+@@ -439,8 +453,14 @@
+ 	} else {
+ 		printf("USB> wifi: chipcommon ID read failed\n");
+ 	}
++	wf_chipid = ok ? id : 0;
++	return ok;
++}
+ 
+-out:
++static void
++wf_probe(bool keep)
++{
++	(void)wf_bringup();
+ 	if (keep) {
+ 		printf("USB> wifi: probe done, left powered (wifi off turns it off)\n");
+ 		wf_st();
+@@ -449,6 +469,622 @@
+ 	}
+ }
+ 
++/*
++ * ---- W3 (0161): data transfers, the backplane, the firmware download ----
++ *
++ * As bcmdhd (dhd_sdio.c dhdsdio_download_state / dhdsdio_write_vars / dhdsdio_bus_init, aiutils.c) does it
++ * for a Cortex-M3 chip: ARM core held in reset, SOCRAM reset (bank 3 remap off on the 43430), the image at
++ * RAM address 0, the NVRAM variables at the top of RAM under their length token, SDIO-core interrupts
++ * cleared, ARM out of reset; then the HT clock, function 2 with the SDPCM protocol version, and the
++ * firmware's own word at the end of RAM: the address of its sdpcm_shared, which names its console.
++ */
++#define M_BLKSIZ        0x01cu
++#define M_BYTCNT        0x020u
++#define M_FIFO          0x200u          /* DW MSHC >= 2.40a */
++#define CTRL_FIFO_RST   0x2u
++#define CMD_DATA        (1u << 9)
++#define CMD_WRITE       (1u << 10)
++#define RINT_DTO        (1u << 3)
++#define RINT_DERR       ((1u << 7) | (1u << 9) | (1u << 10) | (1u << 11) | (1u << 13) | (1u << 15))
++#define SB_ACCESS_4B    0x8000u
++#define SB_OFT_MASK     0x7fffu
++#define WF_CHUNK        64u             /* function-1 block size; one CMD53 in byte mode */
++
++#define CLK_FORCE_HT    0x02u
++#define CLK_HT_REQ      0x10u
++#define CLK_HT_AVAIL    0x80u
++#define SB_WATERMARK    0x10008u
++
++#define CORE_SOCRAM     0x80eu
++#define CORE_D11        0x812u
++#define CORE_SDIOD      0x829u
++#define CORE_CM3        0x82au
++
++#define AI_IOCTRL       0x408u
++#define AI_RESETCTRL    0x800u
++#define AI_RESETSTATUS  0x804u
++#define SICF_FGC        0x2u
++#define SICF_CLOCK_EN   0x1u
++
++#define SR_COREINFO     0x00u
++#define SR_BANKIDX      0x10u
++#define SR_BANKINFO     0x40u
++#define SR_BANKPDA      0x44u
++#define SD_INTSTATUS    0x20u
++#define SD_TOSBMAILBOXDATA 0x48u
++
++#define WF_FW_PATH      "/usr/share/firmware/wifi/on7xelte/bcm43430a1-sdio.bin"
++#define WF_NV_PATH      "/usr/share/firmware/wifi/on7xelte/bcm43430a1-sdio.txt"
++
++struct wf_core {
++	uint32_t id, rev, base, wrap;
++};
++static struct wf_core wf_cores[16];
++static uint32_t wf_ncores;
++static bool wf_bad;                     /* a backplane access failed since it was last cleared */
++static uint32_t wf_errs;                /* data-transfer errors, the first few of which are told */
++
++/* CMD53 in byte mode, incrementing: n (4..64, a multiple of 4) bytes of function fn at addr */
++static bool
++wf_cmd53(uint32_t fn, uint32_t addr, bool wr, uint32_t *buf, uint32_t n)
++{
++	uint32_t arg = (wr ? (1u << 31) : 0) | ((fn & 7) << 28) | (1u << 26) | ((addr & 0x1ffff) << 9) | (n & 0x1ff);
++	uint32_t st = 0, r = 0;
++
++	wr32(wf_mmc, M_CTRL, rd32(wf_mmc, M_CTRL) | CTRL_FIFO_RST);
++	if (!wf_wait_clear(M_CTRL, CTRL_FIFO_RST, 10000)) {
++		goto bad;
++	}
++	wr32(wf_mmc, M_BLKSIZ, n);
++	wr32(wf_mmc, M_BYTCNT, n);
++	if (wr) {
++		for (uint32_t i = 0; i < n / 4; i++) {
++			wr32(wf_mmc, M_FIFO, buf[i]);
++		}
++	}
++	wr32(wf_mmc, M_RINTSTS, 0xffffffffu);
++	wr32(wf_mmc, M_CMDARG, arg);
++	wr32(wf_mmc, M_CMD, CMD_START | CMD_HOLD | CMD_WAIT_PRV | CMD_RESP | CMD_CRC | CMD_DATA |
++	    (wr ? CMD_WRITE : 0) | 53);
++	for (uint32_t t = 0; t < 500000; t += 5) {
++		st = rd32(wf_mmc, M_RINTSTS);
++		if ((st & RINT_DTO) || (st & (RINT_HLE | RINT_DERR)) ||
++		    ((st & RINT_CMD_DONE) && (st & (RINT_RE | RINT_RTO | RINT_RCRC)))) {
++			break;
++		}
++		delay(5);
++	}
++	r = rd32(wf_mmc, M_RESP0);
++	wr32(wf_mmc, M_RINTSTS, st);
++	if (!(st & RINT_DTO) || (st & (RINT_HLE | RINT_DERR | RINT_RE | RINT_RTO | RINT_RCRC)) || (r & 0xcb00u)) {
++		goto bad;
++	}
++	if (!wr) {
++		for (uint32_t i = 0; i < n / 4; i++) {
++			buf[i] = rd32(wf_mmc, M_FIFO);
++		}
++	}
++	return true;
++bad:
++	if (wf_errs++ < 6) {
++		printf("USB> wifi: CMD53 %s fn %u addr 0x%05x n %u failed: RINTSTS 0x%08x R5 0x%08x STATUS 0x%08x\n",
++		    wr ? "write" : "read", fn, addr, n, st, r, rd32(wf_mmc, M_STATUS));
++	}
++	wf_bad = true;
++	return false;
++}
++
++static bool
++wf_setwin(uint32_t addr)
++{
++	uint32_t w = addr & ~SB_OFT_MASK;
++
++	if (w == wf_win) {
++		return true;
++	}
++	if (!wf_wr8(1, SB_SBADDRLOW, (w >> 8) & 0x80) || !wf_wr8(1, SB_SBADDRMID, (w >> 16) & 0xff) ||
++	    !wf_wr8(1, SB_SBADDRHIGH, (w >> 24) & 0xff)) {
++		wf_win = 0xffffffffu;
++		wf_bad = true;
++		return false;
++	}
++	wf_win = w;
++	return true;
++}
++
++/* n <= 64 bytes at a backplane address, inside one 32 KiB window */
++static bool
++wf_bp(uint32_t addr, bool wr, uint32_t *buf, uint32_t n)
++{
++	return wf_setwin(addr) && wf_cmd53(1, (addr & SB_OFT_MASK) | SB_ACCESS_4B, wr, buf, n);
++}
++
++static uint32_t
++wf_rd32(uint32_t addr)
++{
++	uint32_t v = 0;
++
++	if (!wf_bp(addr, false, &v, 4)) {
++		return 0xffffffffu;
++	}
++	return v;
++}
++
++static void
++wf_wr32(uint32_t addr, uint32_t v)
++{
++	(void)wf_bp(addr, true, &v, 4);
++}
++
++/* len bytes of chip memory at addr (4-aligned), in 64-byte pieces; verify compares instead of storing */
++static bool
++wf_mem(uint32_t addr, bool wr, uint8_t *data, uint32_t len, bool verify, uint32_t *diffs)
++{
++	uint32_t chunk[WF_CHUNK / 4];
++
++	while (len) {
++		uint32_t n = WF_CHUNK - (addr & (WF_CHUNK - 1));
++		if (n > len) {
++			n = len;
++		}
++		uint32_t nw = (n + 3) & ~3u;
++		if (wr) {
++			bzero(chunk, sizeof(chunk));
++			memcpy(chunk, data, n);
++		}
++		if (!wf_bp(addr, wr, chunk, nw)) {
++			return false;
++		}
++		if (!wr) {
++			if (verify) {
++				if (memcmp(chunk, data, n)) {
++					if ((*diffs)++ < 3) {
++						printf("USB> wifi: verify: differs in the 64 bytes at 0x%05x\n", addr);
++					}
++				}
++			} else {
++				memcpy(data, chunk, n);
++			}
++		}
++		addr += n;
++		data += n;
++		len -= n;
++	}
++	return true;
++}
++
++static struct wf_core *
++wf_core(uint32_t id)
++{
++	for (uint32_t i = 0; i < wf_ncores; i++) {
++		if (wf_cores[i].id == id && wf_cores[i].base && wf_cores[i].wrap) {
++			return &wf_cores[i];
++		}
++	}
++	return NULL;
++}
++
++/* the backplane's enumeration ROM (aiutils.c ai_scan): each core's ID, revision, registers, wrapper */
++static void
++wf_erom(void)
++{
++	uint32_t p = wf_rd32(SI_ENUM_BASE + 0xfc);
++	struct wf_core *c = NULL;
++
++	wf_ncores = 0;
++	printf("USB> wifi: EROM at 0x%08x\n", p);
++	for (uint32_t i = 0; i < 256 && !wf_bad; i++) {
++		uint32_t e = wf_rd32(p);
++		p += 4;
++		if (e == 0xffffffffu) {
++			break;
++		}
++		if (!(e & 1)) {
++			continue;
++		}
++		if ((e & 0xe) == 0xe) {                 /* end */
++			break;
++		}
++		if ((e & 0x6) == 0) {                   /* component: CIA, then CIB */
++			uint32_t b = wf_rd32(p);
++			p += 4;
++			c = wf_ncores < 16 ? &wf_cores[wf_ncores++] : NULL;
++			if (c) {
++				c->id = (e >> 8) & 0xfff;
++				c->rev = b >> 24;
++				c->base = c->wrap = 0;
++			}
++		} else if ((e & 0xe) == 4) {            /* address descriptor */
++			if (e & 0x8) {
++				p += 4;                         /* upper 32 address bits */
++			}
++			if ((e & 0x30) == 0x30) {
++				uint32_t sz = wf_rd32(p);
++				p += 4;
++				if (sz & 0x8) {
++					p += 4;
++				}
++			}
++			uint32_t t = e & 0xc0, sp = (e >> 8) & 0xf, a = e & 0xfffff000u;
++			if (c) {
++				if (t == 0 && sp == 0 && !c->base) {
++					c->base = a;
++				}
++				if ((t == 0x80 || t == 0xc0) && !c->wrap) {
++					c->wrap = a;
++				}
++			}
++		}
++	}
++	for (uint32_t i = 0; i < wf_ncores; i++) {
++		printf("USB> wifi: core 0x%03x rev %u regs 0x%08x wrapper 0x%08x\n", wf_cores[i].id, wf_cores[i].rev,
++		    wf_cores[i].base, wf_cores[i].wrap);
++	}
++}
++
++static void
++wf_spin_status(struct wf_core *c)
++{
++	for (uint32_t t = 0; t < 300 && wf_rd32(c->wrap + AI_RESETSTATUS) != 0; t++) {
++		delay(1);
++	}
++}
++
++static bool
++wf_core_up(struct wf_core *c)
++{
++	uint32_t io = wf_rd32(c->wrap + AI_IOCTRL), rc = wf_rd32(c->wrap + AI_RESETCTRL);
++	return (io & (SICF_FGC | SICF_CLOCK_EN)) == SICF_CLOCK_EN && !(rc & 1);
++}
++
++static void
++wf_core_disable(struct wf_core *c, uint32_t bits)
++{
++	if (wf_rd32(c->wrap + AI_RESETCTRL) & 1) {
++		return;
++	}
++	wf_spin_status(c);
++	wf_wr32(c->wrap + AI_RESETCTRL, 1);
++	(void)wf_rd32(c->wrap + AI_RESETCTRL);
++	delay(1);
++	wf_wr32(c->wrap + AI_IOCTRL, bits);
++	(void)wf_rd32(c->wrap + AI_IOCTRL);
++	delay(10);
++}
++
++static void
++wf_core_reset(struct wf_core *c, uint32_t bits, uint32_t resetbits)
++{
++	wf_spin_status(c);
++	wf_wr32(c->wrap + AI_RESETCTRL, 1);
++	delay(10);
++	wf_spin_status(c);
++	wf_wr32(c->wrap + AI_IOCTRL, bits | resetbits | SICF_FGC | SICF_CLOCK_EN);
++	(void)wf_rd32(c->wrap + AI_IOCTRL);
++	wf_spin_status(c);
++	for (uint32_t n = 10; wf_rd32(c->wrap + AI_RESETCTRL) != 0 && n && !wf_bad; n--) {
++		wf_spin_status(c);
++		wf_wr32(c->wrap + AI_RESETCTRL, 0);
++		wf_spin_status(c);
++	}
++	wf_wr32(c->wrap + AI_IOCTRL, bits | SICF_CLOCK_EN);
++	(void)wf_rd32(c->wrap + AI_IOCTRL);
++	delay(1);
++}
++
++/* a file of the root, whole, in memory of ours (as y2sios redwood_adsp.c root_file) */
++static uint8_t *
++wf_file(const char *path, uint32_t *size)
++{
++	vfs_context_t ctx = vfs_context_kernel();
++	vnode_t vp = NULLVP;
++	struct vnode_attr va;
++	uint8_t *data;
++	int left = 0, error;
++
++	if (rootvnode == NULLVP || vnode_lookup(path, 0, &vp, ctx) != 0) {
++		printf("USB> wifi: %s: not found\n", path);
++		return NULL;
++	}
++	VATTR_INIT(&va);
++	VATTR_WANTED(&va, va_data_size);
++	if (vnode_getattr(vp, &va, ctx) != 0 || va.va_data_size == 0 || va.va_data_size > (1u << 20)) {
++		printf("USB> wifi: %s: no size, or too big\n", path);
++		vnode_put(vp);
++		return NULL;
++	}
++	data = kalloc_data((vm_size_t)va.va_data_size, Z_WAITOK);
++	if (data == NULL) {
++		vnode_put(vp);
++		return NULL;
++	}
++	error = vn_rdwr(UIO_READ, vp, (caddr_t)data, (int)va.va_data_size, 0, UIO_SYSSPACE, 0,
++	    vfs_context_ucred(ctx), &left, vfs_context_proc(ctx));
++	vnode_put(vp);
++	if (error != 0 || left != 0) {
++		printf("USB> wifi: %s: read error %d, %d bytes left\n", path, error, left);
++		kfree_data(data, (vm_size_t)va.va_data_size);
++		return NULL;
++	}
++	*size = (uint32_t)va.va_data_size;
++	return data;
++}
++
++/* NVRAM text to the chip's form: key=value lines, NUL-terminated, comments and blanks dropped, a final NUL */
++static uint32_t
++wf_nvram(const uint8_t *s, uint32_t n, uint8_t *out, uint32_t *count)
++{
++	uint32_t o = 0, i = 0, c = 0;
++
++	while (i < n) {
++		uint32_t a = i;
++		while (i < n && s[i] != '\n') {
++			i++;
++		}
++		uint32_t b = i++;
++		while (a < b && (s[a] == ' ' || s[a] == '\t' || s[a] == '\r')) {
++			a++;
++		}
++		while (b > a && (s[b - 1] == ' ' || s[b - 1] == '\t' || s[b - 1] == '\r')) {
++			b--;
++		}
++		bool eq = false;
++		for (uint32_t k = a; k < b && !eq; k++) {
++			eq = s[k] == '=';
++		}
++		if (a == b || s[a] == '#' || !eq) {
++			continue;
++		}
++		memcpy(out + o, s + a, b - a);
++		o += b - a;
++		out[o++] = 0;
++		c++;
++	}
++	out[o++] = 0;
++	*count = c;
++	return (o + 3) & ~3u;
++}
++
++/* the firmware's console ring (hndrte_cons_t: vcons_in, vcons_out, log {buf, buf_size, idx, out_idx}) */
++static void
++wf_console(uint32_t cons, uint32_t ramsize)
++{
++	uint32_t lg[4];
++	static uint8_t cbuf[2048];
++	char line[120];
++	uint32_t ln = 0;
++
++	if (!wf_mem(cons + 8, false, (uint8_t *)lg, sizeof(lg), false, NULL)) {
++		return;
++	}
++	uint32_t buf = lg[0], size = lg[1], idx = lg[2];
++	printf("USB> wifi: console at 0x%05x: log buf 0x%05x size %u idx %u\n", cons, buf, size, idx);
++	if (buf >= ramsize || size == 0 || size > sizeof(cbuf) || idx > size || (buf & 3)) {
++		return;
++	}
++	if (!wf_mem(buf, false, cbuf, (size + 3) & ~3u, false, NULL)) {
++		return;
++	}
++	/* oldest first: from idx to the end (if it ever wrapped), then from 0 to idx */
++	for (uint32_t k = 0; k < size; k++) {
++		uint8_t ch = cbuf[(idx + k) % size];
++		if (ch == '\n' || ch == 0 || ln == sizeof(line) - 1) {
++			if (ln) {
++				line[ln] = 0;
++				printf("USB> wifi: fw| %s\n", line);
++				ln = 0;
++			}
++			continue;
++		}
++		if (ch >= 0x20 && ch < 0x7f) {
++			line[ln++] = (char)ch;
++		}
++	}
++}
++
++static void
++wf_fw(void)
++{
++	uint32_t fwlen = 0, nvlen = 0, nvars = 0, vlen = 0, vcap = 0;
++	uint8_t *fw = wf_file(WF_FW_PATH, &fwlen), *nv = wf_file(WF_NV_PATH, &nvlen), *vars = NULL;
++	uint64_t t0, t1;
++
++	if (!fw || !nv) {
++		goto out;
++	}
++	printf("USB> wifi: firmware %u bytes, NVRAM %u bytes\n", fwlen, nvlen);
++	for (uint32_t i = 0; i + 9 < fwlen; i++) {
++		if (!memcmp(fw + i, "Version: ", 9)) {
++			char v[48];
++			uint32_t k;
++			for (k = 0; k < sizeof(v) - 1 && i + 9 + k < fwlen && fw[i + 9 + k] >= 0x20 &&
++			    fw[i + 9 + k] < 0x7f; k++) {
++				v[k] = (char)fw[i + 9 + k];
++			}
++			v[k] = 0;
++			printf("USB> wifi: firmware says: Version: %s\n", v);
++			break;
++		}
++	}
++	vcap = nvlen + 16;
++	vars = kalloc_data(vcap, Z_WAITOK | Z_ZERO);
++	if (!vars) {
++		goto out;
++	}
++	vlen = wf_nvram(nv, nvlen, vars, &nvars);
++	printf("USB> wifi: NVRAM: %u variables, %u bytes for the chip\n", nvars, vlen);
++
++	if (!wf_bringup()) {
++		goto off;
++	}
++	/* 4-bit bus (CCCR bus interface control), then function 1's block size */
++	int bic = wf_rd8(0, 0x07);
++	if (bic >= 0 && wf_wr8(0, 0x07, (uint8_t)((bic & ~3) | 2))) {
++		wr32(wf_mmc, M_CTYPE, 1);
++		printf("USB> wifi: 4-bit bus (CCCR 0x07 0x%02x -> 0x%02x)\n", bic, wf_rd8(0, 0x07));
++	}
++	wf_wr8(0, 0x110, WF_CHUNK);
++	wf_wr8(0, 0x111, 0);
++	wf_bad = false;
++	wf_errs = 0;
++	uint32_t id = wf_rd32(SI_ENUM_BASE);
++	printf("USB> wifi: chipcommon ID by CMD53: 0x%08x (%s)\n", id, id == wf_chipid ? "same" : "DIFFERENT");
++	if (wf_bad || id != wf_chipid) {
++		goto off;
++	}
++	wf_erom();
++	struct wf_core *cm3 = wf_core(CORE_CM3), *sr = wf_core(CORE_SOCRAM), *sd = wf_core(CORE_SDIOD);
++	if (wf_bad || !cm3 || !sr || !sd) {
++		printf("USB> wifi: ARM CM3 / SOCRAM / SDIO core not all found\n");
++		goto off;
++	}
++
++	/* download state: ARM disabled, SOCRAM reset, its size, bank 3 remap off, the top word cleared */
++	wf_core_disable(cm3, 0);
++	wf_core_reset(sr, 0, 0);
++	uint32_t ci = wf_rd32(sr->base + SR_COREINFO), nb = (ci >> 4) & 0xf, ramsize = 0;
++	for (uint32_t b = 0; b < nb; b++) {
++		wf_wr32(sr->base + SR_BANKIDX, b);
++		ramsize += 8192u * ((wf_rd32(sr->base + SR_BANKINFO) & 0x7f) + 1);
++	}
++	if ((wf_chipid & 0xffff) == 43430) {
++		wf_wr32(sr->base + SR_BANKIDX, 3);
++		wf_wr32(sr->base + SR_BANKPDA, 0);
++	}
++	printf("USB> wifi: download state: CM3 %s, SOCRAM %s, coreinfo 0x%08x, %u banks, RAM %u KiB\n",
++	    (wf_rd32(cm3->wrap + AI_RESETCTRL) & 1) ? "in reset" : "NOT in reset", wf_core_up(sr) ? "up" : "DOWN",
++	    ci, nb, ramsize / 1024);
++	if (wf_bad || ramsize < 0x20000 || ramsize > 0x100000 || fwlen > ramsize - vlen - 8) {
++		goto off;
++	}
++	wf_wr32(ramsize - 4, 0);
++
++	/* the image at 0, then read back */
++	uint32_t diffs = 0;
++	t0 = mach_absolute_time();
++	if (!wf_mem(0, true, fw, fwlen, false, NULL)) {
++		goto off;
++	}
++	t1 = mach_absolute_time();
++	uint64_t ns;
++	absolutetime_to_nanoseconds(t1 - t0, &ns);
++	printf("USB> wifi: firmware written in %llu ms (%llu KiB/s)\n", ns / 1000000,
++	    ns ? (uint64_t)fwlen * 1000000000ull / ns / 1024 : 0);
++	if (!wf_mem(0, false, fw, fwlen, true, &diffs)) {
++		goto off;
++	}
++	printf("USB> wifi: firmware read back: %s (%u differing pieces)\n", diffs ? "DIFFERS" : "same", diffs);
++	if (diffs) {
++		goto off;
++	}
++
++	/* the variables under the top word, as dhdsdio_write_vars, and the length token in it */
++	uint32_t varsize = vlen, varaddr = ramsize - 4 - varsize;
++	if (sd->rev == 7 && (varaddr & 0x3c) == 0x3c && varsize > 4) {
++		varsize += 4;
++		varaddr -= 4;
++	}
++	if (!wf_mem(varaddr, true, vars, varsize, false, NULL) ||
++	    !wf_mem(varaddr, false, vars, varsize, true, &diffs) || diffs) {
++		printf("USB> wifi: NVRAM write/read-back failed (%u differing)\n", diffs);
++		goto off;
++	}
++	uint32_t w = ((ramsize - 4) - varaddr) / 4, token = (~w << 16) | (w & 0xffff);
++	wf_wr32(ramsize - 4, token);
++	printf("USB> wifi: NVRAM at 0x%05x (%u bytes), token 0x%08x\n", varaddr, varsize, token);
++
++	/* out of download state: SDIO-core interrupts cleared, ARM out of reset */
++	if (!wf_core_up(sr)) {
++		printf("USB> wifi: SOCRAM down after the download?\n");
++		goto off;
++	}
++	wf_wr32(sd->base + SD_INTSTATUS, 0xffffffffu);
++	wf_core_reset(cm3, 0, 0);
++	printf("USB> wifi: ARM released (%s)\n", wf_core_up(cm3) ? "up" : "NOT up");
++	if (wf_bad) {
++		goto off;
++	}
++
++	/* HT clock (dhdsdio_htclk) */
++	wf_wr8(1, SB_CHIPCLKCSR, CLK_HT_REQ);
++	int clk = 0;
++	for (int t = 0; t < 500 && !(clk & CLK_HT_AVAIL); t++) {
++		clk = wf_rd8(1, SB_CHIPCLKCSR);
++		if (clk < 0) {
++			clk = 0;
++		}
++		delay(1000);
++	}
++	printf("USB> wifi: HT clock %s (CHIPCLKCSR 0x%02x)\n", (clk & CLK_HT_AVAIL) ? "available" : "NOT available", clk);
++	if (!(clk & CLK_HT_AVAIL)) {
++		goto off;
++	}
++
++	/* function 2 (dhdsdio_bus_init): HT forced, the protocol version to the dongle, F1|F2 on, IOR2 */
++	wf_wr8(1, SB_CHIPCLKCSR, (uint8_t)(clk | CLK_FORCE_HT));
++	wf_wr32(sd->base + SD_TOSBMAILBOXDATA, 4u << 16);
++	wf_wr8(0, 0x02, 0x06);
++	int ready = 0;
++	t0 = mach_absolute_time();
++	for (int t = 0; t < 300 && ready != 0x06; t++) {
++		ready = wf_rd8(0, 0x03);
++		if (ready < 0) {
++			ready = 0;
++		}
++		if (ready != 0x06) {
++			delay(10000);
++		}
++	}
++	absolutetime_to_nanoseconds(mach_absolute_time() - t0, &ns);
++	printf("USB> wifi: function 2 %s (IORx 0x%02x after %llu ms)\n", ready == 0x06 ? "ready" : "NOT ready", ready,
++	    ns / 1000000);
++	if (ready == 0x06 && sd->rev < 15) {
++		wf_wr8(1, SB_WATERMARK, 8);
++	}
++
++	/* the firmware's word at the end of RAM: its sdpcm_shared */
++	uint32_t sh = token;
++	for (int t = 0; t < 200; t++) {
++		sh = wf_rd32(ramsize - 4);
++		if (sh != token && sh < ramsize && !(sh & 3)) {
++			break;
++		}
++		delay(10000);
++	}
++	if (sh == token || sh >= ramsize || (sh & 3)) {
++		printf("USB> wifi: no sdpcm_shared (top word 0x%08x)\n", sh);
++		goto off;
++	}
++	uint32_t s[8];
++	if (!wf_mem(sh, false, (uint8_t *)s, sizeof(s), false, NULL)) {
++		goto off;
++	}
++	printf("USB> wifi: firmware RUNNING: sdpcm_shared at 0x%05x: version %u flags 0x%x trap 0x%x assert line %u "
++	    "console 0x%x fwid 0x%08x\n", sh, s[0] & 0xff, s[0], s[1], s[4], s[5], s[7]);
++	if (s[0] & 0x400) {
++		printf("USB> wifi: the firmware TRAPPED (trap record at 0x%x)\n", s[1]);
++	}
++	if (s[5] && s[5] < ramsize) {
++		wf_console(s[5], ramsize);
++	}
++	printf("USB> wifi: W3 done; left powered with the firmware running (wifi off turns it off)\n");
++	goto out;
++
++off:
++	printf("USB> wifi: firmware step stopped%s\n", wf_bad ? " (a backplane access failed)" : "");
++	wf_off();
++out:
++	if (vars) {
++		kfree_data(vars, vcap);
++	}
++	if (fw) {
++		kfree_data(fw, fwlen);
++	}
++	if (nv) {
++		kfree_data(nv, nvlen);
++	}
++}
++
+ /* From the dvfs worker (a5xelte_dvfs.c dv_run), which may sleep. */
+ void on7xelte_wifi_cmd(const char *arg);
+ void
+@@ -462,8 +1098,10 @@
+ 		wf_off();
+ 	} else if (!strcmp(arg, "st")) {
+ 		wf_st();
++	} else if (!strcmp(arg, "fw")) {
++		wf_fw();
+ 	} else {
+-		printf("USB> wifi: probe [keep] | off | st\n");
++		printf("USB> wifi: probe [keep] | off | st | fw\n");
+ 	}
+ }
+ 
