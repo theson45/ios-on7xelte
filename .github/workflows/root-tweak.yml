@@ -22,6 +22,10 @@ on:
         description: "install the BCM43430A1 firmware + NVRAM for the kernel's Wi-Fi (on7xelte W3)"
         type: boolean
         default: true
+      wifid:
+        description: "install on7wifid + its launchd job: Wi-Fi auto-join and DNS (xnu 0178)"
+        type: boolean
+        default: true
       runner:
         description: GitHub runner label (macos-15-intel when arm64 runners are out of capacity)
         default: macos-15
@@ -78,6 +82,18 @@ jobs:
           path: work/plugin
           retention-days: 14
 
+      - name: Build on7wifid
+        if: ${{ inputs.wifid }}
+        run: |
+          set -eux
+          SDK=$(xcrun --sdk iphoneos --show-sdk-path)
+          CC="$(xcrun --sdk iphoneos --find clang) -isysroot $SDK -arch arm64 -miphoneos-version-min=16.0"
+          mkdir -p work/wifid
+          $CC -O2 -Wall -Werror -framework CoreFoundation -framework SystemConfiguration             -o work/wifid/on7wifid tools/on7wifid/on7wifid.c
+          codesign -f -s - --entitlements tools/on7wifid/on7wifid-ents.plist work/wifid/on7wifid
+          codesign -d --entitlements - work/wifid/on7wifid
+          file work/wifid/on7wifid
+
       # The phone's own Android Wi-Fi files, from the public on7xelte vendor tree at a fixed commit,
       # checked by hash; they only pass through the runner into the image, never into this repository.
       - name: Fetch the Wi-Fi firmware
@@ -100,12 +116,18 @@ jobs:
           plug=""
           if [ "${{ inputs.hal_plugin }}" = "true" ]; then plug="--hal-plugin work/plugin"; fi
           if [ "${{ inputs.wifi_fw }}" = "true" ]; then plug="$plug --wifi-fw work/wifi"; fi
+          if [ "${{ inputs.wifid }}" = "true" ]; then plug="$plug --wifid work/wifid"; fi
           hdiutil attach -owners on -imagekey diskimage-class=CRawDiskImage \
             -mountpoint work/root work/ios-root.img
           sudo python3 tools/sweet-root-tweaks.py work/root $plug | tee work/tweak.log
           if [ "${{ inputs.wifi_fw }}" = "true" ]; then
             grep -q 'bcm43430a1-sdio.bin' work/tweak.log
             sudo ls -lnR work/root/usr/share/firmware/wifi/on7xelte
+          fi
+          if [ "${{ inputs.wifid }}" = "true" ]; then
+            grep -q 'launchd job com.on7xelte.wifid added' work/tweak.log
+            sudo ls -ln work/root/usr/local/bin/on7wifid
+            sudo plutil -p work/root/System/Library/xpc/launchd.plist | grep -A3 com.on7xelte.wifid
           fi
           if [ "${{ inputs.hal_plugin }}" = "true" ]; then
             grep -q 'RedwoodAudio.driver installed' work/tweak.log

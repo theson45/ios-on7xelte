@@ -1,0 +1,440 @@
+--- a/bsd/dev/on7xelte_wifi.c
++++ b/bsd/dev/on7xelte_wifi.c
+@@ -33,6 +33,8 @@
+ #include <sys/random.h>
+ #include <sys/vnode.h>
+ #include <sys/vnode_internal.h>
++#include <sys/sysctl.h>
++#include <sys/fcntl.h>
+ #include <kern/locks.h>
+ #include <kern/thread.h>
+ #include <kern/sched_prim.h>
+@@ -3372,40 +3374,109 @@
+ }
+ 
+ /*
+- * 'wifi join SSIDHEX PASSHEX|-' (sent by tools/on7xelte-wifi-join.py; the echo lines hide the arguments).
+- * WPA2-PSK (AES) with the firmware supplicant, or an open network for '-'.
++ * 0178: the saved network, for auto-join at boot (on7wifid, kern.on7xelte_wifi "auto"): its SSID and PMK (the
++ * PBKDF2 of the password, never the password), root only (0600) on the root. 'wifi join ... save' writes it after
++ * a join that worked, 'wifi forget' overwrites it with zeros and empties it. Neither is ever printed.
+  */
+-static void
+-wf_join_cmd(const char *a)
++#define WF_KEY_PATH     "/private/var/db/on7xelte-wifi.bin"
++struct wf_saved {
++	char magic[4];                  /* "O7WF" */
++	uint8_t ver, sl, sec, pad;      /* 1; SSID length; WPA2-PSK */
++	uint8_t ssid[32];
++	uint8_t pmk[32];
++};
++static bool wf_auto_off;                /* 'wifi off' by hand: no auto-join until the next join */
++
++static int
++wf_key_write(const void *buf, int len, off_t size)
+ {
+-	uint8_t ssid[32], pw[64];
+-	int sl = wf_unhex(&a, ssid, sizeof(ssid)), pl = 0;
++	vfs_context_t ctx = vfs_context_kernel();
++	vnode_t vp = NULLVP;
++	struct vnode_attr va;
++	int left = 0, err, e2;
+ 
+-	while (*a == ' ') {
+-		a++;
++	if (rootvnode == NULLVP) {
++		return ENOENT;
+ 	}
+-	if (sl <= 0) {
+-		printf("USB> wifi: join SSIDHEX PASSHEX|- (use tools/on7xelte-wifi-join.py)\n");
+-		return;
++	err = vnode_open(WF_KEY_PATH, O_CREAT | FWRITE, 0600, VNODE_LOOKUP_NOFOLLOW, &vp, ctx);
++	if (err) {
++		return err;
+ 	}
+-	if (!(a[0] == '-' && (a[1] == 0 || a[1] == ' '))) {
+-		pl = wf_unhex(&a, pw, sizeof(pw) - 1);
+-		if (pl < 8) {
+-			printf("USB> wifi: join: the password must be 8..63 characters (hex)\n");
+-			bzero(pw, sizeof(pw));
+-			return;
+-		}
++	VATTR_INIT(&va);
++	VATTR_SET(&va, va_mode, 0600);
++	VATTR_SET(&va, va_uid, 0);
++	VATTR_SET(&va, va_gid, 0);
++	e2 = vnode_setattr(vp, &va, ctx);
++	err = vn_rdwr(UIO_WRITE, vp, (caddr_t)(uintptr_t)buf, len, 0, UIO_SYSSPACE, IO_SYNC, vfs_context_ucred(ctx), &left,
++	    vfs_context_proc(ctx));
++	if (!err && left) {
++		err = EIO;
++	}
++	if (!err) {
++		VATTR_INIT(&va);
++		VATTR_SET(&va, va_data_size, size);
++		err = vnode_setattr(vp, &va, ctx);
++	}
++	if (!err) {
++		err = VNOP_FSYNC(vp, MNT_WAIT, ctx);
+ 	}
+-	char name[33];
++	vnode_close(vp, FWRITE, ctx);
++	return err ? err : e2;
++}
++
++/* the saved network, or false */
++static bool
++wf_key_read(struct wf_saved *k)
++{
++	vfs_context_t ctx = vfs_context_kernel();
++	vnode_t vp = NULLVP;
++	struct vnode_attr va;
++	int left = 0, err;
++	bool ok = false;
++
++	bzero(k, sizeof(*k));
++	if (rootvnode == NULLVP || vnode_lookup(WF_KEY_PATH, VNODE_LOOKUP_NOFOLLOW, &vp, ctx) != 0) {
++		return false;
++	}
++	VATTR_INIT(&va);
++	VATTR_WANTED(&va, va_data_size);
++	if (vnode_getattr(vp, &va, ctx) == 0 && va.va_data_size == sizeof(*k)) {
++		err = vn_rdwr(UIO_READ, vp, (caddr_t)k, (int)sizeof(*k), 0, UIO_SYSSPACE, 0, vfs_context_ucred(ctx), &left,
++		    vfs_context_proc(ctx));
++		ok = err == 0 && left == 0 && !memcmp(k->magic, "O7WF", 4) && k->ver == 1 && k->sl >= 1 && k->sl <= 32;
++	}
++	vnode_put(vp);
++	if (!ok) {
++		bzero(k, sizeof(*k));
++	}
++	return ok;
++}
++
++static void
++wf_ssid_name(const uint8_t *ssid, int sl, char name[33])
++{
+ 	for (int k = 0; k < sl; k++) {
+ 		name[k] = (ssid[k] >= 0x20 && ssid[k] < 0x7f) ? (char)ssid[k] : '?';
+ 	}
+ 	name[sl] = 0;
++}
++
++/*
++ * The join: WPA2-PSK (AES) with the host handshake (a password, or spmk: a saved PMK), or an open network.
++ * save: the network kept for auto-join once the join worked.
++ */
++static bool
++wf_join(const uint8_t *ssid, int sl, const uint8_t *pw, int pl, const uint8_t *spmk, bool save)
++{
++	bool sec = pl > 0 || spmk != NULL;
++	char name[33];
++
++	wf_ssid_name(ssid, sl, name);
+ 	if (!wf_w4_ready()) {
+-		bzero(pw, sizeof(pw));
+-		return;
++		return false;
+ 	}
+-	printf("USB> wifi: JOIN \"%s\" (%s)\n", name, pl ? "WPA2-PSK, host handshake" : "open");
++	printf("USB> wifi: JOIN \"%s\" (%s)\n", name, sec ? (spmk ? "WPA2-PSK, saved key, host handshake" :
++	    "WPA2-PSK, host handshake") : "open");
+ 	wf_cap_show();
+ 	int up = wf_ioc_int(WLC_UP, 0);
+ 	/* 0176: no rx superframes (SDPCM channel 3, glom; xnu60 dropped them): one frame per read */
+@@ -3424,8 +3495,8 @@
+ 	}
+ 	int infra = wf_ioc_int(20, 1);                  /* WLC_SET_INFRA: BSS */
+ 	int auth = wf_ioc_int(22, 0);                   /* WLC_SET_AUTH: open system */
+-	int wsec = wf_ioc_int(134, pl ? 4u : 0u);       /* WLC_SET_WSEC: AES */
+-	int wpa = wf_ioc_int(165, pl ? 0x80u : 0u);     /* WLC_SET_WPA_AUTH: WPA2_AUTH_PSK */
++	int wsec = wf_ioc_int(134, sec ? 4u : 0u);      /* WLC_SET_WSEC: AES */
++	int wpa = wf_ioc_int(165, sec ? 0x80u : 0u);    /* WLC_SET_WPA_AUTH: WPA2_AUTH_PSK */
+ 	/* 0174: this firmware has no supplicant (sup_wpa -23, xnu57): the host does the handshake */
+ 	int sup = wf_iovar_int("sup_wpa", 0);
+ 	int mac = wf_iovar_get("cur_etheraddr", 8);
+@@ -3438,22 +3509,25 @@
+ 	} else {
+ 		mac = mac ? mac : -1;
+ 	}
+-	if (pl) {
++	if (sec) {
+ 		uint64_t p0 = mach_absolute_time();
+-		wf_pmk(pw, (uint32_t)pl, ssid, (uint32_t)sl, wf_hs.pmk);
++		if (spmk) {
++			memcpy(wf_hs.pmk, spmk, 32);
++		} else {
++			wf_pmk(pw, (uint32_t)pl, ssid, (uint32_t)sl, wf_hs.pmk);
++		}
+ 		absolutetime_to_nanoseconds(mach_absolute_time() - p0, &ms);
+ 		ms /= 1000000;
+ 		wf_hs.on = mac == 0;
+ 	}
+-	bzero(pw, sizeof(pw));
+ 	printf("USB> wifi: JOIN setup: up %d event_msgs %d infra %d auth %d wsec %d wpa_auth %d sup_wpa %d mac %d%s\n", up,
+-	    em, infra, auth, wsec, wpa, sup, mac, pl ? "; PMK computed" : "");
+-	if (pl) {
++	    em, infra, auth, wsec, wpa, sup, mac, sec ? (spmk ? "; saved PMK" : "; PMK computed") : "");
++	if (sec && !spmk) {
+ 		printf("USB> wifi: JOIN: PBKDF2 took %llu ms\n", ms);
+ 	}
+-	if (up == -999 || infra == -999 || (pl && !wf_hs.on)) {
++	if (up == -999 || infra == -999 || (sec && !wf_hs.on)) {
+ 		wf_hs_clear();
+-		return;
++		return false;
+ 	}
+ 	uint8_t sj[36];
+ 	bzero(sj, sizeof(sj));
+@@ -3464,23 +3538,130 @@
+ 	int st = wf_dcmd(26, true, sj, sizeof(sj));     /* WLC_SET_SSID */
+ 	printf("USB> wifi: JOIN: SET_SSID status %d\n", st);
+ 	uint64_t t0 = mach_absolute_time(), ns = 0;
+-	for (int t = 0; st == 0 && t < 10000 && !wf_bad && !wf_j_fail && !(wf_j_link && (wf_hs.keys_set || !pl)); t++) {
++	for (int t = 0; st == 0 && t < 10000 && !wf_bad && !wf_j_fail && !(wf_j_link && (wf_hs.keys_set || !sec)); t++) {
+ 		wf_poll();
+ 		wf_hs_step();
+ 		delay(2000);
+ 	}
+ 	wf_joining = false;
+ 	absolutetime_to_nanoseconds(mach_absolute_time() - t0, &ns);
+-	bool ok = wf_j_link && (wf_hs.keys_set || !pl);
++	bool ok = wf_j_link && (wf_hs.keys_set || !sec);
+ 	printf("USB> wifi: JOIN %s after %llu ms (link %u keys %u EAPOL steps 0x%02x fail %u set_ssid %u)%s\n",
+ 	    ok ? "DONE: associated" : "FAILED", ns / 1000000, wf_j_link, wf_hs.keys_set, wf_hs.steps, wf_j_fail, wf_j_ssid,
+ 	    wf_bad ? " (a bus access failed)" : "");
+ 	if (ok) {
++		wf_auto_off = false;
++		if (save) {
++			struct wf_saved k;
++			bzero(&k, sizeof(k));
++			memcpy(k.magic, "O7WF", 4);
++			k.ver = 1;
++			k.sl = (uint8_t)sl;
++			k.sec = sec;
++			memcpy(k.ssid, ssid, (size_t)sl);
++			if (sec) {
++				memcpy(k.pmk, wf_hs.pmk, 32);
++			}
++			int err = wf_key_write(&k, (int)sizeof(k), (off_t)sizeof(k));
++			bzero(&k, sizeof(k));
++			printf("USB> wifi: JOIN: \"%s\" saved for auto-join (%s, root only): %d\n", name, WF_KEY_PATH, err);
++		}
+ 		wf_link_cmd();
+ 		wf_net_up();                    /* 0175: the handshake stays on for rekeys */
+ 	} else {
+ 		wf_hs_clear();
+ 	}
++	return ok;
++}
++
++/*
++ * 'wifi join SSIDHEX PASSHEX|- [save]' (sent by tools/on7xelte-wifi-join.py; the echo lines hide the arguments).
++ */
++static void
++wf_join_cmd(const char *a)
++{
++	uint8_t ssid[32], pw[64];
++	int sl = wf_unhex(&a, ssid, sizeof(ssid)), pl = 0;
++
++	while (*a == ' ') {
++		a++;
++	}
++	if (sl <= 0) {
++		printf("USB> wifi: join SSIDHEX PASSHEX|- [save] (use tools/on7xelte-wifi-join.py)\n");
++		return;
++	}
++	if (a[0] == '-' && (a[1] == 0 || a[1] == ' ')) {
++		a++;
++	} else {
++		pl = wf_unhex(&a, pw, sizeof(pw) - 1);
++		if (pl < 8) {
++			printf("USB> wifi: join: the password must be 8..63 characters (hex)\n");
++			bzero(pw, sizeof(pw));
++			return;
++		}
++	}
++	while (*a == ' ') {
++		a++;
++	}
++	bool save = !strcmp(a, "save");
++	(void)wf_join(ssid, sl, pw, pl, NULL, save);
++	bzero(pw, sizeof(pw));
++}
++
++/* 'wifi forget': the saved network overwritten with zeros, the file emptied */
++static void
++wf_forget_cmd(void)
++{
++	struct wf_saved k;
++	bool had = wf_key_read(&k);
++	bzero(&k, sizeof(k));
++	int err = had ? wf_key_write(&k, (int)sizeof(k), 0) : 0;
++	printf("USB> wifi: FORGET: %s (%d)\n", had ? "the saved network cleared" : "no saved network", err);
++}
++
++static void
++wf_saved_cmd(void)
++{
++	struct wf_saved k;
++	char name[33];
++	if (wf_key_read(&k)) {
++		wf_ssid_name(k.ssid, k.sl, name);
++		printf("USB> wifi: SAVED: \"%s\" (%s); auto-join %s\n", name, k.sec ? "WPA2-PSK" : "open",
++		    wf_auto_off ? "off ('wifi off' by hand)" : "on");
++	} else {
++		printf("USB> wifi: SAVED: none\n");
++	}
++	bzero(&k, sizeof(k));
++}
++
++/* 'auto' (on7wifid at boot and while there is no link): firmware up, then the saved network. 0 = a link */
++static int
++wf_auto(void)
++{
++	struct wf_saved k;
++	int ret;
++
++	if (wf_auto_off) {
++		return ECANCELED;
++	}
++	if (wf_fwup && wf_net_link) {
++		return 0;
++	}
++	if (!wf_key_read(&k)) {
++		return ENOENT;
++	}
++	if (!wf_fwup) {
++		printf("USB> wifi: AUTO: firmware\n");
++		wf_bus4 = true;
++		wf_fw();
++	}
++	if (!wf_fwup) {
++		ret = EIO;
++	} else {
++		ret = wf_join(k.ssid, k.sl, NULL, 0, k.sec ? k.pmk : NULL, false) ? 0 : ETIMEDOUT;
++	}
++	bzero(&k, sizeof(k));
++	return ret;
+ }
+ 
+ static void
+@@ -3491,6 +3672,7 @@
+ 	} else if (!strcmp(arg, "probe keep")) {
+ 		wf_probe(true);
+ 	} else if (!strcmp(arg, "off")) {
++		wf_auto_off = true;             /* 0178: off by hand stays off until the next join */
+ 		wf_off();
+ 	} else if (!strcmp(arg, "st")) {
+ 		wf_st();
+@@ -3534,6 +3716,12 @@
+ 		wf_join_cmd(arg + 5);
+ 	} else if (!strcmp(arg, "link")) {
+ 		wf_link_cmd();
++	} else if (!strcmp(arg, "forget")) {
++		wf_forget_cmd();
++	} else if (!strcmp(arg, "saved")) {
++		wf_saved_cmd();
++	} else if (!strcmp(arg, "auto")) {
++		printf("USB> wifi: AUTO: %d\n", wf_auto());
+ 	} else if (!strcmp(arg, "net")) {
+ 		wf_net_cmd();
+ 	} else if (!strcmp(arg, "dhcp")) {
+@@ -3559,7 +3747,7 @@
+ 	} else if (!strncmp(arg, "cr ", 3)) {
+ 		wf_rd_cmd(arg + 3, true);
+ 	} else {
+-		printf("USB> wifi: probe [keep] | off | st | fw | fw1 | ver | mac | scan | join SSIDHEX PASSHEX|- | link | net | dhcp | dm HEX|keep | con | fifo 0-3 | div N | rd ADDR [N] | wr ADDR VAL | cr FN ADDR\n");
++		printf("USB> wifi: probe [keep] | off | st | fw | fw1 | ver | mac | scan | join SSIDHEX PASSHEX|- [save] | forget | saved | auto | link | net | dhcp | dm HEX|keep | con | fifo 0-3 | div N | rd ADDR [N] | wr ADDR VAL | cr FN ADDR\n");
+ 	}
+ }
+ 
+@@ -3576,4 +3764,89 @@
+ 	lck_mtx_unlock(&wf_bus);
+ }
+ 
++/*
++ * 0178: for on7wifid (tools/on7wifid), root only. kern.on7xelte_wifi: write "auto", "net", "saved", "off" (the
++ * command in the caller's thread, under the bus lock; "auto" answers with its errno) or "log TEXT" (a line of
++ * the daemon's in the kernel log). kern.on7xelte_wifi_lease: the lease, for configd.
++ */
++struct on7_wifi_lease {
++	uint32_t ver, link, state, on_if, ip, mask, gw, dns, lease;
++	char ifname[16];
++};
++
++static int
++wf_sysctl_cmd SYSCTL_HANDLER_ARGS
++{
++#pragma unused(oidp, arg1, arg2)
++	char buf[96];
++	int err;
++
++	if (req->newptr == USER_ADDR_NULL) {
++		return SYSCTL_OUT(req, "", 1);
++	}
++	if (req->newlen == 0 || req->newlen >= sizeof(buf)) {
++		return EINVAL;
++	}
++	size_t n = req->newlen;
++	err = SYSCTL_IN(req, buf, n);
++	if (err) {
++		return err;
++	}
++	buf[n] = 0;
++	while (n && (buf[n - 1] == '\n' || buf[n - 1] == 0)) {
++		buf[--n] = 0;
++	}
++	if (!strncmp(buf, "log ", 4)) {
++		for (char *c = buf + 4; *c; c++) {
++			if (*c < 0x20 || *c >= 0x7f) {
++				*c = '?';
++			}
++		}
++		printf("USB> on7wifid: %s\n", buf + 4);
++		return 0;
++	}
++	if (!strcmp(buf, "auto")) {
++		lck_mtx_lock(&wf_bus);
++		err = wf_auto();
++		if (!wf_fwup) {
++			wf_net_link_set(false);
++		}
++		lck_mtx_unlock(&wf_bus);
++		return err;
++	}
++	if (!strcmp(buf, "net") || !strcmp(buf, "saved") || !strcmp(buf, "off")) {
++		on7xelte_wifi_cmd(buf);
++		return 0;
++	}
++	return EINVAL;
++}
++
++SYSCTL_PROC(_kern, OID_AUTO, on7xelte_wifi, CTLTYPE_STRING | CTLFLAG_RW | CTLFLAG_LOCKED, 0, 0, wf_sysctl_cmd, "A",
++    "on7xelte Wi-Fi: auto | net | saved | off | log TEXT");
++
++static int
++wf_sysctl_lease SYSCTL_HANDLER_ARGS
++{
++#pragma unused(oidp, arg1, arg2)
++	struct on7_wifi_lease l;
++
++	bzero(&l, sizeof(l));
++	l.ver = 1;
++	l.link = wf_net_link && wf_fwup;
++	l.state = wf_dh.state;
++	l.ip = wf_dh.ip;
++	l.mask = wf_dh.mask;
++	l.gw = wf_dh.gw;
++	l.dns = wf_dh.dns;
++	l.lease = wf_dh.lease;
++	l.on_if = wf_dh.ip != 0 && wf_dh.set_ip == wf_dh.ip;
++	if (wf_ifp) {
++		snprintf(l.ifname, sizeof(l.ifname), "%s%u", ifnet_name(wf_ifp), ifnet_unit(wf_ifp));
++	}
++	return SYSCTL_OUT(req, &l, sizeof(l));
++}
++
++SYSCTL_PROC(_kern, OID_AUTO, on7xelte_wifi_lease, CTLTYPE_OPAQUE | CTLFLAG_RD | CTLFLAG_LOCKED, 0, 0, wf_sysctl_lease,
++    "S,on7_wifi_lease", "on7xelte Wi-Fi: the DHCP lease");
++
+ #endif /* ARM64_BOARD_CONFIG_A5XELTE */

@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Apply the SWEET bring-up changes to an iOS root made by tools/mkiosroot.sh.
 
-  sudo sweet-root-tweaks.py MOUNTED_ROOT [--hal-plugin DIR] [--wifi-fw DIR]
+  sudo sweet-root-tweaks.py MOUNTED_ROOT [--hal-plugin DIR] [--wifi-fw DIR] [--wifid DIR]
 
 MOUNTED_ROOT is the HFS+ image mounted read-write (Linux: run
 `fsck.hfsplus -fy` on the image, then `mount -t hfsplus -o loop,force`).
@@ -34,6 +34,13 @@ screen (image versions v8-v14 in NOTES.md):
                   root-tweak.yml, never kept in this repository) as
                   /usr/share/firmware/wifi/on7xelte/{bcm43430a1-sdio.bin,
                   bcm43430a1-sdio.txt}, where the kernel reads them
+  wifi daemon     with --wifid DIR (on7xelte, xnu 0178): DIR/on7wifid
+                  (tools/on7wifid, signed with its entitlements) as
+                  /usr/local/bin/on7wifid and the launchd job
+                  com.on7xelte.wifid (root, at load, kept alive): auto-join
+                  of the saved network at boot and en0's DHCP lease + DNS in
+                  configd's store. Remove the job from launchd.plist (or copy
+                  launchd.plist.orig back) to turn it off
   MediaToolbox    StartRecorderServer=false (camera filter prewarm calls a
                   NULL OpenGL function without a GPU -> mediaserverd crash loop)
   SpringBoard     BKNoWatchdogs (one slow CPU path, no scene-create watchdog
@@ -182,6 +189,28 @@ def wifi_fw(root, fwdir):
         print('wifi firmware installed: %s (%d bytes)' % (out[len(root):], os.path.getsize(out)))
 
 
+def wifid(root, d):
+    bindir = os.path.join(root, 'usr/local/bin')
+    os.makedirs(bindir, exist_ok=True)
+    for x in (os.path.join(root, 'usr/local'), bindir):
+        os.chown(x, 0, 0)
+        os.chmod(x, 0o755)
+    exe = os.path.join(bindir, 'on7wifid')
+    shutil.copyfile(os.path.join(d, 'on7wifid'), exe)
+    os.chown(exe, 0, 0)
+    os.chmod(exe, 0o755)
+    path = os.path.join(root, 'System/Library/xpc/launchd.plist')
+    st = os.stat(path)
+    plist = load(path)
+    plist['LaunchDaemons']['/System/Library/LaunchDaemons/com.on7xelte.wifid.plist'] = {
+        'Label': 'com.on7xelte.wifid', 'ProgramArguments': ['/usr/local/bin/on7wifid'],
+        'RunAtLoad': True, 'KeepAlive': True, 'ThrottleInterval': 10, 'UserName': 'root',
+        'StandardOutPath': '/dev/null', 'StandardErrorPath': '/dev/null'}
+    save(path, plist, st.st_uid, st.st_gid, st.st_mode & 0o7777)
+    print('on7wifid installed: /usr/local/bin/on7wifid (%d bytes), launchd job com.on7xelte.wifid added'
+          % os.path.getsize(exe))
+
+
 def audio(root, plugdir=None):
     src = os.path.join(root, 'Library/Audio/Plug-Ins/HAL/VirtualAudio.plugin')
     dst_dir = os.path.join(root, 'Library/Audio/Plug-Ins/HAL.disabled')
@@ -201,10 +230,12 @@ def audio(root, plugdir=None):
 
 def main():
     args = sys.argv[1:]
-    plugdir = fwdir = None
-    while len(args) >= 3 and args[-2] in ('--hal-plugin', '--wifi-fw'):
+    plugdir = fwdir = wifiddir = None
+    while len(args) >= 3 and args[-2] in ('--hal-plugin', '--wifi-fw', '--wifid'):
         if args[-2] == '--hal-plugin':
             plugdir = args[-1]
+        elif args[-2] == '--wifid':
+            wifiddir = args[-1]
         else:
             fwdir = args[-1]
         args = args[:-2]
@@ -217,6 +248,8 @@ def main():
     audio(root, plugdir)
     if fwdir:
         wifi_fw(root, fwdir)
+    if wifiddir:
+        wifid(root, wifiddir)
     merge_pref(root, 'com.apple.migration', {
         'LastSystemVersion': BUILD,
         'DMUserDataDisposition': {'SyntheticDidUpgrade': False, 'buildVersion': BUILD}})

@@ -4,7 +4,10 @@
 on7xelte-usb-log.py through OUTDIR/join.txt, which it sends once to the
 phone as "wifi join SSIDHEX PASSHEX" and deletes. The logger, the kernel's
 echo and its dvfs lines show only "wifi join (hidden)". An empty password
-joins an open network. 0172 (on7xelte W5)."""
+joins an open network. 0172 (on7xelte W5). 0178: "save" (asked) keeps the
+network for auto-join at boot: the kernel stores its SSID and PMK (derived
+from the password, never the password itself) root only on the phone;
+"wifi forget" clears it."""
 import getpass, os, sys
 
 out = sys.argv[1] if len(sys.argv) > 1 else "."
@@ -14,7 +17,8 @@ if not ssid or len(ssid.encode()) > 32:
     sys.exit("SSID must be 1..32 bytes")
 if pw and not 8 <= len(pw.encode()) <= 63:
     sys.exit("WPA2 password must be 8..63 characters")
-line = "wifi join %s %s" % (ssid.encode().hex(), pw.encode().hex() if pw else "-")
+keep = input("Join automatically at boot (save the network on the phone)? [y/N]: ").strip().lower() in ("y", "yes", "e", "evet")
+line = "wifi join %s %s%s" % (ssid.encode().hex(), pw.encode().hex() if pw else "-", " save" if keep else "")
 tmp = os.path.join(out, "join.tmp")
 with open(tmp, "w", encoding="utf-8") as f:
     f.write(line + "\n")
