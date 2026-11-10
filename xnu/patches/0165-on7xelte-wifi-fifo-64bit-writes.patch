@@ -1,0 +1,29 @@
+--- a/bsd/dev/on7xelte_wifi.c
++++ b/bsd/dev/on7xelte_wifi.c
+@@ -573,8 +573,14 @@
+ 	wr32(wf_mmc, M_BLKSIZ, n);
+ 	wr32(wf_mmc, M_BYTCNT, n);
+ 	if (wr) {
+-		for (uint32_t i = 0; i < n / 4; i++) {
+-			wr32(wf_mmc, M_FIFO, buf[i]);
++		/*
++		 * 0165: HCON says this controller's FIFO is 64 bits wide (H_DATA_WIDTH 2); 32-bit stores never
++		 * reach it (0164: STATUS FIFO count 0, write never done). Push 64 bits at a time, as dw_mmc's
++		 * push_data64; a last odd word goes with zeros (BYTCNT says how much is sent).
++		 */
++		for (uint32_t i = 0; i < n / 4; i += 2) {
++			uint64_t v = buf[i] | ((i + 1 < n / 4) ? (uint64_t)buf[i + 1] << 32 : 0);
++			*(volatile uint64_t *)(wf_mmc + M_FIFO) = v;
+ 		}
+ 	}
+ 	wr32(wf_mmc, M_RINTSTS, 0xffffffffu);
+@@ -610,7 +616,8 @@
+ 		(void)wf_wr8(0, 0x06, (uint8_t)(fn & 7));       /* CCCR I/O abort of this function */
+ 		wr32(wf_mmc, M_RINTSTS, 0xffffffffu);
+ 		if (!quiet && wf_errs < 6) {
+-			printf("USB> wifi: CMD53 recovery: STATUS 0x%08x -> 0x%08x\n", stat, rd32(wf_mmc, M_STATUS));
++			printf("USB> wifi: CMD53 recovery: STATUS 0x%08x -> 0x%08x (HCON data width %u)\n", stat,
++			    rd32(wf_mmc, M_STATUS), (rd32(wf_mmc, M_HCON) >> 7) & 7);
+ 		}
+ 	}
+ 	if (quiet) {
