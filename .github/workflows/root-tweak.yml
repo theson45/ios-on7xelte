@@ -90,7 +90,7 @@ jobs:
           curl -fsSL --retry 5 -o work/wifi/nvram_net.txt "$V/nvram_net.txt"
           shasum -a 256 -c <<'SUMS'
           47ce52e9b2c5c39da006b79a1f35dfbd98cc1837e384b486ec581ea5703f850b  work/wifi/bcmdhd_sta.bin
-          cdbdb9a2341fa012933cf3e4c9b3c5e2eb4bc972ef8e40761819f84df1df6911  work/wifi/nvram_net.txt
+          61cba5c6a52e2265633ddcf480b246031944f3f3561c60adb3cc36efa508fb0f  work/wifi/nvram_net.txt
           SUMS
 
       - name: Apply the tweaks
