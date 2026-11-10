@@ -1,0 +1,362 @@
+--- a/bsd/conf/files
++++ b/bsd/conf/files
+@@ -111,6 +111,7 @@
+ bsd/dev/a5xelte_usb.c			standard
+ bsd/dev/a5xelte_dvfs.c			standard
+ bsd/dev/on7xelte_input.c		standard
++bsd/dev/on7xelte_audio.c		standard
+ bsd/dev/sweet_sample.c			standard
+ bsd/dev/sweet_keys.c			standard
+ bsd/dev/sweet_touch.c			standard
+--- a/bsd/dev/a5xelte_dvfs.c
++++ b/bsd/dev/a5xelte_dvfs.c
+@@ -1861,6 +1861,19 @@
+ 	return true;
+ }
+ 
++/* 0158: on7xelte_audio.c (/dev/redwood-audio) brings the speaker path up and down through the worker. */
++bool
++a5xelte_aud_running(void)
++{
++	return __atomic_load_n(&au_on, __ATOMIC_ACQUIRE);
++}
++
++bool
++a5xelte_aud_request(bool on)
++{
++	return !dv.busy && dv_post("aud", on ? "on" : "off");
++}
++
+ /* on7xelte_input.c, once after boot: false = busy, ask again later */
+ bool
+ a5xelte_rtc_boot(void)
+--- a/bsd/dev/a5xelte_emmc.c
++++ b/bsd/dev/a5xelte_emmc.c
+@@ -1680,6 +1680,10 @@
+ 		    emmc_partition_name, emmc_writable ? "writable" : "read-only");
+ 		emmc_log_start();
+ 		a5xelte_usb_start();
++		{
++			extern void on7xelte_audio_init(void);  /* 0158: /dev/redwood-audio */
++			on7xelte_audio_init();
++		}
+ 	}
+ 	*dev = emmc_bdev;
+ 	return 0;
+--- /dev/null
++++ b/bsd/dev/on7xelte_audio.c
+@@ -0,0 +1,314 @@
++/*
++ * 0158: /dev/redwood-audio on the J7 Prime (on7xelte, Exynos 7870).
++ *
++ * The RedwoodAudio HAL plug-in (mediaserverd) writes what iOS has mixed here: 16-bit signed
++ * little-endian stereo frames at 48 kHz, never blocking (the writer is the audio server's
++ * real-time thread and paces itself).  ioctl _IOW('r', 1, {below, muted}) sets the volume as
++ * eighths of a dB under the loudest.  Same interface as ios-b0s / y2sios sys/redwood_audio.h.
++ *
++ * The path (0156/0157, a5xelte_dvfs.c "aud on"): LDO25 -> I2S0 (0x148A0000, 48 kHz, 16-bit
++ * stereo, BCLK 64 fs) -> s1402x mixer -> cod3026x speaker amplifier.  There is no DMA yet: the
++ * frames go into a ring here and one high-priority kernel thread moves them into the I2S TX
++ * FIFO by PIO (64 frames deep = 1.33 ms), waking every 500 us.  While nothing is written it
++ * keeps the FIFO full of silence; 3 s after the last write it asks the dvfs worker for
++ * "aud off", and on the next write for "aud on" (the worker owns the I2C bus).
++ *
++ * Volume is applied here in software (Q16 gain); the codec stays at Android's speaker level.
++ * "USB> raud:" lines count frames, drops (ring full) and FIFO underruns per stretch of sound.
++ */
++#include <sys/param.h>
++#include <sys/systm.h>
++#include <sys/conf.h>
++#include <sys/errno.h>
++#include <sys/proc.h>
++#include <sys/uio.h>
++#include <sys/ioccom.h>
++#include <miscfs/devfs/devfs.h>
++#include <kern/locks.h>
++#include <kern/clock.h>
++#include <kern/thread.h>
++#include <kern/sched_prim.h>
++#include <mach/mach_time.h>
++#include <machine/machine_routines.h>
++#include <libkern/libkern.h>
++#include <pexpert/pexpert.h>
++
++#if defined(ARM64_BOARD_CONFIG_A5XELTE)
++
++extern vm_offset_t ml_io_map(vm_offset_t phys_addr, vm_size_t size);
++extern kern_return_t kernel_thread_start_priority(thread_continue_t, void *, integer_t, thread_t *);
++extern void thread_deallocate(thread_t);
++extern bool a5xelte_aud_running(void);          /* a5xelte_dvfs.c */
++extern bool a5xelte_aud_request(bool on);       /* a5xelte_dvfs.c: false if the worker is busy */
++
++#define RA_RATE         48000u
++#define RA_FRAME        4u
++#define RA_RING         8192u                   /* frames, power of two: 170 ms */
++#define RA_PREFILL      1024u                   /* frames kept when the hardware comes up */
++#define RA_IDLE_MS      3000u
++#define RA_WAKE_US      500u
++#define RA_CHUNK        512u
++
++#define I2S_PA          0x148A0000u
++#define I2S_CON         0x00
++#define I2S_TXD         0x10
++#define I2S_CON_TXUR    (1u << 17)
++#define I2S_CON_TXFULL  (1u << 8)
++#define I2S_CON_ACTIVE  (1u << 0)
++
++struct redwood_audio_volume {
++	uint32_t below;                 /* eighths of a dB */
++	uint32_t muted;
++};
++#define REDWOOD_AUDIO_SET_VOLUME _IOW('r', 1, struct redwood_audio_volume)
++
++static LCK_GRP_DECLARE(ra_lck_grp, "redwood-audio");
++static LCK_MTX_DECLARE(ra_lock, &ra_lck_grp);   /* writers against each other */
++
++static uint32_t ra_ring[RA_RING];
++static volatile uint32_t ra_head, ra_tail;      /* head: written by write(); tail: by the feeder */
++static volatile uint32_t ra_gain = 65536;       /* Q16 */
++static volatile uint64_t ra_last_write;         /* mach_absolute_time() */
++static volatile uint32_t ra_wanted;             /* write() since the feeder last looked */
++static volatile vm_offset_t ra_i2s;
++
++/* per stretch of sound */
++static volatile uint32_t ra_frames, ra_dropped;
++static uint32_t ra_underruns, ra_silent;
++
++static uint32_t
++ra_gain_for(uint32_t below, bool muted)
++{
++	uint64_t g = 65536;
++	if (muted) {
++		return 0;
++	}
++	if (below > 8 * 96) {
++		return 0;
++	}
++	for (uint32_t i = 0; i < below; i++) {
++		g = (g * 64604u) >> 16;         /* 10^(-1/160) = 0.98578 */
++	}
++	return (uint32_t)g;
++}
++
++static int
++ra_open(__unused dev_t dev, __unused int flags, __unused int devtype, __unused struct proc *p)
++{
++	return 0;
++}
++
++static int
++ra_close(__unused dev_t dev, __unused int flags, __unused int devtype, __unused struct proc *p)
++{
++	return 0;
++}
++
++static int
++ra_write(__unused dev_t dev, struct uio *uio, __unused int ioflag)
++{
++	uint32_t buf[RA_CHUNK];
++	int error = 0;
++
++	lck_mtx_lock(&ra_lock);
++	while (uio_resid(uio) >= (user_ssize_t)RA_FRAME) {
++		user_ssize_t bytes = uio_resid(uio);
++		if (bytes > (user_ssize_t)sizeof(buf)) {
++			bytes = sizeof(buf);
++		}
++		bytes -= bytes % RA_FRAME;
++		error = uiomove((caddr_t)buf, (int)bytes, uio);
++		if (error) {
++			break;
++		}
++		uint32_t n = (uint32_t)(bytes / RA_FRAME);
++		uint32_t head = ra_head, tail = __atomic_load_n(&ra_tail, __ATOMIC_ACQUIRE);
++		uint32_t room = RA_RING - (head - tail);
++		uint32_t take = n < room ? n : room;
++		for (uint32_t i = 0; i < take; i++) {
++			ra_ring[(head + i) & (RA_RING - 1)] = buf[i];
++		}
++		__atomic_store_n(&ra_head, head + take, __ATOMIC_RELEASE);
++		ra_frames += n;
++		ra_dropped += n - take;
++	}
++	ra_last_write = mach_absolute_time();
++	ra_wanted = 1;
++	lck_mtx_unlock(&ra_lock);
++	return error;
++}
++
++static int
++ra_ioctl(__unused dev_t dev, u_long cmd, caddr_t data, __unused int flags, __unused struct proc *p)
++{
++	const struct redwood_audio_volume *v = (const struct redwood_audio_volume *)data;
++	if (cmd != REDWOOD_AUDIO_SET_VOLUME) {
++		return ENOTTY;
++	}
++	ra_gain = ra_gain_for(v->below, v->muted != 0);
++	printf("USB> raud: volume %s%u.%03u dB under the loudest (gain 0x%x)\n", v->muted ? "muted; " : "",
++	    v->below / 8, v->below % 8 * 125, ra_gain);
++	return 0;
++}
++
++static const struct cdevsw ra_cdevsw = {
++	.d_open = ra_open, .d_close = ra_close, .d_read = eno_rdwrt, .d_write = ra_write,
++	.d_ioctl = ra_ioctl, .d_stop = eno_stop, .d_reset = eno_reset, .d_select = eno_select,
++	.d_mmap = eno_mmap, .d_strategy = eno_strat, .d_type = 0
++};
++
++static inline uint32_t
++ra_scale(uint32_t w, uint32_t g)
++{
++	if (g == 65536) {
++		return w;
++	}
++	int32_t l = (int16_t)(w & 0xffff), r = (int16_t)(w >> 16);
++	l = (int32_t)(((int64_t)l * g) >> 16);
++	r = (int32_t)(((int64_t)r * g) >> 16);
++	return ((uint32_t)l & 0xffffu) | ((uint32_t)r << 16);
++}
++
++static void
++ra_sleep_us(uint32_t us)
++{
++	uint64_t deadline;
++	clock_interval_to_deadline(us, NSEC_PER_USEC, &deadline);
++	(void)assert_wait_deadline((event_t)&ra_wanted, THREAD_UNINT, deadline);
++	thread_block(THREAD_CONTINUE_NULL);
++}
++
++static uint64_t
++ra_ms_since(uint64_t t)
++{
++	uint64_t ns = 0;
++	absolutetime_to_nanoseconds(mach_absolute_time() - t, &ns);
++	return ns / NSEC_PER_MSEC;
++}
++
++static void
++ra_report(void)
++{
++	printf("USB> raud: stretch done: %u frames (%u ms), dropped %u, underruns %u\n",
++	    ra_frames, ra_frames / (RA_RATE / 1000), ra_dropped, ra_underruns);
++	ra_frames = ra_dropped = 0;
++	ra_underruns = 0;
++}
++
++static void
++ra_feeder(void *a __unused, wait_result_t w __unused)
++{
++	enum { IDLE, STARTING, PLAYING, STOPPING } st = IDLE;
++	uint64_t t_state = 0;
++	vm_offset_t i2s = ra_i2s;
++
++	for (;;) {
++		switch (st) {
++		case IDLE:
++			if (!ra_wanted) {
++				ra_sleep_us(20000);
++				break;
++			}
++			ra_wanted = 0;
++			if (a5xelte_aud_running() || a5xelte_aud_request(true)) {
++				printf("USB> raud: sound -> starting the speaker path\n");
++				st = STARTING;
++				t_state = mach_absolute_time();
++			} else {
++				ra_wanted = 1;          /* worker busy: again shortly */
++				ra_sleep_us(50000);
++			}
++			break;
++		case STARTING:
++			if (a5xelte_aud_running()) {
++				/* keep only the newest RA_PREFILL frames: low latency from the start */
++				uint32_t head = __atomic_load_n(&ra_head, __ATOMIC_ACQUIRE), tail = ra_tail;
++				if (head - tail > RA_PREFILL) {
++					__atomic_store_n(&ra_tail, head - RA_PREFILL, __ATOMIC_RELEASE);
++				}
++				ra_silent = 0;
++				st = PLAYING;
++				break;
++			}
++			if (ra_ms_since(t_state) > 2000) {
++				printf("USB> raud: speaker path did not come up\n");
++				st = IDLE;
++				break;
++			}
++			ra_sleep_us(5000);
++			break;
++		case PLAYING: {
++			if (!a5xelte_aud_running()) {
++				/* someone ran "aud off" (or tone) by hand */
++				ra_report();
++				st = IDLE;
++				break;
++			}
++			uint32_t g = ra_gain, fed = 0;
++			while (!(*(volatile uint32_t *)(i2s + I2S_CON) & I2S_CON_TXFULL)) {
++				uint32_t head = __atomic_load_n(&ra_head, __ATOMIC_ACQUIRE), tail = ra_tail, wv = 0;
++				if (head != tail) {
++					wv = ra_scale(ra_ring[tail & (RA_RING - 1)], g);
++					__atomic_store_n(&ra_tail, tail + 1, __ATOMIC_RELEASE);
++					fed++;
++				}
++				*(volatile uint32_t *)(i2s + I2S_TXD) = wv;
++			}
++			uint32_t con = *(volatile uint32_t *)(i2s + I2S_CON);
++			if (con & I2S_CON_TXUR) {
++				ra_underruns++;
++				*(volatile uint32_t *)(i2s + I2S_CON) = con;    /* write 1 to clear */
++			}
++			if (fed == 0 && ra_ms_since(ra_last_write) > RA_IDLE_MS) {
++				st = STOPPING;
++				break;
++			}
++			ra_sleep_us(RA_WAKE_US);
++			break;
++		}
++		case STOPPING:
++			if (a5xelte_aud_request(false)) {
++				ra_report();
++				ra_wanted = 0;
++				/* wait for the worker to finish "aud off" */
++				for (uint32_t i = 0; i < 100 && a5xelte_aud_running(); i++) {
++					ra_sleep_us(10000);
++				}
++				st = IDLE;
++			} else {
++				/* worker busy: keep the FIFO fed a little longer */
++				st = PLAYING;
++				ra_sleep_us(RA_WAKE_US);
++			}
++			break;
++		}
++	}
++}
++
++/* From a5xelte_emmc.c once devfs is up (before the root is mounted). */
++void
++on7xelte_audio_init(void)
++{
++	uint32_t off = 0;
++	thread_t th;
++
++	if (PE_parse_boot_argn("raud_off", &off, sizeof(off)) && off) {
++		printf("USB> raud: disabled by boot-arg raud_off\n");
++		return;
++	}
++	ra_i2s = ml_io_map(I2S_PA, 0x1000);
++	int major = cdevsw_add(-1, &ra_cdevsw);
++	if (ra_i2s == 0 || major < 0 ||
++	    devfs_make_node(makedev(major, 0), DEVFS_CHAR, UID_ROOT, GID_WHEEL, 0666, "redwood-audio") == NULL) {
++		printf("USB> raud: cannot create /dev/redwood-audio\n");
++		return;
++	}
++	if (kernel_thread_start_priority(ra_feeder, NULL, 95, &th) != KERN_SUCCESS) {
++		printf("USB> raud: no feeder thread\n");
++		return;
++	}
++	thread_deallocate(th);
++	printf("USB> raud: /dev/redwood-audio ready (major %d), PIO feeder every %u us\n", major, RA_WAKE_US);
++}
++
++#endif /* ARM64_BOARD_CONFIG_A5XELTE */
