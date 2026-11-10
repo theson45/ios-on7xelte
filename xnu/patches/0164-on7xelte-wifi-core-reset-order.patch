@@ -1,0 +1,146 @@
+--- a/bsd/dev/on7xelte_wifi.c
++++ b/bsd/dev/on7xelte_wifi.c
+@@ -601,6 +601,18 @@
+ 	}
+ 	return true;
+ bad:
++	{
++		uint32_t stat = rd32(wf_mmc, M_STATUS);
++		wr32(wf_mmc, M_CTRL, rd32(wf_mmc, M_CTRL) | CTRL_RESETS);
++		(void)wf_wait_clear(M_CTRL, CTRL_RESETS, 100000);
++		wr32(wf_mmc, M_RINTSTS, 0xffffffffu);
++		(void)wf_clk_update();
++		(void)wf_wr8(0, 0x06, (uint8_t)(fn & 7));       /* CCCR I/O abort of this function */
++		wr32(wf_mmc, M_RINTSTS, 0xffffffffu);
++		if (!quiet && wf_errs < 6) {
++			printf("USB> wifi: CMD53 recovery: STATUS 0x%08x -> 0x%08x\n", stat, rd32(wf_mmc, M_STATUS));
++		}
++	}
+ 	if (quiet) {
+ 		return false;
+ 	}
+@@ -648,6 +660,9 @@
+ static bool
+ wf_bp(uint32_t addr, bool wr, uint32_t *buf, uint32_t n)
+ {
++	if (wf_bad) {
++		return false;   /* 0164: fail fast after the first error */
++	}
+ 	return wf_setwin(addr) && wf_cmd53(1, (addr & SB_OFT_MASK) | SB_ACCESS_4B, wr, buf, n);
+ }
+ 
+@@ -775,14 +790,6 @@
+ 	}
+ }
+ 
+-static void
+-wf_spin_status(struct wf_core *c)
+-{
+-	for (uint32_t t = 0; t < 300 && wf_rd32(c->wrap + AI_RESETSTATUS) != 0; t++) {
+-		delay(1);
+-	}
+-}
+-
+ static bool
+ wf_core_up(struct wf_core *c)
+ {
+@@ -791,38 +798,40 @@
+ }
+ 
+ static void
+-wf_core_disable(struct wf_core *c, uint32_t bits)
++wf_core_disable(struct wf_core *c, uint32_t prereset, uint32_t reset)
+ {
+-	if (wf_rd32(c->wrap + AI_RESETCTRL) & 1) {
+-		return;
++	if (!(wf_rd32(c->wrap + AI_RESETCTRL) & 1)) {
++		wf_wr32(c->wrap + AI_IOCTRL, prereset | SICF_FGC | SICF_CLOCK_EN);
++		(void)wf_rd32(c->wrap + AI_IOCTRL);
++		wf_wr32(c->wrap + AI_RESETCTRL, 1);
++		delay(20);
++		for (uint32_t t = 0; t < 300 && !wf_bad && wf_rd32(c->wrap + AI_RESETCTRL) != 1; t++) {
++			delay(1);
++		}
+ 	}
+-	wf_spin_status(c);
+-	wf_wr32(c->wrap + AI_RESETCTRL, 1);
+-	(void)wf_rd32(c->wrap + AI_RESETCTRL);
+-	delay(1);
+-	wf_wr32(c->wrap + AI_IOCTRL, bits);
++	wf_wr32(c->wrap + AI_IOCTRL, reset | SICF_FGC | SICF_CLOCK_EN);
+ 	(void)wf_rd32(c->wrap + AI_IOCTRL);
+-	delay(10);
+ }
+ 
+ static void
+-wf_core_reset(struct wf_core *c, uint32_t bits, uint32_t resetbits)
++wf_core_reset(struct wf_core *c, uint32_t prereset, uint32_t reset, uint32_t postreset)
+ {
+-	wf_spin_status(c);
+-	wf_wr32(c->wrap + AI_RESETCTRL, 1);
+-	delay(10);
+-	wf_spin_status(c);
+-	wf_wr32(c->wrap + AI_IOCTRL, bits | resetbits | SICF_FGC | SICF_CLOCK_EN);
+-	(void)wf_rd32(c->wrap + AI_IOCTRL);
+-	wf_spin_status(c);
+-	for (uint32_t n = 10; wf_rd32(c->wrap + AI_RESETCTRL) != 0 && n && !wf_bad; n--) {
+-		wf_spin_status(c);
++	wf_core_disable(c, prereset, reset);
++	for (uint32_t n = 0; n < 50 && !wf_bad && (wf_rd32(c->wrap + AI_RESETCTRL) & 1); n++) {
+ 		wf_wr32(c->wrap + AI_RESETCTRL, 0);
+-		wf_spin_status(c);
++		delay(50);
+ 	}
+-	wf_wr32(c->wrap + AI_IOCTRL, bits | SICF_CLOCK_EN);
++	wf_wr32(c->wrap + AI_IOCTRL, postreset | SICF_CLOCK_EN);
+ 	(void)wf_rd32(c->wrap + AI_IOCTRL);
+-	delay(1);
++}
++
++/* 0164: one line on a core's wrapper state */
++static void
++wf_core_show(const char *what, struct wf_core *c)
++{
++	printf("USB> wifi: %s: core 0x%03x ioctrl 0x%08x resetctrl 0x%08x resetstatus 0x%08x%s\n", what, c->id,
++	    wf_rd32(c->wrap + AI_IOCTRL), wf_rd32(c->wrap + AI_RESETCTRL), wf_rd32(c->wrap + AI_RESETSTATUS),
++	    wf_bad ? " (access failed)" : "");
+ }
+ 
+ /* a file of the root, whole, in memory of ours (as y2sios redwood_adsp.c root_file) */
+@@ -986,15 +995,23 @@
+ 		goto off;
+ 	}
+ 	wf_erom();
+-	struct wf_core *cm3 = wf_core(CORE_CM3), *sr = wf_core(CORE_SOCRAM), *sd = wf_core(CORE_SDIOD);
+-	if (wf_bad || !cm3 || !sr || !sd) {
++	struct wf_core *cm3 = wf_core(CORE_CM3), *sr = wf_core(CORE_SOCRAM), *sd = wf_core(CORE_SDIOD),
++	    *d11 = wf_core(CORE_D11);
++	if (wf_bad || !cm3 || !sr || !sd || !d11) {
+ 		printf("USB> wifi: ARM CM3 / SOCRAM / SDIO core not all found\n");
+ 		goto off;
+ 	}
+ 
+ 	/* download state: ARM disabled, SOCRAM reset, its size, bank 3 remap off, the top word cleared */
+-	wf_core_disable(cm3, 0);
+-	wf_core_reset(sr, 0, 0);
++	wf_core_show("before", cm3);
++	wf_core_show("before", d11);
++	wf_core_show("before", sr);
++	wf_core_disable(cm3, 0, 0);
++	wf_core_show("ARM disabled", cm3);
++	wf_core_reset(d11, 0x8u | 0x4u, 0x4u, 0x4u);  /* D11 PHYRESET | PHYCLOCKEN, then PHYCLOCKEN */
++	wf_core_show("D11 reset", d11);
++	wf_core_reset(sr, 0, 0, 0);
++	wf_core_show("SOCRAM reset", sr);
+ 	uint32_t ci = wf_rd32(sr->base + SR_COREINFO), nb = (ci >> 4) & 0xf, ramsize = 0;
+ 	for (uint32_t b = 0; b < nb; b++) {
+ 		wf_wr32(sr->base + SR_BANKIDX, b);
+@@ -1052,7 +1069,7 @@
+ 		goto off;
+ 	}
+ 	wf_wr32(sd->base + SD_INTSTATUS, 0xffffffffu);
+-	wf_core_reset(cm3, 0, 0);
++	wf_core_reset(cm3, 0, 0, 0);
+ 	printf("USB> wifi: ARM released (%s)\n", wf_core_up(cm3) ? "up" : "NOT up");
+ 	if (wf_bad) {
+ 		goto off;
