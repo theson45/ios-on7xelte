@@ -1,0 +1,82 @@
+--- a/bsd/dev/on7xelte_wifi.c
++++ b/bsd/dev/on7xelte_wifi.c
+@@ -513,6 +513,7 @@
+ #define CMD_WRITE       (1u << 10)
+ #define RINT_DTO        (1u << 3)
+ #define RINT_TXDR       (1u << 4)
++#define RINT_RXDR       (1u << 5)
+ #define RINT_DERR       ((1u << 7) | (1u << 9) | (1u << 10) | (1u << 11) | (1u << 13) | (1u << 15))
+ #define SB_ACCESS_4B    0x8000u
+ #define SB_OFT_MASK     0x7fffu
+@@ -591,6 +592,21 @@
+ 	}
+ }
+ 
++/* 0171: up to max FIFO entries into buf[got..nw), each as 0x200 (low) then 0x204 (high); returns the new got */
++static uint32_t
++wf_fifo_take(uint32_t *buf, uint32_t got, uint32_t nw, uint32_t max)
++{
++	for (uint32_t e = 0; e < max && got < nw; e++) {
++		buf[got] = rd32(wf_mmc, M_FIFO);
++		uint32_t hi = rd32(wf_mmc, M_FIFO + 4);
++		if (got + 1 < nw) {
++			buf[got + 1] = hi;
++		}
++		got += 2;
++	}
++	return got;
++}
++
+ static bool
+ wf_cmd53_once(uint32_t fn, uint32_t addr, bool wr, uint32_t *buf, uint32_t n, bool quiet)
+ {
+@@ -630,13 +646,17 @@
+ 				fc++;
+ 			}
+ 			pre = rd32(wf_mmc, M_STATUS);
+-			if (!quiet && wf_errs < 6) {
+-				printf("USB> wifi: TXDR push (mode %u): STATUS 0x%08x -> 0x%08x, RINTSTS 0x%08x\n", wf_fifo_mode,
+-				    before, pre, rd32(wf_mmc, M_RINTSTS));
+-			}
++			(void)before;
+ 			wr32(wf_mmc, M_RINTSTS, RINT_TXDR);
+ 			continue;
+ 		}
++		if (!wr && wf_fifo_mode == 1 && sent < nw && (st & RINT_RXDR)) {
++			/* 0171: as dw_mci_read_data_pio on RXDR: take what the FIFO holds (entries of 64 bits) */
++			uint32_t fc = (rd32(wf_mmc, M_STATUS) >> 17) & 0x1fff;
++			sent = wf_fifo_take(buf, sent, nw, fc);
++			wr32(wf_mmc, M_RINTSTS, RINT_RXDR);
++			continue;
++		}
+ 		if ((st & RINT_DTO) || (st & (RINT_HLE | RINT_DERR)) ||
+ 		    ((st & RINT_CMD_DONE) && (st & (RINT_RE | RINT_RTO | RINT_RCRC)))) {
+ 			break;
+@@ -649,14 +669,8 @@
+ 		goto bad;
+ 	}
+ 	if (!wr && wf_fifo_mode == 1) {
+-		/* 0169: a 64-bit FIFO entry read as two 32-bit halves, 0x200 then 0x204 (as written) */
+-		for (uint32_t i = 0; i < nw; i += 2) {
+-			buf[i] = rd32(wf_mmc, M_FIFO);
+-			uint32_t hi = rd32(wf_mmc, M_FIFO + 4);
+-			if (i + 1 < nw) {
+-				buf[i + 1] = hi;
+-			}
+-		}
++		/* 0169: a 64-bit FIFO entry read as two 32-bit halves, 0x200 then 0x204; 0171: the rest after DTO */
++		sent = wf_fifo_take(buf, sent, nw, 64);
+ 	} else if (!wr) {
+ 		for (uint32_t i = 0; i < n / 4; i++) {
+ 			buf[i] = rd32(wf_mmc, M_FIFO);
+@@ -1676,8 +1690,8 @@
+ 		ssid[k] = (b[19 + k] >= 0x20 && b[19 + k] < 0x7f) ? (char)b[19 + k] : '?';
+ 	}
+ 	ssid[sl] = 0;
+-	uint32_t chanspec = (uint32_t)b[71] | ((uint32_t)b[72] << 8);
+-	int rssi = (int16_t)(b[76] | (b[77] << 8));
++	uint32_t chanspec = (uint32_t)b[72] | ((uint32_t)b[73] << 8);    /* 0171: struct is not packed */
++	int rssi = (int16_t)(b[78] | (b[79] << 8));
+ 	printf("USB> wifi: AP %02x:%02x:%02x:%02x:%02x:%02x ch %u rssi %d \"%s\"\n", bssid[0], bssid[1], bssid[2],
+ 	    bssid[3], bssid[4], bssid[5], chanspec & 0xff, rssi, ssid);
+ }
