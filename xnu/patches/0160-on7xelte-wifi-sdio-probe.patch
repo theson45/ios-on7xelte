@@ -1,0 +1,514 @@
+--- a/bsd/conf/files
++++ b/bsd/conf/files
+@@ -112,6 +112,7 @@
+ bsd/dev/a5xelte_dvfs.c			standard
+ bsd/dev/on7xelte_input.c		standard
+ bsd/dev/on7xelte_audio.c		standard
++bsd/dev/on7xelte_wifi.c			standard
+ bsd/dev/sweet_sample.c			standard
+ bsd/dev/sweet_keys.c			standard
+ bsd/dev/sweet_touch.c			standard
+--- a/bsd/dev/a5xelte_dvfs.c
++++ b/bsd/dev/a5xelte_dvfs.c
+@@ -1693,6 +1693,8 @@
+ 	}
+ }
+ 
++extern void on7xelte_wifi_cmd(const char *arg);       /* 0160: on7xelte_wifi.c */
++
+ static void
+ dv_run(const char *cmd, const char *arg)
+ {
+@@ -1700,6 +1702,10 @@
+ 		reg_run(arg);
+ 		return;
+ 	}
++	if (!strcmp(cmd, "wifi")) {
++		on7xelte_wifi_cmd(arg);
++		return;
++	}
+ 	if (!dv_map()) {
+ 		return;
+ 	}
+@@ -1854,7 +1860,7 @@
+ a5xelte_dvfs_command(const char *cmd, const char *arg)
+ {
+ 	if (strcmp(cmd, "temp") && strcmp(cmd, "pmic") && strcmp(cmd, "cpufreq") && strcmp(cmd, "reg") &&
+-	    strcmp(cmd, "time") && strcmp(cmd, "codec") && strcmp(cmd, "aud")) {
++	    strcmp(cmd, "time") && strcmp(cmd, "codec") && strcmp(cmd, "aud") && strcmp(cmd, "wifi")) {
+ 		return false;
+ 	}
+ 	dv_post(cmd, arg);
+--- /dev/null
++++ b/bsd/dev/on7xelte_wifi.c
+@@ -0,0 +1,470 @@
++/*
++ * 0160: Wi-Fi of the J7 Prime (on7xelte), step W2: the BCM43430A1 seen as an SDIO card.
++ *
++ * The radio sits on the SoC's second DesignWare MSHC (dwmmc1, 0x13550000, 4-bit SDIO), powered by
++ * WLAN_REG_ON (gpd3-6); its pins are gpr2-0/1 (clock, command) and gpr3-0..3 (data).  Nothing of this
++ * is touched at boot: only the USB command "wifi" (run by the dvfs worker, a5xelte_dvfs.c) does it.
++ *
++ *   wifi probe   pins to SD, REG_ON high, dwmmc1 from reset at <= 400 kHz, the card's SDIO enumeration
++ *                (CMD0, CMD5, CMD3, CMD7), CCCR read, function 1 enabled, the ALP clock asked for, and
++ *                the chip's ID read from the backplane (chipcommon 0x18000000) with CMD52; then
++ *                everything off again (REG_ON low, controller unpowered) unless "wifi probe keep"
++ *   wifi off     REG_ON low, controller clock and power off
++ *   wifi st      the controller's and the pins' registers
++ *
++ * Linux references: drivers/mmc/core/sdio*.c (enumeration), drivers/mmc/host/dw_mmc.c + dw_mmc-exynos.c
++ * (the host; CLKSEL from the DT's samsung,dw-mshc-sdr-timing <3 0 2 0>), brcmfmac sdio.c/bcmsdh.c
++ * (SBSDIO_FUNC1_* window and clock-control registers), dhd_custom_exynos.c (REG_ON).
++ * Every wait is bounded; every step says what it did as "USB> wifi: ...".
++ */
++#include <sys/param.h>
++#include <sys/systm.h>
++#include <kern/clock.h>
++#include <machine/machine_routines.h>
++#include <libkern/libkern.h>
++
++#if defined(ARM64_BOARD_CONFIG_A5XELTE)
++
++extern vm_offset_t ml_io_map(vm_offset_t phys_addr, vm_size_t size);
++
++#define WF_MMC_PA       0x13550000u
++#define WF_PINR_PA      0x13750000u     /* gpr2 at +0x40, gpr3 at +0x60 */
++#define WF_PIND_PA      0x139B0000u     /* gpd3 at +0x140 */
++
++/* DW MSHC */
++#define M_CTRL          0x000u
++#define M_PWREN         0x004u
++#define M_CLKDIV        0x008u
++#define M_CLKSRC        0x00cu
++#define M_CLKENA        0x010u
++#define M_TMOUT         0x014u
++#define M_CTYPE         0x018u
++#define M_INTMASK       0x024u
++#define M_CMDARG        0x028u
++#define M_CMD           0x02cu
++#define M_RESP0         0x030u
++#define M_RINTSTS       0x044u
++#define M_STATUS        0x048u
++#define M_FIFOTH        0x04cu
++#define M_VERID         0x06cu
++#define M_HCON          0x070u
++#define M_CLKSEL        0x0a8u
++
++#define CTRL_RESETS     0x7u            /* controller, FIFO, DMA */
++#define CMD_START       (1u << 31)
++#define CMD_HOLD        (1u << 29)
++#define CMD_UPD_CLK     (1u << 21)
++#define CMD_INIT        (1u << 15)
++#define CMD_WAIT_PRV    (1u << 13)
++#define CMD_CRC         (1u << 8)
++#define CMD_RESP        (1u << 6)
++#define RINT_CMD_DONE   (1u << 2)
++#define RINT_RE         (1u << 1)
++#define RINT_RCRC       (1u << 6)
++#define RINT_RTO        (1u << 8)
++#define RINT_HLE        (1u << 12)
++
++/* Exynos CLKSEL: DIVIDER(3) | DRIVE(2) | SAMPLE(0), as dw_mmc-exynos makes of <3 0 2 0> */
++#define WF_CLKSEL       ((3u << 24) | (2u << 16) | 0u)
++#define WF_CLKDIV_SLOW  255u            /* cclk_in / 510: <= 400 kHz for any cclk_in up to 200 MHz */
++
++/* GPIO bank registers (bank_type_4: CON 4b, DAT 1b, PUD 2b, DRV 3b, CONPDN 2b, PUDPDN 2b) */
++#define G_CON           0x00u
++#define G_DAT           0x04u
++#define G_PUD           0x08u
++#define G_DRV           0x0cu
++#define G_CONPDN        0x10u
++#define G_PUDPDN        0x14u
++#define GPR2            0x040u
++#define GPR3            0x060u
++#define GPD3            0x140u
++#define REG_ON_PIN      6u
++
++/* brcmfmac's function-1 registers */
++#define SB_SBADDRLOW    0x1000au
++#define SB_SBADDRMID    0x1000bu
++#define SB_SBADDRHIGH   0x1000cu
++#define SB_CHIPCLKCSR   0x1000eu
++#define SB_SDIOPULLUP   0x1000fu
++#define CLK_FORCE_ALP   0x01u
++#define CLK_ALP_REQ     0x08u
++#define CLK_HW_OFF      0x20u
++#define CLK_ALP_AVAIL   0x40u
++#define SI_ENUM_BASE    0x18000000u
++
++static vm_offset_t wf_mmc, wf_pinr, wf_pind;
++
++static inline uint32_t
++rd32(vm_offset_t b, uint32_t off)
++{
++	return *(volatile uint32_t *)(b + off);
++}
++
++static inline void
++wr32(vm_offset_t b, uint32_t off, uint32_t v)
++{
++	*(volatile uint32_t *)(b + off) = v;
++}
++
++static void
++fld(vm_offset_t b, uint32_t off, uint32_t pin, uint32_t width, uint32_t val)
++{
++	uint32_t m = ((1u << width) - 1u) << (pin * width);
++	wr32(b, off, (rd32(b, off) & ~m) | ((val << (pin * width)) & m));
++}
++
++static bool
++wf_map(void)
++{
++	if (!wf_mmc) {
++		wf_mmc = ml_io_map(WF_MMC_PA, 0x2000);
++		wf_pinr = ml_io_map(WF_PINR_PA, 0x1000);
++		wf_pind = ml_io_map(WF_PIND_PA, 0x1000);
++	}
++	if (!wf_mmc || !wf_pinr || !wf_pind) {
++		printf("USB> wifi: could not map the registers\n");
++		return false;
++	}
++	return true;
++}
++
++static void
++wf_regon(bool on)
++{
++	/* gpd3-6: output, no pull, drive 3 (as cfg_wlanen), keeps its level in power-down */
++	fld(wf_pind, GPD3 + G_DAT, REG_ON_PIN, 1, on ? 1 : 0);
++	fld(wf_pind, GPD3 + G_PUD, REG_ON_PIN, 2, 0);
++	fld(wf_pind, GPD3 + G_DRV, REG_ON_PIN, 3, 3);
++	fld(wf_pind, GPD3 + G_CONPDN, REG_ON_PIN, 2, 3);
++	fld(wf_pind, GPD3 + G_PUDPDN, REG_ON_PIN, 2, 0);
++	fld(wf_pind, GPD3 + G_CON, REG_ON_PIN, 4, 1);
++	fld(wf_pind, GPD3 + G_DAT, REG_ON_PIN, 1, on ? 1 : 0);
++}
++
++static void
++wf_pins_sd(void)
++{
++	/* sd1_clk/sd1_cmd: function 2, no pull, drive 2 */
++	for (uint32_t p = 0; p < 2; p++) {
++		fld(wf_pinr, GPR2 + G_PUD, p, 2, 0);
++		fld(wf_pinr, GPR2 + G_DRV, p, 3, 2);
++		fld(wf_pinr, GPR2 + G_CON, p, 4, 2);
++	}
++	/* sd1_bus1/bus4: function 2, pull-up (on7xelte DT), drive 2, power-down: function 2 + pull-up */
++	for (uint32_t p = 0; p < 4; p++) {
++		fld(wf_pinr, GPR3 + G_PUD, p, 2, 3);
++		fld(wf_pinr, GPR3 + G_DRV, p, 3, 2);
++		fld(wf_pinr, GPR3 + G_CONPDN, p, 2, 2);
++		fld(wf_pinr, GPR3 + G_PUDPDN, p, 2, 3);
++		fld(wf_pinr, GPR3 + G_CON, p, 4, 2);
++	}
++}
++
++static bool
++wf_wait_clear(uint32_t off, uint32_t bits, uint32_t us)
++{
++	for (uint32_t t = 0; t < us; t += 10) {
++		if (!(rd32(wf_mmc, off) & bits)) {
++			return true;
++		}
++		delay(10);
++	}
++	return false;
++}
++
++static bool
++wf_clk_update(void)
++{
++	wr32(wf_mmc, M_CMDARG, 0);
++	wr32(wf_mmc, M_CMD, CMD_START | CMD_HOLD | CMD_UPD_CLK | CMD_WAIT_PRV);
++	if (!wf_wait_clear(M_CMD, CMD_START, 100000)) {
++		printf("USB> wifi: clock update not taken (RINTSTS 0x%08x)\n", rd32(wf_mmc, M_RINTSTS));
++		return false;
++	}
++	return true;
++}
++
++static bool
++wf_host_init(void)
++{
++	wr32(wf_mmc, M_CTRL, CTRL_RESETS);
++	if (!wf_wait_clear(M_CTRL, CTRL_RESETS, 100000)) {
++		printf("USB> wifi: controller reset stuck (CTRL 0x%08x)\n", rd32(wf_mmc, M_CTRL));
++		return false;
++	}
++	wr32(wf_mmc, M_INTMASK, 0);
++	wr32(wf_mmc, M_RINTSTS, 0xffffffffu);
++	wr32(wf_mmc, M_TMOUT, 0xffffffffu);
++	wr32(wf_mmc, M_CTYPE, 0);                       /* 1-bit while enumerating */
++	wr32(wf_mmc, M_FIFOTH, 0x203f0040u);            /* MSIZE 8, RX 63, TX 64 (fifo-depth 0x40) */
++	wr32(wf_mmc, M_CLKSEL, WF_CLKSEL);
++	wr32(wf_mmc, M_PWREN, 1);
++	delay(10000);
++	wr32(wf_mmc, M_CLKENA, 0);
++	if (!wf_clk_update()) {
++		return false;
++	}
++	wr32(wf_mmc, M_CLKDIV, WF_CLKDIV_SLOW);
++	wr32(wf_mmc, M_CLKSRC, 0);
++	if (!wf_clk_update()) {
++		return false;
++	}
++	wr32(wf_mmc, M_CLKENA, 1);
++	if (!wf_clk_update()) {
++		return false;
++	}
++	delay(2000);
++	printf("USB> wifi: dwmmc1 up: VERID 0x%08x HCON 0x%08x CLKSEL 0x%08x CLKDIV %u STATUS 0x%08x\n",
++	    rd32(wf_mmc, M_VERID), rd32(wf_mmc, M_HCON), rd32(wf_mmc, M_CLKSEL), rd32(wf_mmc, M_CLKDIV),
++	    rd32(wf_mmc, M_STATUS));
++	return true;
++}
++
++/* One command without data; 0 = response in *resp, else the RINTSTS error bits (or 1: stuck). */
++static uint32_t
++wf_cmd(uint32_t idx, uint32_t arg, uint32_t flags, uint32_t *resp)
++{
++	wr32(wf_mmc, M_RINTSTS, 0xffffffffu);
++	wr32(wf_mmc, M_CMDARG, arg);
++	wr32(wf_mmc, M_CMD, CMD_START | CMD_HOLD | CMD_WAIT_PRV | flags | (idx & 0x3f));
++	uint32_t st = 0;
++	for (uint32_t t = 0; t < 200000; t += 10) {
++		st = rd32(wf_mmc, M_RINTSTS);
++		if (st & (RINT_CMD_DONE | RINT_HLE)) {
++			break;
++		}
++		delay(10);
++	}
++	wr32(wf_mmc, M_RINTSTS, st);
++	if (!(st & RINT_CMD_DONE)) {
++		return st ? st : 1;
++	}
++	uint32_t err = st & (RINT_RE | RINT_RTO | RINT_HLE | ((flags & CMD_CRC) ? RINT_RCRC : 0));
++	if (resp) {
++		*resp = rd32(wf_mmc, M_RESP0);
++	}
++	return err;
++}
++
++/* CMD52: one byte of function fn at addr; write if wr, returns the R5 flags << 8 | data, or -1 */
++static int
++wf_cmd52(uint32_t fn, uint32_t addr, bool wr, uint8_t data)
++{
++	uint32_t arg = (wr ? (1u << 31) : 0) | ((fn & 7) << 28) | ((addr & 0x1ffff) << 9) | data;
++	uint32_t r = 0, e = wf_cmd(52, arg, CMD_RESP | CMD_CRC, &r);
++	if (e || (r & 0xcb00u)) {       /* R5: CRC, illegal command, error, function number, out of range */
++		return -1;
++	}
++	return (int)(r & 0xffff);
++}
++
++static int
++wf_rd8(uint32_t fn, uint32_t addr)
++{
++	int r = wf_cmd52(fn, addr, false, 0);
++	return r < 0 ? -1 : (r & 0xff);
++}
++
++static bool
++wf_wr8(uint32_t fn, uint32_t addr, uint8_t v)
++{
++	return wf_cmd52(fn, addr, true, v) >= 0;
++}
++
++static void
++wf_off(void)
++{
++	if (!wf_map()) {
++		return;
++	}
++	wf_regon(false);
++	wr32(wf_mmc, M_CLKENA, 0);
++	(void)wf_clk_update();
++	wr32(wf_mmc, M_PWREN, 0);
++	printf("USB> wifi: off (REG_ON low, dwmmc1 clock and power off)\n");
++}
++
++static void
++wf_st(void)
++{
++	if (!wf_map()) {
++		return;
++	}
++	printf("USB> wifi: dwmmc1 CTRL 0x%08x PWREN 0x%x CLKDIV 0x%x CLKENA 0x%x CTYPE 0x%x STATUS 0x%08x "
++	    "RINTSTS 0x%08x CLKSEL 0x%08x\n", rd32(wf_mmc, M_CTRL), rd32(wf_mmc, M_PWREN), rd32(wf_mmc, M_CLKDIV),
++	    rd32(wf_mmc, M_CLKENA), rd32(wf_mmc, M_CTYPE), rd32(wf_mmc, M_STATUS), rd32(wf_mmc, M_RINTSTS),
++	    rd32(wf_mmc, M_CLKSEL));
++	printf("USB> wifi: gpd3 CON 0x%08x DAT 0x%02x  gpr2 CON 0x%08x PUD 0x%04x  gpr3 CON 0x%08x PUD 0x%04x\n",
++	    rd32(wf_pind, GPD3 + G_CON), rd32(wf_pind, GPD3 + G_DAT), rd32(wf_pinr, GPR2 + G_CON),
++	    rd32(wf_pinr, GPR2 + G_PUD), rd32(wf_pinr, GPR3 + G_CON), rd32(wf_pinr, GPR3 + G_PUD));
++}
++
++static bool
++wf_enumerate(void)
++{
++	uint32_t r = 0, e;
++
++	/* CMD0 with the 80 initialisation clocks; an SDIO-only card may not answer, which is fine */
++	(void)wf_cmd(0, 0, CMD_INIT, NULL);
++	delay(2000);
++
++	e = wf_cmd(5, 0, CMD_RESP, &r);
++	if (e) {
++		printf("USB> wifi: CMD5 (arg 0): no answer (RINTSTS bits 0x%08x) -- no SDIO card\n", e);
++		return false;
++	}
++	uint32_t ocr = r;
++	printf("USB> wifi: CMD5: OCR 0x%08x, %u function(s), memory %s\n", ocr, (ocr >> 28) & 7,
++	    (ocr & (1u << 27)) ? "present" : "absent");
++	uint32_t want = ocr & 0x00ff8000u;
++	if (!want) {
++		want = 0x00ff8000u;
++	}
++	uint32_t i;
++	for (i = 0; i < 100; i++) {
++		e = wf_cmd(5, want, CMD_RESP, &r);
++		if (!e && (r & (1u << 31))) {
++			break;
++		}
++		delay(10000);
++	}
++	if (i == 100) {
++		printf("USB> wifi: CMD5: card never ready (last 0x%08x, err 0x%08x)\n", r, e);
++		return false;
++	}
++	printf("USB> wifi: CMD5: ready after %u tries, OCR 0x%08x\n", i + 1, r);
++
++	e = wf_cmd(3, 0, CMD_RESP | CMD_CRC, &r);
++	if (e) {
++		printf("USB> wifi: CMD3 failed (0x%08x)\n", e);
++		return false;
++	}
++	uint32_t rca = r >> 16;
++	e = wf_cmd(7, rca << 16, CMD_RESP | CMD_CRC, &r);
++	if (e) {
++		printf("USB> wifi: CMD7 (RCA 0x%04x) failed (0x%08x)\n", rca, e);
++		return false;
++	}
++	printf("USB> wifi: card selected, RCA 0x%04x (R1 0x%08x)\n", rca, r);
++	return true;
++}
++
++static void
++wf_probe(bool keep)
++{
++	if (!wf_map()) {
++		return;
++	}
++	printf("USB> wifi: probe: pins to SD, REG_ON high\n");
++	wf_regon(false);
++	delay(20000);
++	wf_pins_sd();
++	wf_regon(true);
++	delay(200000);                  /* dhd: the chip's power-on and its SDIO core */
++	if (!wf_host_init() || !wf_enumerate()) {
++		goto out;
++	}
++
++	int cccr = wf_rd8(0, 0x00), sdr = wf_rd8(0, 0x01), caps = wf_rd8(0, 0x08), hs = wf_rd8(0, 0x13);
++	int cis = wf_rd8(0, 0x09) | (wf_rd8(0, 0x0a) << 8) | (wf_rd8(0, 0x0b) << 16);
++	printf("USB> wifi: CCCR rev 0x%02x SD 0x%02x caps 0x%02x high-speed 0x%02x CIS 0x%06x\n",
++	    cccr, sdr, caps, hs, cis);
++	if (cccr < 0) {
++		goto out;
++	}
++	/* the first CIS tuples: MANFID 0x20 gives vendor (0x02d0 Broadcom) and device */
++	for (int a = cis, n = 0; a > 0 && n < 8; n++) {
++		int code = wf_rd8(0, (uint32_t)a), len = wf_rd8(0, (uint32_t)a + 1);
++		if (code < 0 || code == 0xff || len < 0) {
++			break;
++		}
++		if (code == 0x20 && len >= 4) {
++			printf("USB> wifi: CIS MANFID vendor 0x%04x device 0x%04x\n",
++			    wf_rd8(0, (uint32_t)a + 2) | (wf_rd8(0, (uint32_t)a + 3) << 8),
++			    wf_rd8(0, (uint32_t)a + 4) | (wf_rd8(0, (uint32_t)a + 5) << 8));
++		}
++		a += 2 + len;
++	}
++
++	/* function 1 on */
++	wf_wr8(0, 0x02, 0x02);
++	int ready = 0;
++	for (int t = 0; t < 100 && !(ready & 0x02); t++) {
++		ready = wf_rd8(0, 0x03);
++		if (ready < 0) {
++			ready = 0;
++		}
++		delay(10000);
++	}
++	printf("USB> wifi: function 1 %s (IORx 0x%02x)\n", (ready & 0x02) ? "ready" : "NOT ready", ready);
++	if (!(ready & 0x02)) {
++		goto out;
++	}
++
++	/* ALP clock, as brcmf_sdio_probe_attach() asks for it */
++	wf_wr8(1, SB_CHIPCLKCSR, CLK_HW_OFF | CLK_ALP_REQ);
++	int clk = 0;
++	for (int t = 0; t < 100 && !(clk & CLK_ALP_AVAIL); t++) {
++		clk = wf_rd8(1, SB_CHIPCLKCSR);
++		if (clk < 0) {
++			clk = 0;
++		}
++		delay(1000);
++	}
++	printf("USB> wifi: ALP clock %s (CHIPCLKCSR 0x%02x)\n", (clk & CLK_ALP_AVAIL) ? "available" : "NOT available",
++	    clk);
++	if (!(clk & CLK_ALP_AVAIL)) {
++		goto out;
++	}
++	wf_wr8(1, SB_CHIPCLKCSR, CLK_HW_OFF | CLK_FORCE_ALP);
++	wf_wr8(1, SB_SDIOPULLUP, 0);
++
++	/* the backplane window on chipcommon, then its ID register byte by byte */
++	wf_wr8(1, SB_SBADDRLOW, (SI_ENUM_BASE >> 8) & 0x80);
++	wf_wr8(1, SB_SBADDRMID, (SI_ENUM_BASE >> 16) & 0xff);
++	wf_wr8(1, SB_SBADDRHIGH, (SI_ENUM_BASE >> 24) & 0xff);
++	uint32_t id = 0;
++	bool ok = true;
++	for (uint32_t b = 0; b < 4; b++) {
++		int v = wf_rd8(1, (SI_ENUM_BASE & 0x7fff) + b);
++		if (v < 0) {
++			ok = false;
++			break;
++		}
++		id |= (uint32_t)v << (8 * b);
++	}
++	if (ok) {
++		printf("USB> wifi: chipcommon ID 0x%08x: chip 0x%04x (%u) rev %u, package %u, %u cores\n",
++		    id, id & 0xffff, id & 0xffff, (id >> 16) & 0xf, (id >> 20) & 0xf, (id >> 24) & 0xf);
++	} else {
++		printf("USB> wifi: chipcommon ID read failed\n");
++	}
++
++out:
++	if (keep) {
++		printf("USB> wifi: probe done, left powered (wifi off turns it off)\n");
++		wf_st();
++	} else {
++		wf_off();
++	}
++}
++
++/* From the dvfs worker (a5xelte_dvfs.c dv_run), which may sleep. */
++void on7xelte_wifi_cmd(const char *arg);
++void
++on7xelte_wifi_cmd(const char *arg)
++{
++	if (!strcmp(arg, "probe")) {
++		wf_probe(false);
++	} else if (!strcmp(arg, "probe keep")) {
++		wf_probe(true);
++	} else if (!strcmp(arg, "off")) {
++		wf_off();
++	} else if (!strcmp(arg, "st")) {
++		wf_st();
++	} else {
++		printf("USB> wifi: probe [keep] | off | st\n");
++	}
++}
++
++#endif /* ARM64_BOARD_CONFIG_A5XELTE */
