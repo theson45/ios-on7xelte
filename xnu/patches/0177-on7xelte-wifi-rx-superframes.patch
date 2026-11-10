@@ -1,0 +1,132 @@
+--- a/bsd/dev/on7xelte_wifi.c
++++ b/bsd/dev/on7xelte_wifi.c
+@@ -1411,7 +1411,7 @@
+ #define I_HMB_FRAME_IND         (1u << 6)
+ #define I_HMB_HOST_INT          (1u << 7)
+ #define WF_F2ADDR               ((0x18000000u & SB_OFT_MASK) | SB_ACCESS_4B)
+-#define WF_RXMAX                4096u
++#define WF_RXMAX                24576u         /* 0177: rx superframes (xnu61: 9248 bytes) */
+ #define WLC_UP                  2u
+ #define WLC_GET_VAR             262u
+ #define WLC_SET_VAR             263u
+@@ -1531,22 +1531,22 @@
+ static void wf_net_rx(const uint8_t *e, uint32_t len);
+ static bool wf_net_event(uint32_t type, uint32_t status, uint32_t reason, uint32_t flags);
+ static uint64_t wf_rxn;
++static void wf_glom_frame(uint8_t *f, uint32_t flen, uint32_t doff);
+ 
+-/* the frame in wf_rxbuf: a control response is kept, events are handed on, data is dropped */
++/* one SDPCM frame (wf_rxbuf, or a subframe of a superframe): a control response is kept, events and data handed on */
+ static void
+-wf_frame(void)
++wf_frame_at(uint8_t *f, uint32_t flen)
+ {
+-	uint8_t *f = (uint8_t *)wf_rxbuf;
+-	uint32_t chan = (wf_rxbuf[1] >> 8) & 0xf, doff = wf_rxbuf[1] >> 24;
++	uint32_t chan = f[5] & 0xfu, doff = f[7];
+ 
+ 	wf_rxn++;
+ 
+-	if (doff < 12 || doff > wf_rxlen) {
+-		printf("USB> wifi: rx: chan %u doffset %u of %u?\n", chan, doff, wf_rxlen);
++	if (doff < 12 || doff > flen) {
++		printf("USB> wifi: rx: chan %u doffset %u of %u?\n", chan, doff, flen);
+ 		return;
+ 	}
+ 	uint8_t *pl = f + doff;
+-	uint32_t plen = wf_rxlen - doff;
++	uint32_t plen = flen - doff;
+ 	if (chan == 0) {
+ 		if (plen < 16) {
+ 			return;
+@@ -1571,12 +1571,81 @@
+ 		} else {
+ 			wf_net_rx(pl + o, plen - o);    /* 0175: data, to en0 */
+ 		}
++	} else if (chan == 3 && f == (uint8_t *)wf_rxbuf) {
++		wf_glom_frame(f, flen, doff);   /* 0177: a superframe or its descriptor */
+ 	} else {
+ 		printf("USB> wifi: rx: frame on channel %u (%u bytes): %02x %02x %02x %02x %02x %02x %02x %02x\n", chan,
+-		    wf_rxlen, pl[0], pl[1], pl[2], pl[3], pl[4], pl[5], pl[6], pl[7]);
++		    flen, pl[0], pl[1], pl[2], pl[3], pl[4], pl[5], pl[6], pl[7]);
+ 	}
+ }
+ 
++/*
++ * 0177: rx superframes (glom). The firmware sends them though bus:rxglom is 0 (xnu61): first a descriptor
++ * on channel 3 (after its header, the subframes' lengths as 16-bit words), then the superframe, whose length
++ * is their sum. Subframe i takes its length's bytes from the running offset; the first one starts with the
++ * superframe's own header (channel 3), its SDPCM header at that header's data offset. Each subframe is an
++ * ordinary SDPCM frame (brcmfmac brcmf_sdio_rxglom).
++ */
++static uint16_t wf_glom[64];
++static uint32_t wf_glom_n, wf_glom_sum, wf_glom_bad;
++static uint64_t wf_glom_frames, wf_glom_subs;
++static void wf_frame_at(uint8_t *f, uint32_t flen);
++
++static void
++wf_glom_frame(uint8_t *f, uint32_t flen, uint32_t doff)
++{
++	if (wf_glom_n && flen == wf_glom_sum) {
++		uint32_t off = 0;
++		wf_glom_frames++;
++		for (uint32_t i = 0; i < wf_glom_n; off += wf_glom[i], i++) {
++			uint32_t sl = wf_glom[i], hs = i == 0 ? doff : 0;
++			if (off + sl > flen || hs + 12 > sl) {
++				break;
++			}
++			uint8_t *h = f + off + hs;
++			uint32_t len = (uint32_t)h[0] | (uint32_t)h[1] << 8, chk = (uint32_t)h[2] | (uint32_t)h[3] << 8;
++			if ((len ^ chk) != 0xffffu || len < 12 || len > sl - hs || (h[5] & 0xfu) == 3) {
++				if (wf_glom_bad++ < 10) {
++					printf("USB> wifi: rx glom: subframe %u/%u at %u (+%u) of %u: bad header %02x %02x %02x %02x %02x %02x %02x %02x\n",
++					    i, wf_glom_n, off, hs, flen, h[0], h[1], h[2], h[3], h[4], h[5], h[6], h[7]);
++				}
++				continue;
++			}
++			uint8_t win = h[9];
++			if ((uint8_t)(win - wf_txseq) <= 0x40) {
++				wf_txmax = win;
++			}
++			wf_glom_subs++;
++			wf_frame_at(h, len);
++		}
++		wf_glom_n = 0;
++		return;
++	}
++	if (wf_glom_n) {
++		if (wf_glom_bad++ < 10) {
++			printf("USB> wifi: rx glom: frame of %u bytes, the descriptor said %u\n", flen, wf_glom_sum);
++		}
++		wf_glom_n = 0;
++	}
++	uint32_t sum = 0, k = 0;
++	for (uint32_t o = doff; o + 2 <= flen && k < 64; o += 2) {
++		uint32_t v = (uint32_t)f[o] | (uint32_t)f[o + 1] << 8;
++		if (!v) {
++			break;
++		}
++		wf_glom[k++] = (uint16_t)v;
++		sum += v;
++	}
++	wf_glom_n = k;
++	wf_glom_sum = sum;
++}
++
++static void
++wf_frame(void)
++{
++	wf_frame_at((uint8_t *)wf_rxbuf, wf_rxlen);
++}
++
+ /* what the dongle flagged: mailbox data acked, frames read until it has none */
+ static void
+ wf_poll(void)
+@@ -3299,6 +3368,7 @@
+ 	    g, d, wf_dh.lease, wf_dh.set_ip != 0);
+ 	printf("USB> wifi: NET: rx %llu (dropped %llu), tx %llu (dropped %llu), queued %u, txseq %u window %u, poll bus errors %u\n",
+ 	    wf_rx_frames, wf_rx_drop, wf_tx_frames, wf_tx_drop, wf_txq_n, wf_txseq, wf_txmax, wf_bad_runs);
++	printf("USB> wifi: NET: rx superframes %llu (subframes %llu, bad %u)\n", wf_glom_frames, wf_glom_subs, wf_glom_bad);
+ }
+ 
+ /*
