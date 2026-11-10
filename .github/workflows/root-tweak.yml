@@ -18,6 +18,13 @@ on:
         description: "install the RedwoodAudio HAL plug-in and keep VirtualAudio (xnu 0158)"
         type: boolean
         default: true
+      wifi_fw:
+        description: "install the BCM43430A1 firmware + NVRAM for the kernel's Wi-Fi (on7xelte W3)"
+        type: boolean
+        default: true
+      runner:
+        description: GitHub runner label (macos-15-intel when arm64 runners are out of capacity)
+        default: macos-15
 
 permissions:
   actions: read
@@ -29,7 +36,7 @@ concurrency:
 
 jobs:
   tweak:
-    runs-on: macos-15
+    runs-on: ${{ inputs.runner || 'macos-15' }}
     timeout-minutes: 120
     steps:
       - uses: actions/checkout@v4
@@ -71,16 +78,36 @@ jobs:
           path: work/plugin
           retention-days: 14
 
+      # The phone's own Android Wi-Fi files, from the public on7xelte vendor tree at a fixed commit,
+      # checked by hash; they only pass through the runner into the image, never into this repository.
+      - name: Fetch the Wi-Fi firmware
+        if: ${{ inputs.wifi_fw }}
+        run: |
+          set -eux
+          V=https://raw.githubusercontent.com/DevOtag-Open-Source/android_vendor_samsung_on7xelte/9e3f643a14b641638d87c076daa3e3a22d4dc950/proprietary/etc/wifi
+          mkdir -p work/wifi
+          curl -fsSL --retry 5 -o work/wifi/bcmdhd_sta.bin "$V/bcmdhd_sta.bin"
+          curl -fsSL --retry 5 -o work/wifi/nvram_net.txt "$V/nvram_net.txt"
+          shasum -a 256 -c <<'SUMS'
+          47ce52e9b2c5c39da006b79a1f35dfbd98cc1837e384b486ec581ea5703f850b  work/wifi/bcmdhd_sta.bin
+          cdbdb9a2341fa012933cf3e4c9b3c5e2eb4bc972ef8e40761819f84df1df6911  work/wifi/nvram_net.txt
+          SUMS
+
       - name: Apply the tweaks
         run: |
           set -eux
           mkdir -p work/root
           plug=""
           if [ "${{ inputs.hal_plugin }}" = "true" ]; then plug="--hal-plugin work/plugin"; fi
+          if [ "${{ inputs.wifi_fw }}" = "true" ]; then plug="$plug --wifi-fw work/wifi"; fi
           hdiutil attach -owners on -imagekey diskimage-class=CRawDiskImage \
             -mountpoint work/root work/ios-root.img
           sudo python3 tools/sweet-root-tweaks.py work/root $plug | tee work/tweak.log
-          if [ -n "$plug" ]; then
+          if [ "${{ inputs.wifi_fw }}" = "true" ]; then
+            grep -q 'bcm43430a1-sdio.bin' work/tweak.log
+            sudo ls -lnR work/root/usr/share/firmware/wifi/on7xelte
+          fi
+          if [ "${{ inputs.hal_plugin }}" = "true" ]; then
             grep -q 'RedwoodAudio.driver installed' work/tweak.log
             sudo ls -lnR work/root/System/Library/Audio/Plug-Ins/HAL/RedwoodAudio.driver
             sudo ls -ln work/root/Library/Audio/Plug-Ins/HAL

@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Apply the SWEET bring-up changes to an iOS root made by tools/mkiosroot.sh.
 
-  sudo sweet-root-tweaks.py MOUNTED_ROOT [--hal-plugin DIR]
+  sudo sweet-root-tweaks.py MOUNTED_ROOT [--hal-plugin DIR] [--wifi-fw DIR]
 
 MOUNTED_ROOT is the HFS+ image mounted read-write (Linux: run
 `fsck.hfsplus -fy` on the image, then `mount -t hfsplus -o loop,force`).
@@ -28,6 +28,12 @@ screen (image versions v8-v14 in NOTES.md):
                   /System/Library/Audio/Plug-Ins/HAL/RedwoodAudio.driver and
                   VirtualAudio stays (or is moved back from HAL.disabled): it
                   finds the "Speaker" device it wants there
+  wifi firmware   with --wifi-fw DIR (on7xelte, Wi-Fi W3): the BCM43430A1's
+                  station firmware and NVRAM from DIR (bcmdhd_sta.bin,
+                  nvram_net.txt: the phone's own Android files, fetched by
+                  root-tweak.yml, never kept in this repository) as
+                  /usr/share/firmware/wifi/on7xelte/{bcm43430a1-sdio.bin,
+                  bcm43430a1-sdio.txt}, where the kernel reads them
   MediaToolbox    StartRecorderServer=false (camera filter prewarm calls a
                   NULL OpenGL function without a GPU -> mediaserverd crash loop)
   SpringBoard     BKNoWatchdogs (one slow CPU path, no scene-create watchdog
@@ -162,6 +168,20 @@ def hal_plugin(root, plugdir):
         print('VirtualAudio.plugin enabled again')
 
 
+def wifi_fw(root, fwdir):
+    dst = os.path.join(root, 'usr/share/firmware/wifi/on7xelte')
+    os.makedirs(dst, exist_ok=True)
+    for d in (os.path.join(root, 'usr/share/firmware'), os.path.join(root, 'usr/share/firmware/wifi'), dst):
+        os.chown(d, 0, 0)
+        os.chmod(d, 0o755)
+    for src, name in (('bcmdhd_sta.bin', 'bcm43430a1-sdio.bin'), ('nvram_net.txt', 'bcm43430a1-sdio.txt')):
+        out = os.path.join(dst, name)
+        shutil.copyfile(os.path.join(fwdir, src), out)
+        os.chown(out, 0, 0)
+        os.chmod(out, 0o644)
+        print('wifi firmware installed: %s (%d bytes)' % (out[len(root):], os.path.getsize(out)))
+
+
 def audio(root, plugdir=None):
     src = os.path.join(root, 'Library/Audio/Plug-Ins/HAL/VirtualAudio.plugin')
     dst_dir = os.path.join(root, 'Library/Audio/Plug-Ins/HAL.disabled')
@@ -181,10 +201,13 @@ def audio(root, plugdir=None):
 
 def main():
     args = sys.argv[1:]
-    plugdir = None
-    if len(args) == 3 and args[1] == '--hal-plugin':
-        plugdir = args[2]
-        args = args[:1]
+    plugdir = fwdir = None
+    while len(args) >= 3 and args[-2] in ('--hal-plugin', '--wifi-fw'):
+        if args[-2] == '--hal-plugin':
+            plugdir = args[-1]
+        else:
+            fwdir = args[-1]
+        args = args[:-2]
     if len(args) != 1 or not os.path.isdir(os.path.join(args[0], 'System/Library/xpc')):
         sys.exit(__doc__)
     root = args[0]
@@ -192,6 +215,8 @@ def main():
     containers(root)
     activation(root)
     audio(root, plugdir)
+    if fwdir:
+        wifi_fw(root, fwdir)
     merge_pref(root, 'com.apple.migration', {
         'LastSystemVersion': BUILD,
         'DMUserDataDisposition': {'SyntheticDidUpgrade': False, 'buildVersion': BUILD}})
