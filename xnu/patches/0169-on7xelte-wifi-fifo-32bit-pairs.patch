@@ -1,0 +1,73 @@
+--- a/bsd/dev/on7xelte_wifi.c
++++ b/bsd/dev/on7xelte_wifi.c
+@@ -565,7 +565,8 @@
+  * FIFO count 0 and the card left waiting in TRN. 0 = 64-bit str at 0x200, 1 = 32-bit low at 0x200 and high at
+  * 0x204, 2 = both 32-bit halves at 0x200, 3 = only 32-bit words at 0x200 (no padding).
+  */
+-static uint32_t wf_fifo_mode;
++static uint32_t wf_fifo_mode = 1;      /* 0169: mode 1 works (xnu52): SOCRAM written right */
++static uint32_t wf_div = WF_CLKDIV_SLOW; /* 0169: 'wifi div N' (hex), the clock after the 4-bit switch */
+ 
+ static void
+ wf_fifo_put(uint32_t lo, uint32_t hi)
+@@ -642,7 +643,16 @@
+ 	if (!(st & RINT_DTO) || (st & (RINT_HLE | RINT_DERR | RINT_RE | RINT_RTO | RINT_RCRC)) || (r & 0xcb00u)) {
+ 		goto bad;
+ 	}
+-	if (!wr) {
++	if (!wr && wf_fifo_mode == 1) {
++		/* 0169: a 64-bit FIFO entry read as two 32-bit halves, 0x200 then 0x204 (as written) */
++		for (uint32_t i = 0; i < nw; i += 2) {
++			buf[i] = rd32(wf_mmc, M_FIFO);
++			uint32_t hi = rd32(wf_mmc, M_FIFO + 4);
++			if (i + 1 < nw) {
++				buf[i + 1] = hi;
++			}
++		}
++	} else if (!wr) {
+ 		for (uint32_t i = 0; i < n / 4; i++) {
+ 			buf[i] = rd32(wf_mmc, M_FIFO);
+ 		}
+@@ -1040,6 +1050,16 @@
+ 		wr32(wf_mmc, M_CTYPE, 1);
+ 		printf("USB> wifi: 4-bit bus (CCCR 0x07 0x%02x -> 0x%02x)\n", bic, wf_rd8(0, 0x07));
+ 	}
++	if (wf_div != WF_CLKDIV_SLOW) {
++		/* 0169: faster card clock for the download (cclk_in / (2 * div)) */
++		wr32(wf_mmc, M_CLKENA, 0);
++		bool ck = wf_clk_update();
++		wr32(wf_mmc, M_CLKDIV, wf_div);
++		ck = ck && wf_clk_update();
++		wr32(wf_mmc, M_CLKENA, 1);
++		ck = ck && wf_clk_update();
++		printf("USB> wifi: CLKDIV %u -> %u (%s)\n", WF_CLKDIV_SLOW, rd32(wf_mmc, M_CLKDIV), ck ? "ok" : "update FAILED");
++	}
+ 	wf_wr8(0, 0x110, WF_CHUNK);
+ 	wf_wr8(0, 0x111, 0);
+ 	wf_bad = false;
+@@ -1334,6 +1354,16 @@
+ 	} else if (!strncmp(arg, "fifo ", 5) && arg[5] >= '0' && arg[5] <= '3' && !arg[6]) {
+ 		wf_fifo_mode = (uint32_t)(arg[5] - '0');
+ 		printf("USB> wifi: FIFO write mode %u\n", wf_fifo_mode);
++	} else if (!strncmp(arg, "div ", 4)) {
++		const char *a = arg + 4;
++		bool ok;
++		uint32_t d = wf_hex(&a, &ok);
++		if (ok && d >= 4 && d <= WF_CLKDIV_SLOW) {
++			wf_div = d;
++			printf("USB> wifi: CLKDIV for the next fw: %u\n", wf_div);
++		} else {
++			printf("USB> wifi: div N (hex, 4..ff)\n");
++		}
+ 	} else if (!strcmp(arg, "fw1")) {
+ 		wf_bus4 = false;
+ 		wf_fw();
+@@ -1344,7 +1374,7 @@
+ 	} else if (!strncmp(arg, "cr ", 3)) {
+ 		wf_rd_cmd(arg + 3, true);
+ 	} else {
+-		printf("USB> wifi: probe [keep] | off | st | fw | fw1 | fifo 0-3 | rd ADDR [N] | wr ADDR VAL | cr FN ADDR\n");
++		printf("USB> wifi: probe [keep] | off | st | fw | fw1 | fifo 0-3 | div N | rd ADDR [N] | wr ADDR VAL | cr FN ADDR\n");
+ 	}
+ }
+ 
