@@ -1,0 +1,75 @@
+--- a/bsd/dev/on7xelte_wifi.c
++++ b/bsd/dev/on7xelte_wifi.c
+@@ -507,6 +507,7 @@
+ #define CMD_DATA        (1u << 9)
+ #define CMD_WRITE       (1u << 10)
+ #define RINT_DTO        (1u << 3)
++#define RINT_TXDR       (1u << 4)
+ #define RINT_DERR       ((1u << 7) | (1u << 9) | (1u << 10) | (1u << 11) | (1u << 13) | (1u << 15))
+ #define SB_ACCESS_4B    0x8000u
+ #define SB_OFT_MASK     0x7fffu
+@@ -563,7 +564,7 @@
+ wf_cmd53_once(uint32_t fn, uint32_t addr, bool wr, uint32_t *buf, uint32_t n, bool quiet)
+ {
+ 	uint32_t arg = (wr ? (1u << 31) : 0) | ((fn & 7) << 28) | (1u << 26) | ((addr & 0x1ffff) << 9) | (n & 0x1ff);
+-	uint32_t st = 0, r = 0, pre = 0;
++	uint32_t st = 0, r = 0, pre = 0, sent = 0, nw = n / 4;
+ 
+ 	(void)wf_idle();
+ 	wr32(wf_mmc, M_CTRL, rd32(wf_mmc, M_CTRL) | CTRL_FIFO_RST);
+@@ -572,24 +573,30 @@
+ 	}
+ 	wr32(wf_mmc, M_BLKSIZ, n);
+ 	wr32(wf_mmc, M_BYTCNT, n);
+-	if (wr) {
+-		/*
+-		 * 0165: HCON says this controller's FIFO is 64 bits wide (H_DATA_WIDTH 2); 32-bit stores never
+-		 * reach it (0164: STATUS FIFO count 0, write never done). Push 64 bits at a time, as dw_mmc's
+-		 * push_data64; a last odd word goes with zeros (BYTCNT says how much is sent).
+-		 */
+-		for (uint32_t i = 0; i < n / 4; i += 2) {
+-			uint64_t v = buf[i] | ((i + 1 < n / 4) ? (uint64_t)buf[i + 1] << 32 : 0);
+-			*(volatile uint64_t *)(wf_mmc + M_FIFO) = v;
+-		}
+-		pre = rd32(wf_mmc, M_STATUS);     /* 0166: FIFO count (29:17) before the command */
+-	}
++	/*
++	 * 0167: no FIFO prefill. 0166 showed the FIFO still empty after it (stores before the data command are
++	 * dropped) and RINTSTS TXDR set: the controller was asking for data. As dw_mmc's PIO path
++	 * (dw_mci_write_data_pio on TXDR), push the data once the command runs and TXDR is raised.
++	 */
+ 	wr32(wf_mmc, M_RINTSTS, 0xffffffffu);
+ 	wr32(wf_mmc, M_CMDARG, arg);
+ 	wr32(wf_mmc, M_CMD, CMD_START | CMD_HOLD | CMD_WAIT_PRV | CMD_RESP | CMD_CRC | CMD_DATA |
+ 	    (wr ? CMD_WRITE : 0) | 53);
+ 	for (uint32_t t = 0; t < 500000; t += 5) {
+ 		st = rd32(wf_mmc, M_RINTSTS);
++		if (wr && sent < nw && (st & RINT_TXDR)) {
++			/* 64-bit FIFO (HCON H_DATA_WIDTH 2), depth 64: push while there is room; odd last word + zeros */
++			uint32_t fc = (rd32(wf_mmc, M_STATUS) >> 17) & 0x1fff;
++			while (sent < nw && fc < 64) {
++				uint64_t v = buf[sent] | ((sent + 1 < nw) ? (uint64_t)buf[sent + 1] << 32 : 0);
++				*(volatile uint64_t *)(wf_mmc + M_FIFO) = v;
++				sent += 2;
++				fc++;
++			}
++			wr32(wf_mmc, M_RINTSTS, RINT_TXDR);
++			pre = rd32(wf_mmc, M_STATUS);
++			continue;
++		}
+ 		if ((st & RINT_DTO) || (st & (RINT_HLE | RINT_DERR)) ||
+ 		    ((st & RINT_CMD_DONE) && (st & (RINT_RE | RINT_RTO | RINT_RCRC)))) {
+ 			break;
+@@ -626,9 +633,9 @@
+ 	}
+ 	if (wf_errs++ < 6) {
+ 		printf("USB> wifi: CMD53 %s fn %u addr 0x%05x n %u failed twice: RINTSTS 0x%08x R5 0x%08x STATUS 0x%08x"
+-		    " (FIFO after fill: STATUS 0x%08x, %u words; bus %u-bit)\n",
+-		    wr ? "write" : "read", fn, addr, n, st, r, rd32(wf_mmc, M_STATUS), pre, (pre >> 17) & 0x1fff,
+-		    rd32(wf_mmc, M_CTYPE) ? 4 : 1);
++		    " (pushed %u of %u words, then STATUS 0x%08x / %u in FIFO; CTRL 0x%08x BMOD 0x%08x; bus %u-bit)\n",
++		    wr ? "write" : "read", fn, addr, n, st, r, rd32(wf_mmc, M_STATUS), sent > nw ? nw : sent, nw, pre,
++		    (pre >> 17) & 0x1fff, rd32(wf_mmc, M_CTRL), rd32(wf_mmc, 0x080u), rd32(wf_mmc, M_CTYPE) ? 4 : 1);
+ 	}
+ 	wf_bad = true;
+ 	return false;
