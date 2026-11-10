@@ -1,0 +1,329 @@
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -93,6 +93,7 @@
+ OSDefineMetaClassAndStructors(IOMobileFramebuffer, IOService);
+ 
+ class IOMobileFramebufferUserClient;
++class AppleARMBacklight;
+ 
+ class AppleCLCD : public IOMobileFramebuffer {
+ 	OSDeclareDefaultStructors(AppleCLCD);
+@@ -120,6 +121,7 @@
+ 	uint32_t      fFlushTicks;    /* vsync ticks between panel copies */
+ 	bool          fPowerOff;      /* RequestPowerChange(0) */
+ 	uint32_t      fFadeStep;      /* fade-out steps done while off */
++	AppleARMBacklight *fBL;        /* 0154: panel backlight, NULL without DSI */
+ 
+ 	bool start(IOService *provider) APPLE_KEXT_OVERRIDE;
+ 	void addClient(IOMobileFramebufferUserClient *client);
+@@ -145,6 +147,263 @@
+ 
+ OSDefineMetaClassAndStructors(IOAcceleratorES, IOService);
+ 
++#if defined(ARM64_BOARD_CONFIG_A5XELTE)
++/*
++ * 0154: panel brightness and display sleep on the J7 Prime (on7xelte).
++ * The TD4300 panel takes its backlight level as a DCS 0x51 short write
++ * (Linux td4300_lcd_ctrl.c, panel levels 0..180 with
++ * CONFIG_PANEL_BRIGHTNESS_MAX_480CD as on7xelte uses; 66 is its default).
++ * The loader leaves DSIM0 (0x14800000, exynos7870.dtsi) running in video
++ * mode; a short packet goes through its SFR header FIFO (dsim_reg_7870.c:
++ * PKTHDR = data id | data0 << 8 | data1 << 16, sent when
++ * INTSRC.SFR_PH_FIFO_EMPTY is set; the bit is write-1-to-clear). The block
++ * is only used when DSIM_RESOL reads back the 1080x1920 panel.
++ *
++ * CoreBrightness (backboardd) drives the service with backlight-control =
++ * true that conforms to AppleARMBacklight: it sets {brightness =
++ * level * (max - min) + min, FadePeriod (seconds, 16.16)} through
++ * IORegistryEntrySetCFProperties, min/max from IODisplayParameters. The
++ * fade is stepped here every 16 ms on its own work loop (a DCS write waits
++ * for the vertical blanking). Display off (RequestPowerChange 0) sets the
++ * level to 0, display on restores the last non-zero level.
++ * Boot-arg on7bl=0 leaves all of it out.
++ */
++#define ON7_DSIM_PA             0x14800000ULL
++#define ON7_DSIM_RESOL          0x20
++#define ON7_DSIM_INTSRC         0x34
++#define ON7_DSIM_PKTHDR         0x3c
++#define ON7_DSIM_FIFOCTRL       0x4c
++#define ON7_INTSRC_PH_EMPTY     (1u << 28)
++#define ON7_FIFOCTRL_FULL_PH    (1u << 11)
++#define ON7_FIFOCTRL_EMPTY_PH   (1u << 10)
++#define ON7_DCS_SHORT_WRITE_1   0x15
++#define ON7_BL_MAX              180
++#define ON7_BL_DEFAULT          66
++#define ON7_BL_STEP_MS          16
++#define ON7_MIN(a, b)           ((a) < (b) ? (a) : (b))
++
++extern "C" vm_offset_t ml_io_map(vm_offset_t phys_addr, vm_size_t size);
++
++static volatile uint32_t *on7_dsim;
++static IOLock *on7_dcs_lock;
++
++static bool
++on7_dsim_setup(void)
++{
++	on7_dcs_lock = IOLockAlloc();
++	volatile uint32_t *r = (volatile uint32_t *)ml_io_map(ON7_DSIM_PA, 0x100);
++	if (on7_dcs_lock == NULL || r == NULL) {
++		IOLog("ON7 BL: no DSIM mapping\n");
++		return false;
++	}
++	uint32_t resol = r[ON7_DSIM_RESOL / 4];
++	uint32_t fifo = r[ON7_DSIM_FIFOCTRL / 4];
++	IOLog("ON7 BL: DSIM0 RESOL 0x%08x FIFOCTRL 0x%08x\n", resol, fifo);
++	if ((resol & 0xfff) != 1080 || ((resol >> 16) & 0xfff) != 1920) {
++		IOLog("ON7 BL: DSIM0 is not driving the 1080x1920 panel, no brightness control\n");
++		return false;
++	}
++	on7_dsim = r;
++	return true;
++}
++
++static bool
++on7_dcs(uint8_t cmd, uint8_t param)
++{
++	volatile uint32_t *r = on7_dsim;
++	bool ok = false;
++	if (r == NULL) {
++		return false;
++	}
++	IOLockLock(on7_dcs_lock);
++	for (int i = 0; i < 400 && (r[ON7_DSIM_FIFOCTRL / 4] & ON7_FIFOCTRL_FULL_PH); i++) {
++		IODelay(50);
++	}
++	r[ON7_DSIM_INTSRC / 4] = ON7_INTSRC_PH_EMPTY;
++	r[ON7_DSIM_PKTHDR / 4] = ON7_DCS_SHORT_WRITE_1 | ((uint32_t)cmd << 8) | ((uint32_t)param << 16);
++	for (int i = 0; i < 800; i++) {         /* 40 ms, a frame is 16.7 */
++		if (r[ON7_DSIM_INTSRC / 4] & ON7_INTSRC_PH_EMPTY) {
++			ok = true;
++			break;
++		}
++		IODelay(50);
++	}
++	if (!ok && (r[ON7_DSIM_FIFOCTRL / 4] & ON7_FIFOCTRL_EMPTY_PH)) {
++		ok = true;
++	}
++	r[ON7_DSIM_INTSRC / 4] = ON7_INTSRC_PH_EMPTY;
++	IOLockUnlock(on7_dcs_lock);
++	return ok;
++}
++
++class AppleARMBacklight : public IOService {
++	OSDeclareDefaultStructors(AppleARMBacklight);
++
++	IOWorkLoop         *fWL;
++	IOTimerEventSource *fFade;
++	bool                fKnown;         /* fLevel is what the panel has */
++	bool                fOff;           /* display off: hold level 0 */
++	uint32_t            fLevel, fFrom, fTo, fLastOn;
++	uint64_t            fStart, fPeriod;        /* abs time */
++	uint32_t            fLogged, fFailed;
++
++	static void fadeStep(OSObject *owner, IOTimerEventSource *sender);
++	static IOReturn setGated(OSObject *owner, void *to, void *ms, void *, void *);
++	static IOReturn powerGated(OSObject *owner, void *on, void *, void *, void *);
++	void apply(uint32_t level);
++	void publish(uint32_t level);
++
++public:
++	bool startBacklight(void);
++	void displayPower(bool on);
++	IOReturn setProperties(OSObject *properties) APPLE_KEXT_OVERRIDE;
++};
++
++OSDefineMetaClassAndStructors(AppleARMBacklight, IOService);
++
++void
++AppleARMBacklight::publish(uint32_t level)
++{
++	OSDictionary *b = OSDictionary::withCapacity(3);
++	OSDictionary *p = OSDictionary::withCapacity(1);
++	if (b != NULL && p != NULL) {
++		OSNumber *n;
++		n = OSNumber::withNumber(0ULL, 32); b->setObject("min", n); OSSafeReleaseNULL(n);
++		n = OSNumber::withNumber(ON7_BL_MAX, 32); b->setObject("max", n); OSSafeReleaseNULL(n);
++		n = OSNumber::withNumber(level, 32); b->setObject("value", n); OSSafeReleaseNULL(n);
++		p->setObject("brightness", b);
++		setProperty("IODisplayParameters", p);
++	}
++	OSSafeReleaseNULL(b);
++	OSSafeReleaseNULL(p);
++}
++
++bool
++AppleARMBacklight::startBacklight(void)
++{
++	fWL = IOWorkLoop::workLoop();
++	fFade = IOTimerEventSource::timerEventSource(this, &AppleARMBacklight::fadeStep);
++	if (fWL == NULL || fFade == NULL || fWL->addEventSource(fFade) != kIOReturnSuccess) {
++		return false;
++	}
++	fLevel = ON7_BL_DEFAULT;
++	fLastOn = ON7_BL_DEFAULT;
++	setProperty("backlight-control", true);
++	publish(fLevel);
++	registerService();
++	IOLog("ON7 BL: AppleARMBacklight published, panel levels 0..%u\n", ON7_BL_MAX);
++	return true;
++}
++
++/* fWL gate held. */
++void
++AppleARMBacklight::apply(uint32_t level)
++{
++	if (fKnown && level == fLevel) {
++		return;
++	}
++	bool ok = on7_dcs(0x51, (uint8_t)level);
++	if (!fKnown || (!ok && fFailed < 10)) {
++		if (!ok) {
++			fFailed++;
++		}
++		IOLog("ON7 BL: panel level %u %s\n", level, ok ? "set" : "FAILED (DSI header FIFO did not drain)");
++	}
++	fKnown = true;
++	fLevel = level;
++	if (level != 0 && !fOff) {
++		fLastOn = level;
++	}
++}
++
++void
++AppleARMBacklight::fadeStep(OSObject *owner, IOTimerEventSource *sender)
++{
++	AppleARMBacklight *bl = (AppleARMBacklight *)owner;
++	uint64_t t = mach_absolute_time() - bl->fStart;
++	uint32_t level = bl->fTo;
++	if (t < bl->fPeriod) {
++		level = (uint32_t)((int64_t)bl->fFrom +
++		    ((int64_t)bl->fTo - (int64_t)bl->fFrom) * (int64_t)t / (int64_t)bl->fPeriod);
++	}
++	bl->apply(level);
++	if (level != bl->fTo) {
++		sender->setTimeoutMS(ON7_BL_STEP_MS);
++	}
++}
++
++IOReturn
++AppleARMBacklight::setGated(OSObject *owner, void *to, void *ms, void *, void *)
++{
++	AppleARMBacklight *bl = (AppleARMBacklight *)owner;
++	uint32_t level = (uint32_t)(uintptr_t)to;
++	if (bl->fOff) {
++		if (level != 0) {
++			bl->fLastOn = level;    /* applied when the display comes on */
++		}
++		return kIOReturnSuccess;
++	}
++	bl->fFade->cancelTimeout();
++	bl->fFrom = bl->fLevel;
++	bl->fTo = level;
++	bl->fStart = mach_absolute_time();
++	nanoseconds_to_absolutetime(ON7_MIN((uint64_t)(uintptr_t)ms, 5000ULL) * NSEC_PER_MSEC, &bl->fPeriod);
++	fadeStep(bl, bl->fFade);
++	return kIOReturnSuccess;
++}
++
++IOReturn
++AppleARMBacklight::powerGated(OSObject *owner, void *on, void *, void *, void *)
++{
++	AppleARMBacklight *bl = (AppleARMBacklight *)owner;
++	bl->fFade->cancelTimeout();
++	if (on == NULL) {
++		bl->fOff = true;
++		bl->apply(0);
++	} else {
++		bl->fOff = false;
++		bl->apply(bl->fLastOn != 0 ? bl->fLastOn : ON7_BL_DEFAULT);
++	}
++	IOLog("ON7 BL: display %s, panel level %u\n", on ? "on" : "off", bl->fLevel);
++	return kIOReturnSuccess;
++}
++
++void
++AppleARMBacklight::displayPower(bool on)
++{
++	fWL->runAction(&AppleARMBacklight::powerGated, this, on ? (void *)1 : NULL);
++}
++
++IOReturn
++AppleARMBacklight::setProperties(OSObject *properties)
++{
++	OSDictionary *d = OSDynamicCast(OSDictionary, properties);
++	if (d == NULL) {
++		return kIOReturnBadArgument;
++	}
++	OSNumber *b = OSDynamicCast(OSNumber, d->getObject("brightness"));
++	OSNumber *f = OSDynamicCast(OSNumber, d->getObject("FadePeriod"));
++	if (fLogged < 40) {
++		fLogged++;
++		char name[32];
++		proc_selfname(name, sizeof(name));
++		OSNumber *l = OSDynamicCast(OSNumber, d->getObject("backlight-level"));
++		IOLog("ON7 BL: %s sets %u keys: brightness %d FadePeriod %d backlight-level %d\n", name,
++		    d->getCount(), b ? (int)b->unsigned32BitValue() : -1, f ? (int)f->unsigned32BitValue() : -1,
++		    l ? (int)l->unsigned32BitValue() : -1);
++	}
++	if (b == NULL) {
++		return kIOReturnSuccess;
++	}
++	int32_t v = (int32_t)b->unsigned32BitValue();
++	uint32_t to = v < 0 ? 0 : ON7_MIN((uint32_t)v, (uint32_t)ON7_BL_MAX);
++	uint64_t ms = f != NULL ? ((uint64_t)f->unsigned32BitValue() * 1000) >> 16 : 0;
++	fWL->runAction(&AppleARMBacklight::setGated, this, (void *)(uintptr_t)to, (void *)(uintptr_t)ms);
++	publish(to);
++	return kIOReturnSuccess;
++}
++#endif /* A5XELTE */
++
+ class IOMobileFramebufferUserClient : public IOUserClient {
+ 	OSDeclareDefaultStructors(IOMobileFramebufferUserClient);
+ 
+@@ -242,6 +501,21 @@
+ 		}
+ 		OSSafeReleaseNULL(es);
+ 	}
++#if defined(ARM64_BOARD_CONFIG_A5XELTE)
++	{
++		int bl_on = 1;
++		(void)PE_parse_boot_argn("on7bl", &bl_on, sizeof(bl_on));
++		AppleARMBacklight *bl = (bl_on && on7_dsim_setup()) ? OSTypeAlloc(AppleARMBacklight) : NULL;
++		if (bl != NULL && bl->init() && bl->attach(this) && bl->startBacklight()) {
++			fBL = bl;               /* keeps the reference */
++		} else {
++			if (bl != NULL) {
++				IOLog("ON7 BL: setup failed\n");
++			}
++			OSSafeReleaseNULL(bl);
++		}
++	}
++#endif
+ 	IOLog("SWEET FB: AppleCLCD %ux%u stride %u at 0x%llx, default surface %u, presented as %ux%u\n",
+ 	    fWidth, fHeight, fRowBytes, fPhys, fSurface->id, fLogicalW, fLogicalH);
+ 	return true;
+@@ -581,8 +855,10 @@
+ 		if (args->scalarInputCount >= 1) {
+ 			bool off = args->scalarInput[0] == 0;
+ #if defined(ARM64_BOARD_CONFIG_A5XELTE)
+-			int keep_on = 0;
+-			if (off && PE_parse_boot_argn("a5fb_keep_on", &keep_on, sizeof(keep_on)) && keep_on) {
++			int keep_on = 0, sleep = 0;
++			/* 0154: on7sleep=1 lets the display sleep although a5fb_keep_on is set */
++			(void)PE_parse_boot_argn("on7sleep", &sleep, sizeof(sleep));
++			if (off && !sleep && PE_parse_boot_argn("a5fb_keep_on", &keep_on, sizeof(keep_on)) && keep_on) {
+ 				IOLog("A5XELTE FB: display-off request ignored (a5fb_keep_on)\n");
+ 				break;
+ 			}
+@@ -594,6 +870,11 @@
+ 				fFB->fDirty = true;     /* on: redraw the latest frame */
+ 			}
+ 			IOLockUnlock(fFB->fLock);
++#if defined(ARM64_BOARD_CONFIG_A5XELTE)
++			if (fFB->fBL != NULL) {
++				fFB->fBL->displayPower(!off);
++			}
++#endif
+ 			IOLog("SWEET FB: display %s\n", off ? "off" : "on");
+ 		}
+ 		break;
