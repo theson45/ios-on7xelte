@@ -18,6 +18,8 @@ Commands (a5usb=3; with a5usb=2 the kernel drops them):
   - typed into this program's terminal, one per line, or
   - appended as lines to OUTDIR/cmd.txt by anything else (another shell,
     an agent): every new line is sent once.
+  - OUTDIR/join.txt (0172, written by on7xelte-wifi-join.py): its line is
+    sent once and the file deleted; the log shows "wifi join (hidden)".
 Answers come back in the log as "USB> ..." lines. Kernel commands: help,
 info, replay, ps, sample NAME[,NAME]|PID, kill PID [SIG], rd PA [N],
 reboot, recovery (reboot into TWRP).
@@ -91,14 +93,29 @@ def stdin_commands(q):
             q.put(line.strip())
 
 
+def shown(c):
+    """What the log may show of a command: never the Wi-Fi join arguments."""
+    return "wifi join (hidden)" if c.startswith("wifi join") else c
+
+
 def file_commands(path, q):
     """Send each line appended to path once (lines already there at start
-    are skipped)."""
+    are skipped); a join.txt next to it is sent once and deleted."""
     open(path, "a").close()
     pos = os.path.getsize(path)
     rest = b""
+    secret = os.path.join(os.path.dirname(path) or ".", "join.txt")
     while True:
         time.sleep(0.5)
+        if os.path.exists(secret):
+            try:
+                with open(secret, "r", encoding="utf-8") as f:
+                    line = f.read().strip()
+                os.remove(secret)
+                if line.startswith("wifi join "):
+                    q.put(line)
+            except OSError:
+                pass
         try:
             size = os.path.getsize(path)
             if size < pos:              # truncated: start over
@@ -172,7 +189,7 @@ def main():
                     while not cmds.empty():
                         c = cmds.get()
                         f.write((c + "\n").encode())
-                        note(f"sent: {c}")
+                        note(f"sent: {shown(c)}")
                     b = f.read(16384)
                     if not b:
                         time.sleep(0.05)

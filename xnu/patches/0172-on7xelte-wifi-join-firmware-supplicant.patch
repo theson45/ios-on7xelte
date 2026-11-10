@@ -1,0 +1,325 @@
+--- a/bsd/dev/on7xelte_wifi.c	2026-11-11 00:15:01.670650500 +0300
++++ b/bsd/dev/on7xelte_wifi.c	2026-11-11 00:17:40.904657800 +0300
+@@ -1649,6 +1649,62 @@
+ 	return ((uint32_t)p[0] << 24) | ((uint32_t)p[1] << 16) | ((uint32_t)p[2] << 8) | p[3];
+ }
+ 
++/*
++ * ---- W5 (0172): joining a network with the firmware's own supplicant ----
++ * After brcmfmac cfg80211.c brcmf_cfg80211_connect / brcmf_set_pmk (firmware PSK supplicant, "sup_wpa").
++ * Events seen during a join are told by name; LINK (flags bit 0) and PSK_SUP keyed (status 6) end it.
++ */
++static bool wf_joining;
++static uint32_t wf_j_link, wf_j_keyed, wf_j_fail, wf_j_ssid;
++
++static const char *
++wf_evname(uint32_t t)
++{
++	switch (t) {
++	case 0: return "SET_SSID";
++	case 1: return "JOIN";
++	case 3: return "AUTH";
++	case 5: return "DEAUTH";
++	case 6: return "DEAUTH_IND";
++	case 7: return "ASSOC";
++	case 9: return "REASSOC";
++	case 11: return "DISASSOC";
++	case 12: return "DISASSOC_IND";
++	case 16: return "LINK";
++	case 46: return "PSK_SUP";
++	case 54: return "IF";
++	default: return "event";
++	}
++}
++
++static void
++wf_join_event(uint32_t type, uint32_t status, uint32_t reason, uint32_t flags)
++{
++	printf("USB> wifi: JOIN event %s (%u) status %u reason %u flags 0x%x\n", wf_evname(type), type, status, reason,
++	    flags);
++	if (type == 0) {
++		wf_j_ssid = status + 1;
++		if (status != 0) {
++			wf_j_fail = 1;
++		}
++	} else if (type == 16) {
++		if (flags & 1) {
++			wf_j_link = 1;
++		} else {
++			wf_j_link = 0;
++			wf_j_fail = 2;
++		}
++	} else if (type == 46) {
++		if (status == 6) {              /* WLC_SUP_KEYED */
++			wf_j_keyed = 1;
++		} else if (status != 0 && status != 4 && status != 5) {
++			wf_j_fail = 3;
++		}
++	} else if (type == 6 || type == 12 || (type == 3 && status != 0)) {
++		wf_j_fail = 4;
++	}
++}
++
+ /* a Broadcom event (ethertype 0x886c): escan results printed, the rest told briefly */
+ static void
+ wf_event(const uint8_t *e, uint32_t len)
+@@ -1660,6 +1716,10 @@
+ 	uint32_t type = wf_be32(m + 4), status = wf_be32(m + 8), dlen = wf_be32(m + 20);
+ 	const uint8_t *d = m + 48;
+ 	wf_events++;
++	if (wf_joining && type != 69) {         /* 0172: a join's events, by name */
++		wf_join_event(type, status, wf_be32(m + 12), (uint32_t)m[2] << 8 | m[3]);
++		return;
++	}
+ 	if (type != 69) {                       /* WLC_E_ESCAN_RESULT */
+ 		if (wf_events < 20) {
+ 			printf("USB> wifi: event %u status %u (%u bytes)\n", type, status, dlen);
+@@ -1746,6 +1806,179 @@
+ 	    ns / 1000000, wf_scan_n, wf_events, wf_bad ? " (a bus access failed)" : "");
+ }
+ 
++/* hex text to bytes, up to a space or the end; -1 if not hex or too long */
++static int
++wf_unhex(const char **pp, uint8_t *out, uint32_t max)
++{
++	const char *p = *pp;
++	uint32_t n = 0;
++
++	while (*p == ' ') {
++		p++;
++	}
++	while (*p && *p != ' ') {
++		int v[2];
++		for (int k = 0; k < 2; k++) {
++			char c = p[k];
++			v[k] = (c >= '0' && c <= '9') ? c - '0' : (c >= 'a' && c <= 'f') ? c - 'a' + 10 :
++			    (c >= 'A' && c <= 'F') ? c - 'A' + 10 : -1;
++			if (v[k] < 0) {
++				return -1;
++			}
++		}
++		if (n >= max) {
++			return -1;
++		}
++		out[n++] = (uint8_t)(v[0] << 4 | v[1]);
++		p += 2;
++	}
++	*pp = p;
++	return (int)n;
++}
++
++static int
++wf_ioc_int(uint32_t cmd, uint32_t v)
++{
++	return wf_dcmd(cmd, true, (const uint8_t *)&v, 4);
++}
++
++static int
++wf_iovar_int(const char *name, uint32_t v)
++{
++	return wf_iovar_set(name, &v, 4);
++}
++
++/* the firmware's capability string ("cap"): does it have the supplicant (idsup)? */
++static void
++wf_cap_show(void)
++{
++	if (wf_iovar_get("cap", 300) != 0) {
++		return;
++	}
++	char v[200];
++	uint32_t k = 0;
++	for (; k < wf_ctl_len && k < sizeof(v) - 1 && wf_ctl[k]; k++) {
++		v[k] = (wf_ctl[k] >= 0x20 && wf_ctl[k] < 0x7f) ? (char)wf_ctl[k] : ' ';
++	}
++	v[k] = 0;
++	printf("USB> wifi: cap = \"%s\"\n", v);
++}
++
++/* 'wifi link': BSSID and RSSI of the current association */
++static void
++wf_link_cmd(void)
++{
++	if (!wf_w4_ready()) {
++		return;
++	}
++	static const uint8_t z[8] = { 0 };
++	int st = wf_dcmd(23, false, z, 6);              /* WLC_GET_BSSID */
++	uint8_t b[6] = { 0 };
++	if (st == 0 && wf_ctl_len >= 6) {
++		memcpy(b, wf_ctl, 6);
++	}
++	int st2 = wf_dcmd(127, false, z, 4);            /* WLC_GET_RSSI */
++	int32_t rssi = 0;
++	if (st2 == 0 && wf_ctl_len >= 4) {
++		memcpy(&rssi, wf_ctl, 4);
++	}
++	printf("USB> wifi: link: BSSID %02x:%02x:%02x:%02x:%02x:%02x (status %d), RSSI %d (status %d)\n", b[0], b[1],
++	    b[2], b[3], b[4], b[5], st, (int)rssi, st2);
++}
++
++/*
++ * 'wifi join SSIDHEX PASSHEX|-' (sent by tools/on7xelte-wifi-join.py; the echo lines hide the arguments).
++ * WPA2-PSK (AES) with the firmware supplicant, or an open network for '-'.
++ */
++static void
++wf_join_cmd(const char *a)
++{
++	uint8_t ssid[32], pw[64];
++	int sl = wf_unhex(&a, ssid, sizeof(ssid)), pl = 0;
++
++	while (*a == ' ') {
++		a++;
++	}
++	if (sl <= 0) {
++		printf("USB> wifi: join SSIDHEX PASSHEX|- (use tools/on7xelte-wifi-join.py)\n");
++		return;
++	}
++	if (!(a[0] == '-' && (a[1] == 0 || a[1] == ' '))) {
++		pl = wf_unhex(&a, pw, sizeof(pw) - 1);
++		if (pl < 8) {
++			printf("USB> wifi: join: the password must be 8..63 characters (hex)\n");
++			bzero(pw, sizeof(pw));
++			return;
++		}
++	}
++	char name[33];
++	for (int k = 0; k < sl; k++) {
++		name[k] = (ssid[k] >= 0x20 && ssid[k] < 0x7f) ? (char)ssid[k] : '?';
++	}
++	name[sl] = 0;
++	if (!wf_w4_ready()) {
++		bzero(pw, sizeof(pw));
++		return;
++	}
++	printf("USB> wifi: JOIN \"%s\" (%s)\n", name, pl ? "WPA2-PSK, firmware supplicant" : "open");
++	wf_cap_show();
++	int up = wf_ioc_int(WLC_UP, 0);
++	/* events of a join on, ESCAN kept */
++	int em = wf_iovar_get("event_msgs", 16);
++	if (em == 0 && wf_ctl_len >= 16) {
++		static const uint8_t ev[] = { 0, 1, 3, 5, 6, 7, 9, 11, 12, 16, 46, 69 };
++		uint8_t mask[16];
++		memcpy(mask, wf_ctl, 16);
++		for (uint32_t k = 0; k < sizeof(ev); k++) {
++			mask[ev[k] / 8] |= (uint8_t)(1u << (ev[k] % 8));
++		}
++		em = wf_iovar_set("event_msgs", mask, 16);
++	}
++	int infra = wf_ioc_int(20, 1);                  /* WLC_SET_INFRA: BSS */
++	int auth = wf_ioc_int(22, 0);                   /* WLC_SET_AUTH: open system */
++	int wsec = wf_ioc_int(134, pl ? 4u : 0u);       /* WLC_SET_WSEC: AES */
++	int wpa = wf_ioc_int(165, pl ? 0x80u : 0u);     /* WLC_SET_WPA_AUTH: WPA2_AUTH_PSK */
++	int sup = wf_iovar_int("sup_wpa", pl ? 1u : 0u);
++	int pmk = 0;
++	if (pl) {
++		/* wsec_pmk: key_len, flags WSEC_PASSPHRASE, the passphrase */
++		uint8_t k[68];
++		bzero(k, sizeof(k));
++		k[0] = (uint8_t)pl;
++		k[2] = 1;
++		memcpy(k + 4, pw, (size_t)pl);
++		pmk = wf_dcmd(268, true, k, sizeof(k));     /* WLC_SET_WSEC_PMK */
++		bzero(k, sizeof(k));
++	}
++	bzero(pw, sizeof(pw));
++	printf("USB> wifi: JOIN setup: up %d event_msgs %d infra %d auth %d wsec %d wpa_auth %d sup_wpa %d pmk %d\n", up,
++	    em, infra, auth, wsec, wpa, sup, pmk);
++	if (up == -999 || infra == -999 || pmk == -999) {
++		return;
++	}
++	uint8_t sj[36];
++	bzero(sj, sizeof(sj));
++	sj[0] = (uint8_t)sl;
++	memcpy(sj + 4, ssid, (size_t)sl);
++	wf_j_link = wf_j_keyed = wf_j_fail = wf_j_ssid = 0;
++	wf_joining = true;
++	int st = wf_dcmd(26, true, sj, sizeof(sj));     /* WLC_SET_SSID */
++	printf("USB> wifi: JOIN: SET_SSID status %d\n", st);
++	uint64_t t0 = mach_absolute_time(), ns = 0;
++	for (int t = 0; st == 0 && t < 10000 && !wf_bad && !wf_j_fail && !(wf_j_link && (wf_j_keyed || !pl)); t++) {
++		wf_poll();
++		delay(2000);
++	}
++	wf_joining = false;
++	absolutetime_to_nanoseconds(mach_absolute_time() - t0, &ns);
++	bool ok = wf_j_link && (wf_j_keyed || !pl);
++	printf("USB> wifi: JOIN %s after %llu ms (link %u keyed %u fail %u set_ssid %u)%s\n", ok ? "DONE: associated" :
++	    "FAILED", ns / 1000000, wf_j_link, wf_j_keyed, wf_j_fail, wf_j_ssid, wf_bad ? " (a bus access failed)" : "");
++	if (ok) {
++		wf_link_cmd();
++	}
++}
++
+ /* From the dvfs worker (a5xelte_dvfs.c dv_run), which may sleep. */
+ void on7xelte_wifi_cmd(const char *arg);
+ void
+@@ -1781,6 +2014,10 @@
+ 		wf_mac_cmd();
+ 	} else if (!strcmp(arg, "scan")) {
+ 		wf_scan_cmd();
++	} else if (!strncmp(arg, "join ", 5)) {
++		wf_join_cmd(arg + 5);
++	} else if (!strcmp(arg, "link")) {
++		wf_link_cmd();
+ 	} else if (!strcmp(arg, "con")) {
+ 		if (wf_fwup && wf_fw_cons) {
+ 			wf_bad = false;
+@@ -1798,7 +2035,7 @@
+ 	} else if (!strncmp(arg, "cr ", 3)) {
+ 		wf_rd_cmd(arg + 3, true);
+ 	} else {
+-		printf("USB> wifi: probe [keep] | off | st | fw | fw1 | ver | mac | scan | con | fifo 0-3 | div N | rd ADDR [N] | wr ADDR VAL | cr FN ADDR\n");
++		printf("USB> wifi: probe [keep] | off | st | fw | fw1 | ver | mac | scan | join SSIDHEX PASSHEX|- | link | con | fifo 0-3 | div N | rd ADDR [N] | wr ADDR VAL | cr FN ADDR\n");
+ 	}
+ }
+ 
+--- a/bsd/dev/a5xelte_usb.c	2026-11-11 00:15:02.270772200 +0300
++++ b/bsd/dev/a5xelte_usb.c	2026-11-11 00:17:40.905664200 +0300
+@@ -1203,7 +1203,11 @@
+ 	if (line[0] == '\0') {
+ 		return;
+ 	}
+-	printf("USB> $ %s %s\n", line, arg);
++	if (!strcmp(line, "wifi") && !strncmp(arg, "join", 4)) {
++		printf("USB> $ wifi join (hidden)\n");     /* 0172: the arguments carry a Wi-Fi password */
++	} else {
++		printf("USB> $ %s %s\n", line, arg);
++	}
+ 	if (!strcmp(line, "help")) {
+ 		printf("USB> commands: help | info | replay | ps | top [SECS] | bench | sample NAME[,NAME]|PID | "
+ 		    "kill PID [SIG] | rd PA [N] | io [reset|bench] | reboot | recovery\n");
+--- a/bsd/dev/a5xelte_dvfs.c	2026-11-11 00:15:02.363851100 +0300
++++ b/bsd/dev/a5xelte_dvfs.c	2026-11-11 00:17:40.906664100 +0300
+@@ -1806,6 +1806,13 @@
+ 	}
+ }
+ 
++/* 0172: a command's argument as printed; 'wifi join' carries a Wi-Fi password and is not shown */
++static const char *
++dv_shown(const char *cmd, const char *arg)
++{
++	return (!strcmp(cmd, "wifi") && !strncmp(arg, "join", 4)) ? "join (hidden)" : arg;
++}
++
+ static void
+ dv_worker(void *a __unused, wait_result_t w __unused)
+ {
+@@ -1819,7 +1826,7 @@
+ 		}
+ 		dv_run(dv.wcmd, dv.warg);
+ 		if (strcmp(dv.wcmd, "reg")) {
+-			printf("USB> dvfs: '%s %s' finished\n", dv.wcmd, dv.warg);
++			printf("USB> dvfs: '%s %s' finished\n", dv.wcmd, dv_shown(dv.wcmd, dv.warg));
+ 		}
+ 		dv.busy = false;
+ 	}
+@@ -1835,7 +1842,7 @@
+ 		return false;
+ 	}
+ 	if (dv.busy) {
+-		printf("USB> dvfs: busy with '%s %s'\n", dv.wcmd, dv.warg);
++		printf("USB> dvfs: busy with '%s %s'\n", dv.wcmd, dv_shown(dv.wcmd, dv.warg));
+ 		goto out;
+ 	}
+ 	if (!dv.started) {
