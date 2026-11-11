@@ -1,0 +1,1174 @@
+--- a/bsd/dev/on7xelte_wifi.c
++++ b/bsd/dev/on7xelte_wifi.c
+@@ -1531,6 +1531,15 @@
+ static void wf_event(const uint8_t *eth, uint32_t len);
+ static void wf_eapol(const uint8_t *e, uint32_t len);
+ static void wf_net_rx(const uint8_t *e, uint32_t len);
++/* 0179: Apple80211 (wifid): what a scan heard, the network joined, the link, the requests */
++static void wf_a8_bss(const uint8_t *b, uint32_t blen);
++static void wf_a8_scan_start(void);
++static void wf_a8_scan_over(void);
++static void wf_a8_joined(const uint8_t *ssid, int sl, bool sec);
++static void wf_a8_link(bool up);
++static errno_t wf_a8_ioctl(unsigned long cmd, void *data);
++static bool wf_scan_loud = true;        /* 'wifi scan' prints every network; wifid's scans do not */
++static uint32_t wf_j_why;               /* the last join that failed, as Apple80211's result: 21 key, 9 timeout, 2 */
+ static bool wf_net_event(uint32_t type, uint32_t status, uint32_t reason, uint32_t flags);
+ static uint64_t wf_rxn;
+ static void wf_glom_frame(uint8_t *f, uint32_t flen, uint32_t doff);
+@@ -1865,6 +1874,7 @@
+ 	}
+ 	const uint8_t *b = d + 12;              /* escan_result: buflen, version, sync_id, bss_count; then bss_info */
+ 	const uint8_t *bssid = b + 8;
++	wf_a8_bss(b, dlen - 12);                /* 0179 */
+ 	for (uint32_t i = 0; i < wf_scan_n && i < 32; i++) {
+ 		if (!memcmp(wf_seen[i], bssid, 6)) {
+ 			return;
+@@ -1874,6 +1884,9 @@
+ 		memcpy(wf_seen[wf_scan_n], bssid, 6);
+ 	}
+ 	wf_scan_n++;
++	if (!wf_scan_loud) {
++		return;
++	}
+ 	char ssid[33];
+ 	uint32_t sl = b[18] > 32 ? 32 : b[18];
+ 	for (uint32_t k = 0; k < sl; k++) {
+@@ -1894,7 +1907,9 @@
+ 	}
+ 	static const uint8_t zero4[4] = { 0, 0, 0, 0 };
+ 	int st = wf_dcmd(WLC_UP, true, zero4, 4);
+-	printf("USB> wifi: WLC_UP: status %d\n", st);
++	if (wf_scan_loud || st) {
++		printf("USB> wifi: WLC_UP: status %d\n", st);
++	}
+ 	if (st == -999) {
+ 		return;
+ 	}
+@@ -1906,7 +1921,9 @@
+ 		mask[69 / 8] |= (uint8_t)(1u << (69 % 8));
+ 		st = wf_iovar_set("event_msgs", mask, 16);
+ 	}
+-	printf("USB> wifi: event_msgs: status %d\n", st);
++	if (wf_scan_loud || st) {
++		printf("USB> wifi: event_msgs: status %d\n", st);
++	}
+ 	/* escan_params: version 1, action START, sync id; scan_params: any SSID/BSSID/BSS type, all channels */
+ 	uint8_t ep[76];
+ 	bzero(ep, sizeof(ep));
+@@ -1921,8 +1938,11 @@
+ 	wf_events = 0;
+ 	wf_scan_n = 0;
+ 	wf_scan_done = 0;
++	wf_a8_scan_start();
+ 	st = wf_iovar_set("escan", ep, sizeof(ep));
+-	printf("USB> wifi: escan: status %d\n", st);
++	if (wf_scan_loud || st) {
++		printf("USB> wifi: escan: status %d\n", st);
++	}
+ 	if (st) {
+ 		return;
+ 	}
+@@ -1934,6 +1954,7 @@
+ 	absolutetime_to_nanoseconds(mach_absolute_time() - t0, &ns);
+ 	printf("USB> wifi: scan %s after %llu ms: %u networks, %u events%s\n", wf_scan_done ? "done" : "NOT done",
+ 	    ns / 1000000, wf_scan_n, wf_events, wf_bad ? " (a bus access failed)" : "");
++	wf_a8_scan_over();
+ }
+ 
+ /*
+@@ -2850,7 +2871,7 @@
+ 	case SIOCDELMULTI:
+ 		return 0;
+ 	default:
+-		return EOPNOTSUPP;
++		return wf_a8_ioctl(cmd, data);  /* 0179: SIOCGA80211/SIOCSA80211 (wifid), else EOPNOTSUPP */
+ 	}
+ }
+ 
+@@ -2881,6 +2902,7 @@
+ 		init.unit = unit;
+ 		init.family = IFNET_FAMILY_ETHERNET;
+ 		init.type = IFT_ETHER;
++		init.subfamily = IFNET_SUBFAMILY_WIFI;  /* 0179: a radio's interface (wifid, configd) */
+ 		init.output = wf_if_output;
+ 		init.demux = ether_demux;
+ 		init.add_proto = ether_add_proto;
+@@ -2906,6 +2928,13 @@
+ 			ifnet_release(ifp);
+ 			continue;
+ 		}
++		static const uint8_t zero6[6] = { 0 };
++		if (!memcmp(wf_mac, zero6, 6)) {
++			/* 0179: made before the firmware runs: the board's NVRAM address (macaddr=00:90:4c:c5:12:38),
++			 * which the firmware reports as cur_etheraddr too; the join sets what it reports */
++			static const uint8_t nv[6] = { 0x00, 0x90, 0x4c, 0xc5, 0x12, 0x38 };
++			memcpy(wf_mac, nv, 6);
++		}
+ 		ifnet_set_lladdr(ifp, wf_mac, ETHER_ADDR_LEN);
+ 		wf_ifp = ifp;
+ 		break;
+@@ -2934,6 +2963,7 @@
+ 		dlil_post_msg(wf_ifp, KEV_DL_SUBCLASS, up ? KEV_DL_LINK_ON : KEV_DL_LINK_OFF, NULL, 0, FALSE);
+ 	}
+ 	printf("USB> wifi: NET: link %s\n", up ? "up" : "down");
++	wf_a8_link(up);                         /* 0179: told to wifid */
+ }
+ 
+ /* ---- DHCP (RFC 2131), on raw frames: the interface has no address before it ---- */
+@@ -3386,6 +3416,7 @@
+ 	uint8_t pmk[32];
+ };
+ static bool wf_auto_off;                /* 'wifi off' by hand: no auto-join until the next join */
++static uint64_t wf_auto_hold;           /* 0179: wifid left the network: no auto-join before this */
+ 
+ static int
+ wf_key_write(const void *buf, int len, off_t size)
+@@ -3471,6 +3502,7 @@
+ 	bool sec = pl > 0 || spmk != NULL;
+ 	char name[33];
+ 
++	wf_j_why = 2;
+ 	wf_ssid_name(ssid, sl, name);
+ 	if (!wf_w4_ready()) {
+ 		return false;
+@@ -3506,6 +3538,9 @@
+ 	if (mac == 0 && wf_ctl_len >= 6) {
+ 		memcpy(wf_hs.spa, wf_ctl, 6);
+ 		memcpy(wf_mac, wf_ctl, 6);
++		if (wf_ifp != NULL) {
++			ifnet_set_lladdr(wf_ifp, wf_mac, ETHER_ADDR_LEN);       /* 0179: en0 may be older */
++		}
+ 	} else {
+ 		mac = mac ? mac : -1;
+ 	}
+@@ -3567,8 +3602,11 @@
+ 			printf("USB> wifi: JOIN: \"%s\" saved for auto-join (%s, root only): %d\n", name, WF_KEY_PATH, err);
+ 		}
+ 		wf_link_cmd();
++		wf_a8_joined(ssid, sl, sec);    /* 0179: before the link goes up (wifid is told then) */
+ 		wf_net_up();                    /* 0175: the handshake stays on for rekeys */
+ 	} else {
++		/* 0179: keys asked for and none agreed on: the password; nothing went wrong but time: a timeout */
++		wf_j_why = sec && (wf_hs.steps || wf_j_link) ? 21 : (!wf_j_fail && !wf_bad && st == 0) ? 9 : 2;
+ 		wf_hs_clear();
+ 	}
+ 	return ok;
+@@ -3641,7 +3679,7 @@
+ 	struct wf_saved k;
+ 	int ret;
+ 
+-	if (wf_auto_off) {
++	if (wf_auto_off || mach_absolute_time() < wf_auto_hold) {
+ 		return ECANCELED;
+ 	}
+ 	if (wf_fwup && wf_net_link) {
+@@ -3664,6 +3702,935 @@
+ 	return ret;
+ }
+ 
++/*
++ * ---- 0179: Apple80211, answered in the kernel ----
++ * iOS's Wi-Fi side (wifid, and through it Settings and the status bar) talks to a Wi-Fi driver with
++ * SIOCGA80211/SIOCSA80211 on any socket: a struct apple80211req naming the interface, a request type, a value
++ * and a buffer in the caller's memory. XNU hands an interface ioctl it does not know to the interface: en0's
++ * wf_if_ioctl passes them here. After y2sios kernel/xnu/files/bsd/dev/redwood_apple80211.c (MIT), which has
++ * the request types and the layouts of iOS 16.5 (read out of IO80211.framework) and the events (kernel events
++ * of class 6, subclass 1, code = Apple80211's event, the interface's name first in 16 bytes).
++ *
++ * A request is answered at once from what is known (the radio's power, the channels, the last scan, the
++ * network joined); a scan, a join, leaving and the power are done by a thread of its own (wf_a8_thread, under
++ * the bus lock), which tells how it went with an event: SCAN_DONE, ASSOC_DONE (then ASSOCIATE_RESULT: 1 ok,
++ * 21 a wrong key, 9 a timeout, 2 else), POWER; the link's changes (wf_net_link_set) as SSID, BSSID and LINK.
++ * A network joined from Settings is saved for auto-join at boot (on7wifid) like 'wifi join ... save'.
++ * Every request is logged (who, get or set, the type, the value, the length), never what it carries.
++ */
++#define SIOCSA80211             0x802869c8u     /* _IOW('i', 200, struct apple80211req) */
++#define SIOCGA80211             0xc02869c9u     /* _IOWR('i', 201, struct apple80211req) */
++
++struct apple80211req {
++	char req_if_name[16];
++	int32_t req_type;
++	int32_t req_val;
++	uint32_t req_len;
++	user_addr_t req_data __attribute__((aligned(8)));
++};
++
++#define A8_CH_20MHZ             0x2u
++#define A8_CH_2GHZ              0x8u
++#define A8_CH_ACTIVE            0x80u
++
++struct apple80211_channel {
++	uint32_t version, channel, flags;
++};
++
++/* SUPPORTED_CHANNELS (27), HW_SUPPORTED_CHANNELS (254) */
++struct apple80211_channels {
++	uint32_t version, count;
++	struct apple80211_channel channels[401];
++	uint32_t unused;
++};
++
++/* CHANNELS_INFO (207) */
++struct apple80211_channels_info {
++	uint8_t unknown_0[12];
++	uint16_t count;
++	uint8_t unknown_1[800];
++	uint8_t number[400], indoor[400], dfs[400], passive[400], wide_40[400], wide_80[400];
++	uint8_t unknown_2[1602];
++	uint32_t flags[400];
++	uint8_t unknown_3[3600];
++} __attribute__((packed));
++
++/* SCAN_REQ (10) */
++struct apple80211_scan_request {
++	uint32_t version, bss_type;
++	uint8_t bssid[6], unused_0[2];
++	uint32_t ssid_length;
++	uint8_t ssid[32];
++	uint32_t scan_type;
++	uint32_t phy_mode;
++	uint16_t dwell_ms, unused_1;
++	uint32_t rest_ms;
++	uint32_t channel_count;
++	struct apple80211_channel channels[400];
++	uint64_t flags;
++	uint32_t unused_2;
++	uint32_t name_count;
++	uint8_t names[10][56];
++	uint32_t short_ssid, unused_3;
++};
++
++/* SCAN_RESULT (11), CURRENT_NETWORK (103) */
++struct apple80211_scan_result {
++	uint32_t version;
++	struct apple80211_channel channel;
++	uint16_t noise_known;
++	int16_t noise, snr, rssi;
++	uint16_t beacon_interval, capability;
++	uint8_t bssid[6];
++	uint8_t rate_count, unused_0;
++	uint32_t rates[15];
++	uint8_t ssid_length, ssid[32], unused_1[3];
++	uint32_t age_ms;
++	uint8_t flags, unused_2;
++	uint16_t elements_length;               /* comes in as the room there is */
++	uint8_t elements[1024];
++};
++
++/* ASSOCIATE (20) */
++struct apple80211_assoc {
++	uint32_t version;
++	uint16_t mode, auth_lower, auth_upper, unused_0;
++	uint32_t ssid_length;
++	uint8_t ssid[32];
++	uint8_t bssid[6], unused_1[2];
++	uint32_t key_version, key_length, key_cipher;   /* 10: a passphrase as typed; 6: the PMK */
++	uint16_t key_flags, key_index;
++	uint8_t key[64];
++	uint8_t rest[0x250 - 0x88];
++};
++#define A8_CIPHER_PMK           6
++#define A8_CIPHER_PASSPHRASE    10
++
++/* the link event's data (at least 32 bytes, or the framework drops it) */
++struct apple80211_link_changed {
++	uint8_t down, unused_0[3];
++	int32_t rssi;
++	uint16_t snr, noise;
++	uint8_t unused_1[4];
++	uint8_t involuntary, unused_2[3];
++	uint32_t reason, subreason;
++	uint8_t unused_3[4];
++};
++
++_Static_assert(sizeof(struct apple80211req) == 40, "apple80211req");
++_Static_assert(sizeof(struct apple80211_assoc) == 592 && offsetof(struct apple80211_assoc, key) == 0x48, "assoc");
++_Static_assert(sizeof(struct apple80211_link_changed) == 32 && offsetof(struct apple80211_link_changed, reason) == 0x14,
++    "link_changed");
++_Static_assert(sizeof(struct apple80211_channels) == 4824, "channels");
++_Static_assert(sizeof(struct apple80211_channels_info) == 10016 && offsetof(struct apple80211_channels_info, number) == 0x32e &&
++    offsetof(struct apple80211_channels_info, flags) == 0x12d0, "channels_info");
++_Static_assert(sizeof(struct apple80211_scan_request) == 5456 && offsetof(struct apple80211_scan_request, channels) == 0x48 &&
++    offsetof(struct apple80211_scan_request, flags) == 0x1308 && offsetof(struct apple80211_scan_request, names) == 0x1318,
++    "scan_request");
++_Static_assert(sizeof(struct apple80211_scan_result) == 1164 && offsetof(struct apple80211_scan_result, ssid_length) == 0x60 &&
++    offsetof(struct apple80211_scan_result, age_ms) == 0x84 && offsetof(struct apple80211_scan_result, elements) == 0x8c,
++    "scan_result");
++
++enum { A8_EV_POWER = 1, A8_EV_SSID = 2, A8_EV_BSSID = 3, A8_EV_LINK = 4, A8_EV_ASSOC_DONE = 9, A8_EV_SCAN_DONE = 10 };
++enum { A8_RQ_POWER = 1, A8_RQ_LEAVE = 2, A8_RQ_JOIN = 4, A8_RQ_SCAN = 8 };
++
++#define WF_NBSS         32u
++struct wf_bss {
++	uint8_t bssid[6], sl, chan;
++	uint8_t ssid[32];
++	int16_t rssi, noise;
++	uint16_t cap, beacon, iel;
++	bool sec;
++	uint8_t ie[512];
++};
++
++static LCK_MTX_DECLARE(wf_a8_lock, &wf_lck_grp);       /* all below but wf_bss_new (the bus lock's) */
++static struct wf_bss wf_bss_new[WF_NBSS];               /* the scan going on */
++static uint32_t wf_bss_nn;
++static struct wf_bss wf_bss_tab[WF_NBSS];               /* the last scan's */
++static uint32_t wf_bss_n, wf_a8_next;
++static struct wf_bss wf_cur;                            /* the network joined, while wf_cur_ok */
++static bool wf_cur_ok;
++static bool wf_a8_power = true;                         /* the radio's power as wifid set it */
++static uint32_t wf_a8_rq, wf_a8_busy;                   /* A8_RQ_* asked for / being done */
++static uint32_t wf_a8_result;                           /* of the last join wifid asked for; 0 while it runs */
++static bool wf_a8_leaving;                              /* a leave asked for: the link's loss is not involuntary */
++static int wf_a8_started;
++static struct {
++	uint8_t ssid[32], key[64];
++	int sl, kl, kind;                               /* kind 0 open, 1 passphrase, 2 PMK */
++} wf_a8_jp;
++
++/* ---- what a scan heard (escan results; under the bus lock) ---- */
++static void
++wf_a8_scan_start(void)
++{
++	wf_bss_nn = 0;
++}
++
++static void
++wf_a8_bss(const uint8_t *b, uint32_t blen)
++{
++	if (blen < 128) {
++		return;
++	}
++	uint32_t bl = (uint32_t)b[4] | (uint32_t)b[5] << 8 | (uint32_t)b[6] << 16 | (uint32_t)b[7] << 24;
++	if (bl > blen) {
++		bl = blen;
++	}
++	struct wf_bss *e = NULL;
++	for (uint32_t i = 0; i < wf_bss_nn; i++) {
++		if (!memcmp(wf_bss_new[i].bssid, b + 8, 6)) {
++			e = &wf_bss_new[i];
++			break;
++		}
++	}
++	if (e == NULL) {
++		if (wf_bss_nn == WF_NBSS) {
++			return;
++		}
++		e = &wf_bss_new[wf_bss_nn++];
++	}
++	bzero(e, sizeof(*e));
++	memcpy(e->bssid, b + 8, 6);
++	e->beacon = (uint16_t)(b[14] | b[15] << 8);
++	e->cap = (uint16_t)(b[16] | b[17] << 8);
++	e->sl = b[18] > 32 ? 32 : b[18];
++	memcpy(e->ssid, b + 19, e->sl);
++	e->chan = b[88] ? b[88] : b[72];                /* ctl_ch, else the chanspec's channel */
++	e->rssi = (int16_t)(b[78] | b[79] << 8);
++	e->noise = (int8_t)b[80];
++	uint32_t io = (uint32_t)b[116] | (uint32_t)b[117] << 8;
++	uint32_t il = (uint32_t)b[120] | (uint32_t)b[121] << 8 | (uint32_t)b[122] << 16 | (uint32_t)b[123] << 24;
++	if (io >= 128 && io <= bl && il <= bl - io) {
++		const uint8_t *ie = b + io;
++		uint32_t at = 0;
++		while (at + 2 <= il && at + 2 + ie[at + 1] <= il && at + 2 + ie[at + 1] <= sizeof(e->ie)) {
++			if (ie[at] == 48) {
++				e->sec = true;          /* RSN */
++			}
++			at += 2 + ie[at + 1];
++		}
++		memcpy(e->ie, ie, at);
++		e->iel = (uint16_t)at;
++	}
++	e->sec = e->sec || (e->cap & 0x10);
++}
++
++static void
++wf_a8_scan_over(void)
++{
++	lck_mtx_lock(&wf_a8_lock);
++	memcpy(wf_bss_tab, wf_bss_new, wf_bss_nn * sizeof(wf_bss_new[0]));
++	wf_bss_n = wf_bss_nn;
++	wf_a8_next = 0;
++	lck_mtx_unlock(&wf_a8_lock);
++}
++
++/* ---- the network joined (wf_join, under the bus lock, before the link goes up) ---- */
++static void
++wf_a8_joined(const uint8_t *ssid, int sl, bool sec)
++{
++	static const uint8_t z[12] = { 0 };
++	struct wf_bss *c = kalloc_data(sizeof(*c), Z_WAITOK | Z_ZERO);
++	if (c == NULL) {
++		return;
++	}
++	c->sl = (uint8_t)sl;
++	memcpy(c->ssid, ssid, (size_t)sl);
++	c->sec = sec;
++	if (wf_dcmd(23, false, z, 6) == 0 && wf_ctl_len >= 6) {         /* WLC_GET_BSSID */
++		memcpy(c->bssid, wf_ctl, 6);
++	}
++	int32_t v = 0;
++	if (wf_dcmd(127, false, z, 4) == 0 && wf_ctl_len >= 4) {        /* WLC_GET_RSSI */
++		memcpy(&v, wf_ctl, 4);
++		c->rssi = (int16_t)v;
++	}
++	if (wf_dcmd(29, false, z, 12) == 0 && wf_ctl_len >= 4) {         /* WLC_GET_CHANNEL: channel_info_t */
++		memcpy(&v, wf_ctl, 4);
++		c->chan = (uint8_t)v;
++	}
++	bool found = false;
++	for (uint32_t i = 0; i < wf_bss_nn; i++) {
++		if (!memcmp(wf_bss_new[i].bssid, c->bssid, 6) && wf_bss_new[i].sl == c->sl &&
++		    !memcmp(wf_bss_new[i].ssid, c->ssid, c->sl)) {
++			c->cap = wf_bss_new[i].cap;
++			c->beacon = wf_bss_new[i].beacon;
++			c->noise = wf_bss_new[i].noise;
++			c->chan = c->chan ? c->chan : wf_bss_new[i].chan;
++			c->iel = wf_bss_new[i].iel;
++			memcpy(c->ie, wf_bss_new[i].ie, c->iel);
++			found = true;
++			break;
++		}
++	}
++	if (!found) {
++		/* no scan heard it: its elements as they must be (SSID, rates, channel, RSN WPA2-PSK CCMP) */
++		static const uint8_t rates[] = { 1, 8, 0x82, 0x84, 0x8b, 0x96, 0x0c, 0x12, 0x18, 0x24 };
++		static const uint8_t rsn[] = { 48, 20, 1, 0, 0x00, 0x0f, 0xac, 4, 1, 0, 0x00, 0x0f, 0xac, 4, 1, 0, 0x00, 0x0f,
++			                       0xac, 2, 0x0c, 0 };
++		uint32_t n = 0;
++		c->ie[n++] = 0;
++		c->ie[n++] = (uint8_t)sl;
++		memcpy(c->ie + n, ssid, (size_t)sl);
++		n += (uint32_t)sl;
++		memcpy(c->ie + n, rates, sizeof(rates));
++		n += sizeof(rates);
++		c->ie[n++] = 3;
++		c->ie[n++] = 1;
++		c->ie[n++] = c->chan;
++		if (sec) {
++			memcpy(c->ie + n, rsn, sizeof(rsn));
++			n += sizeof(rsn);
++		}
++		c->iel = (uint16_t)n;
++		c->cap = (uint16_t)(0x0001 | 0x0400 | (sec ? 0x0010 : 0));     /* ESS, short slot, privacy */
++		c->beacon = 100;
++	}
++	lck_mtx_lock(&wf_a8_lock);
++	wf_cur = *c;
++	wf_cur_ok = true;
++	lck_mtx_unlock(&wf_a8_lock);
++	printf("USB> wifi: A8: joined: channel %u, RSSI %d, %s scan, %u bytes of elements\n", c->chan, c->rssi,
++	    found ? "from the" : "not in the last", c->iel);
++	kfree_data(c, sizeof(*c));
++}
++
++/* ---- events ---- */
++static void
++wf_a8_post(uint32_t code, const void *data, uint32_t len)
++{
++	struct kev_msg m;
++	char name[16];
++
++	bzero(&m, sizeof(m));
++	bzero(name, sizeof(name));
++	if (wf_ifp != NULL) {
++		snprintf(name, sizeof(name), "%s%u", ifnet_name(wf_ifp), ifnet_unit(wf_ifp));
++	} else {
++		strlcpy(name, "en0", sizeof(name));
++	}
++	m.vendor_code = KEV_VENDOR_APPLE;
++	m.kev_class = KEV_IEEE80211_CLASS;
++	m.kev_subclass = 1;
++	m.event_code = code;
++	m.dv[0].data_length = sizeof(name);
++	m.dv[0].data_ptr = name;
++	if (len != 0) {
++		m.dv[1].data_length = len;
++		m.dv[1].data_ptr = __DECONST(void *, data);
++	}
++	(void)kev_post_msg(&m);
++}
++
++static void
++wf_a8_link(bool up)
++{
++	struct apple80211_link_changed l;
++
++	bzero(&l, sizeof(l));
++	lck_mtx_lock(&wf_a8_lock);
++	if (!up) {
++		wf_cur_ok = false;
++	}
++	l.down = !up;
++	l.rssi = up ? wf_cur.rssi : 0;
++	if (up && wf_cur.noise != 0) {
++		l.noise = (uint16_t)wf_cur.noise;
++		l.snr = (uint16_t)(wf_cur.rssi - wf_cur.noise);
++	}
++	l.involuntary = !up && !wf_a8_leaving;
++	l.reason = l.involuntary ? 4 : 0;
++	lck_mtx_unlock(&wf_a8_lock);
++	wf_a8_post(A8_EV_SSID, NULL, 0);
++	wf_a8_post(A8_EV_BSSID, NULL, 0);
++	wf_a8_post(A8_EV_LINK, &l, sizeof(l));
++}
++
++/* ---- the thread that does what takes long (the bus lock is taken here, never in a request) ---- */
++static void
++wf_a8_fw(void)
++{
++	if (!wf_fwup) {
++		printf("USB> wifi: A8: firmware\n");
++		wf_bus4 = true;
++		wf_fw();
++	}
++}
++
++static void
++wf_a8_disassoc(void)
++{
++	uint8_t scb[12];
++
++	bzero(scb, sizeof(scb));
++	scb[0] = 3;                                     /* reason: leaving */
++	lck_mtx_lock(&wf_a8_lock);
++	wf_a8_leaving = true;
++	lck_mtx_unlock(&wf_a8_lock);
++	int st = wf_fwup ? wf_dcmd(52, true, scb, sizeof(scb)) : 0;     /* WLC_DISASSOC */
++	wf_hs_clear();
++	wf_net_link_set(false);
++	lck_mtx_lock(&wf_a8_lock);
++	wf_a8_leaving = false;
++	lck_mtx_unlock(&wf_a8_lock);
++	printf("USB> wifi: A8: left the network (%d)\n", st);
++}
++
++static void
++wf_a8_thread(void *a __unused, wait_result_t w __unused)
++{
++	struct timespec ts = { 5, 0 };
++	uint8_t ssid[32], key[64];
++
++	for (;;) {
++		lck_mtx_lock(&wf_a8_lock);
++		if (!wf_a8_rq) {
++			(void)msleep(&wf_a8_rq, &wf_a8_lock, PZERO, "wifia8", &ts);
++		}
++		uint32_t rq = wf_a8_rq;
++		wf_a8_rq = 0;
++		wf_a8_busy = rq;
++		int sl = wf_a8_jp.sl, kl = wf_a8_jp.kl, kind = wf_a8_jp.kind;
++		memcpy(ssid, wf_a8_jp.ssid, sizeof(ssid));
++		memcpy(key, wf_a8_jp.key, sizeof(key));
++		bzero(&wf_a8_jp, sizeof(wf_a8_jp));
++		bool power = wf_a8_power, joined = wf_cur_ok;
++		struct wf_bss cur = wf_cur;
++		lck_mtx_unlock(&wf_a8_lock);
++
++		uint32_t result = 0;
++		lck_mtx_lock(&wf_bus);
++		if (rq & A8_RQ_POWER) {
++			static const uint8_t zero4[4] = { 0, 0, 0, 0 };
++			if (power) {
++				wf_auto_off = false;
++				wf_auto_hold = 0;
++				wf_a8_fw();
++				int st = wf_fwup ? wf_dcmd(WLC_UP, true, zero4, 4) : -1;
++				printf("USB> wifi: A8: power on: firmware %s, WLC_UP %d\n", wf_fwup ? "running" : "NOT running", st);
++			} else {
++				if (wf_net_link) {
++					wf_a8_disassoc();
++				}
++				wf_auto_off = true;             /* until it is on again (or a join) */
++				int st = wf_fwup ? wf_dcmd(3, true, zero4, 4) : 0;      /* WLC_DOWN */
++				printf("USB> wifi: A8: power off: WLC_DOWN %d (firmware kept)\n", st);
++			}
++		}
++		if ((rq & A8_RQ_LEAVE) && !(rq & A8_RQ_JOIN)) {
++			if (wf_net_link || wf_fwup) {
++				wf_a8_disassoc();
++			}
++			wf_auto_hold = mach_absolute_time() + wf_ms_abs(120000);       /* on7wifid: not straight back */
++		}
++		if (rq & A8_RQ_JOIN) {
++			char name[33];
++			wf_ssid_name(ssid, sl, name);
++			if (!power) {
++				result = 2;
++			} else if (joined && wf_net_link && cur.sl == sl && !memcmp(cur.ssid, ssid, (size_t)sl)) {
++				result = 1;                     /* already there (auto-join at boot, say) */
++				printf("USB> wifi: A8: join \"%s\": already joined\n", name);
++			} else {
++				wf_a8_fw();
++				if (wf_net_link) {
++					wf_a8_disassoc();
++				}
++				bool ok = wf_fwup && wf_join(ssid, sl, kind == 1 ? key : NULL, kind == 1 ? kl : 0,
++				    kind == 2 ? key : NULL, true);
++				result = ok ? 1 : wf_fwup ? wf_j_why : 2;
++			}
++			bzero(key, sizeof(key));
++		}
++		if ((rq & A8_RQ_SCAN) && power) {
++			wf_a8_fw();
++			if (wf_fwup) {
++				wf_scan_loud = false;
++				wf_scan_cmd();
++				wf_scan_loud = true;
++			}
++		}
++		if (!rq && joined && wf_fwup && wf_net_link) {
++			static const uint8_t z[4] = { 0 };
++			int32_t v = 0;
++			if (wf_dcmd(127, false, z, 4) == 0 && wf_ctl_len >= 4) {        /* the RSSI, every 5 s */
++				memcpy(&v, wf_ctl, 4);
++				lck_mtx_lock(&wf_a8_lock);
++				wf_cur.rssi = (int16_t)v;
++				lck_mtx_unlock(&wf_a8_lock);
++			}
++		}
++		if (!wf_fwup) {
++			wf_net_link_set(false);
++		}
++		lck_mtx_unlock(&wf_bus);
++
++		if (rq & A8_RQ_POWER) {
++			wf_a8_post(A8_EV_POWER, NULL, 0);
++		}
++		if (rq & A8_RQ_JOIN) {
++			lck_mtx_lock(&wf_a8_lock);
++			wf_a8_result = result;
++			lck_mtx_unlock(&wf_a8_lock);
++			printf("USB> wifi: A8: join over: result %u\n", result);
++			wf_a8_post(A8_EV_ASSOC_DONE, NULL, 0);
++		}
++		if (rq & A8_RQ_SCAN) {
++			if (!power) {
++				lck_mtx_lock(&wf_a8_lock);
++				wf_bss_n = 0;
++				wf_a8_next = 0;
++				lck_mtx_unlock(&wf_a8_lock);
++			}
++			wf_a8_post(A8_EV_SCAN_DONE, NULL, 0);
++		}
++		lck_mtx_lock(&wf_a8_lock);
++		wf_a8_busy = 0;
++		lck_mtx_unlock(&wf_a8_lock);
++	}
++}
++
++static void
++wf_a8_start(void)
++{
++	if (__atomic_exchange_n(&wf_a8_started, 1, __ATOMIC_ACQ_REL)) {
++		return;
++	}
++	thread_t t;
++	if (kernel_thread_start(wf_a8_thread, NULL, &t) == KERN_SUCCESS) {
++		thread_deallocate(t);
++	} else {
++		printf("USB> wifi: A8: the thread did not start\n");
++		__atomic_store_n(&wf_a8_started, 0, __ATOMIC_RELEASE);
++	}
++}
++
++static void
++wf_a8_ask(uint32_t what)
++{
++	wf_a8_start();
++	lck_mtx_lock(&wf_a8_lock);
++	wf_a8_rq |= what;
++	wakeup(&wf_a8_rq);
++	lck_mtx_unlock(&wf_a8_lock);
++}
++
++/* ---- the answers ---- */
++static const char *
++wf_a8_name(int32_t t)
++{
++	switch (t) {
++	case 1: return "SSID";
++	case 2: return "AUTH_TYPE";
++	case 4: return "CHANNEL";
++	case 9: return "BSSID";
++	case 10: return "SCAN_REQ";
++	case 11: return "SCAN_RESULT";
++	case 12: return "CARD_CAPABILITIES";
++	case 13: return "STATE";
++	case 14: return "PHY_MODE";
++	case 15: return "OP_MODE";
++	case 16: return "RSSI";
++	case 17: return "NOISE";
++	case 19: return "POWER";
++	case 20: return "ASSOCIATE";
++	case 21: return "ASSOCIATE_RESULT";
++	case 22: return "DISASSOCIATE";
++	case 27: return "SUPPORTED_CHANNELS";
++	case 28: return "LOCALE";
++	case 43: return "DRIVER_VERSION";
++	case 44: return "HARDWARE_VERSION";
++	case 51: return "COUNTRY_CODE";
++	case 103: return "CURRENT_NETWORK";
++	case 207: return "CHANNELS_INFO";
++	case 254: return "HW_SUPPORTED_CHANNELS";
++	default: return "?";
++	}
++}
++
++static void
++wf_a8_chan(struct apple80211_channel *c, uint32_t ch)
++{
++	c->version = 1;
++	c->channel = ch;
++	c->flags = A8_CH_20MHZ | A8_CH_2GHZ | A8_CH_ACTIVE;
++}
++
++static int
++wf_a8_give(const struct apple80211req *r, const void *d, size_t n)
++{
++	return r->req_data == USER_ADDR_NULL ? 0 : copyout(d, r->req_data, n < r->req_len ? n : r->req_len);
++}
++
++/* a network as a scan's result has it; the caller says how much room for elements there is */
++static int
++wf_a8_give_bss(const struct apple80211req *r, const struct wf_bss *e)
++{
++	struct apple80211_scan_result *x = kalloc_data(sizeof(*x), Z_WAITOK | Z_ZERO);
++	uint32_t room = sizeof(x->elements);
++	int err;
++
++	if (x == NULL) {
++		return ENOMEM;
++	}
++	if (r->req_len >= sizeof(*x) && r->req_data != USER_ADDR_NULL &&
++	    copyin(r->req_data, x, offsetof(struct apple80211_scan_result, elements)) == 0 && x->elements_length < room) {
++		room = x->elements_length;
++	}
++	bzero(x, sizeof(*x));
++	x->version = 1;
++	wf_a8_chan(&x->channel, e->chan);
++	x->rssi = e->rssi;
++	if (e->noise != 0) {
++		x->noise = e->noise;
++		x->snr = (int16_t)(e->rssi - e->noise);
++	}
++	x->beacon_interval = e->beacon;
++	x->capability = e->cap;
++	memcpy(x->bssid, e->bssid, 6);
++	x->ssid_length = e->sl;
++	memcpy(x->ssid, e->ssid, e->sl);
++	x->elements_length = (uint16_t)(e->iel <= room ? e->iel : 0);
++	memcpy(x->elements, e->ie, x->elements_length);
++	for (uint32_t at = 0; at + 2 <= e->iel && at + 2 + e->ie[at + 1] <= e->iel; at += 2 + e->ie[at + 1]) {
++		for (uint32_t i = 0; (e->ie[at] == 1 || e->ie[at] == 50) && i < e->ie[at + 1]; i++) {
++			uint32_t rate = (e->ie[at + 2 + i] & 0x7fu) / 2;
++			if (rate != 0 && rate <= 54 && x->rate_count < 15) {
++				x->rates[x->rate_count++] = rate;
++			}
++		}
++	}
++	err = wf_a8_give(r, x, sizeof(*x));
++	kfree_data(x, sizeof(*x));
++	return err;
++}
++
++static int
++wf_a8_get(struct apple80211req *r)
++{
++	int err = 0;
++
++	switch (r->req_type) {
++	case 43:
++	case 44: {
++		static const char name[256] = "on7xelte: BCM43430A1 (SDIO), host WPA2";
++		return wf_a8_give(r, name, sizeof(name));
++	}
++	case 12: {
++		/* AES, AES-CCM, power management, short slot and preamble, WPA2, WME, short GI 20 MHz (y2sios) */
++		uint8_t bits[13] = { 0 };
++		static const uint8_t has[] = { 2, 3, 6, 9, 10, 14, 17, 19 };
++		for (uint32_t i = 0; i < sizeof(has); i++) {
++			bits[has[i] / 8] |= (uint8_t)(1u << (has[i] % 8));
++		}
++		return wf_a8_give(r, bits, sizeof(bits));
++	}
++	case 19: {
++		struct {
++			uint32_t version, radios, state[4];
++		} p = { .version = 1, .radios = 1 };
++		lck_mtx_lock(&wf_a8_lock);
++		p.state[0] = wf_a8_power;
++		lck_mtx_unlock(&wf_a8_lock);
++		return wf_a8_give(r, &p, sizeof(p));
++	}
++	case 15:
++		r->req_val = 1;                 /* a station */
++		return 0;
++	case 27:
++	case 254: {
++		struct apple80211_channels *c = kalloc_data(sizeof(*c), Z_WAITOK | Z_ZERO);
++		if (c == NULL) {
++			return ENOMEM;
++		}
++		c->version = 1;
++		c->count = 13;
++		for (uint32_t i = 0; i < 13; i++) {
++			wf_a8_chan(&c->channels[i], i + 1);
++		}
++		err = wf_a8_give(r, c, sizeof(*c));
++		kfree_data(c, sizeof(*c));
++		return err;
++	}
++	case 207: {
++		struct apple80211_channels_info *c = kalloc_data(sizeof(*c), Z_WAITOK | Z_ZERO);
++		if (c == NULL) {
++			return ENOMEM;
++		}
++		c->count = 13;
++		for (uint32_t i = 0; i < 13; i++) {
++			c->number[i] = (uint8_t)(i + 1);
++			c->flags[i] = A8_CH_20MHZ | A8_CH_2GHZ | A8_CH_ACTIVE;
++		}
++		err = wf_a8_give(r, c, sizeof(*c));
++		kfree_data(c, sizeof(*c));
++		return err;
++	}
++	case 21:
++		lck_mtx_lock(&wf_a8_lock);
++		r->req_val = (int32_t)wf_a8_result;
++		lck_mtx_unlock(&wf_a8_lock);
++		return 0;
++	case 11: {
++		struct wf_bss *e = kalloc_data(sizeof(*e), Z_WAITOK);
++		bool there;
++		if (e == NULL) {
++			return ENOMEM;
++		}
++		lck_mtx_lock(&wf_a8_lock);
++		uint32_t i = wf_a8_next++;
++		there = i < wf_bss_n;
++		if (there) {
++			*e = wf_bss_tab[i];
++		}
++		lck_mtx_unlock(&wf_a8_lock);
++		err = there ? wf_a8_give_bss(r, e) : EIO;
++		kfree_data(e, sizeof(*e));
++		return err;
++	}
++	default:
++		break;
++	}
++
++	/* the rest is about the network joined */
++	struct wf_bss *c = kalloc_data(sizeof(*c), Z_WAITOK);
++	if (c == NULL) {
++		return ENOMEM;
++	}
++	lck_mtx_lock(&wf_a8_lock);
++	bool j = wf_cur_ok && wf_net_link;
++	uint32_t busy = wf_a8_busy | wf_a8_rq;
++	*c = wf_cur;
++	lck_mtx_unlock(&wf_a8_lock);
++	switch (r->req_type) {
++	case 13:                                /* INIT 0, SCAN 1, AUTH 2, ASSOC 3, RUN 4 */
++		r->req_val = j ? 4 : (busy & A8_RQ_JOIN) ? 2 : (busy & A8_RQ_SCAN) ? 1 : 0;
++		break;
++	case 1:
++		if (!j) {
++			err = ENXIO;
++		} else if ((err = wf_a8_give(r, c->ssid, c->sl)) == 0) {
++			r->req_len = c->sl;
++		}
++		break;
++	case 9:
++		err = j ? wf_a8_give(r, c->bssid, 6) : ENXIO;
++		break;
++	case 4: {
++		struct {
++			uint32_t version;
++			struct apple80211_channel channel;
++		} ch = { .version = 1 };
++		wf_a8_chan(&ch.channel, c->chan);
++		err = j ? wf_a8_give(r, &ch, sizeof(ch)) : ENXIO;
++		break;
++	}
++	case 16:
++	case 17: {
++		int32_t v = r->req_type == 16 ? c->rssi : c->noise;
++		struct {
++			uint32_t version, radios, unit;
++			int32_t each[4], all, each_ext[4], all_ext;
++		} q = { .version = 1, .radios = 1, .each = { v }, .all = v, .each_ext = { v }, .all_ext = v };
++		err = !j || (r->req_type == 17 && v == 0) ? ENXIO : wf_a8_give(r, &q, sizeof(q));
++		break;
++	}
++	case 103:
++		err = j ? wf_a8_give_bss(r, c) : ENXIO;
++		break;
++	case 2: {
++		struct {
++			uint32_t version, lower, upper, extended;
++		} a = { .version = 1, .lower = 1, .upper = c->sec ? 8 : 0 };
++		err = j ? wf_a8_give(r, &a, sizeof(a)) : ENXIO;
++		break;
++	}
++	default:
++		err = EOPNOTSUPP;
++		break;
++	}
++	kfree_data(c, sizeof(*c));
++	return err;
++}
++
++static int
++wf_a8_set_join(const struct apple80211req *r, char *said, size_t n)
++{
++	struct apple80211_assoc *a;
++	int err;
++
++	if (r->req_len < offsetof(struct apple80211_assoc, rest) || r->req_data == USER_ADDR_NULL) {
++		return EINVAL;
++	}
++	a = kalloc_data(sizeof(*a), Z_WAITOK | Z_ZERO);
++	if (a == NULL) {
++		return ENOMEM;
++	}
++	err = copyin(r->req_data, a, offsetof(struct apple80211_assoc, rest));
++	if (err) {
++		goto out;
++	}
++	/* lengths and kinds only: the name and the key stay out of the log */
++	snprintf(said, n, " (join: a name of %u bytes, auth %#x/%#x, a key of %u bytes of kind %u)", a->ssid_length,
++	    a->auth_lower, a->auth_upper, a->key_length, a->key_cipher);
++	int kind;
++	if (a->ssid_length == 0 || a->ssid_length > 32) {
++		err = EINVAL;
++		goto out;
++	}
++	if (a->key_length == 0) {
++		kind = 0;
++	} else if (a->key_cipher == A8_CIPHER_PASSPHRASE && a->key_length >= 8 && a->key_length <= 63) {
++		kind = 1;
++	} else if (a->key_cipher == A8_CIPHER_PMK && a->key_length == 32) {
++		kind = 2;
++	} else {
++		err = EINVAL;
++		goto out;
++	}
++	lck_mtx_lock(&wf_a8_lock);
++	bzero(&wf_a8_jp, sizeof(wf_a8_jp));
++	wf_a8_jp.sl = (int)a->ssid_length;
++	memcpy(wf_a8_jp.ssid, a->ssid, a->ssid_length);
++	wf_a8_jp.kind = kind;
++	wf_a8_jp.kl = (int)a->key_length;
++	memcpy(wf_a8_jp.key, a->key, a->key_length);
++	wf_a8_result = 0;
++	lck_mtx_unlock(&wf_a8_lock);
++	wf_a8_ask(A8_RQ_JOIN);
++out:
++	bzero(a, sizeof(*a));
++	kfree_data(a, sizeof(*a));
++	return err;
++}
++
++static int
++wf_a8_set(const struct apple80211req *r, char *said, size_t n)
++{
++	switch (r->req_type) {
++	case 20:
++		return wf_a8_set_join(r, said, n);
++	case 22:
++		wf_a8_ask(A8_RQ_LEAVE);
++		return 0;
++	case 19: {
++		struct {
++			uint32_t version, radios, state[4];
++		} p;
++		int err;
++		if (r->req_len < sizeof(p) || r->req_data == USER_ADDR_NULL) {
++			return EINVAL;
++		}
++		if ((err = copyin(r->req_data, &p, sizeof(p))) != 0) {
++			return err;
++		}
++		snprintf(said, n, " (power %s)", p.state[0] ? "on" : "off");
++		lck_mtx_lock(&wf_a8_lock);
++		wf_a8_power = p.state[0] != 0;
++		lck_mtx_unlock(&wf_a8_lock);
++		wf_a8_ask(A8_RQ_POWER);
++		return 0;
++	}
++	case 10: {
++		if (r->req_len != sizeof(struct apple80211_scan_request) || r->req_data == USER_ADDR_NULL) {
++			return EINVAL;
++		}
++		struct apple80211_scan_request *q = kalloc_data(sizeof(*q), Z_WAITOK);
++		if (q == NULL) {
++			return ENOMEM;
++		}
++		int err = copyin(r->req_data, q, sizeof(*q));
++		if (err == 0) {
++			snprintf(said, n, " (scan: type %u, %u channels, %u ms each, a name of %u bytes, %u names)", q->scan_type,
++			    q->channel_count, q->dwell_ms, q->ssid_length, q->name_count);
++			lck_mtx_lock(&wf_a8_lock);
++			bool on = wf_a8_power;
++			lck_mtx_unlock(&wf_a8_lock);
++			if (on) {
++				wf_a8_ask(A8_RQ_SCAN);
++			} else {
++				err = ENETDOWN;
++			}
++		}
++		kfree_data(q, sizeof(*q));
++		return err;
++	}
++	default:
++		return EOPNOTSUPP;
++	}
++}
++
++/* how often each kind of request came and how it fared ('wifi a8') */
++static struct {
++	int32_t type;
++	bool set;
++	uint32_t times, answered;
++	int last_error;
++} wf_a8_kinds[64];
++static uint32_t wf_a8_nkinds;
++
++static void
++wf_a8_note(const struct apple80211req *r, bool set, int err)
++{
++	uint32_t i;
++	lck_mtx_lock(&wf_a8_lock);
++	for (i = 0; i < wf_a8_nkinds && !(wf_a8_kinds[i].type == r->req_type && wf_a8_kinds[i].set == set); i++) {
++	}
++	if (i < 64) {
++		if (i == wf_a8_nkinds) {
++			wf_a8_nkinds++;
++			wf_a8_kinds[i].type = r->req_type;
++			wf_a8_kinds[i].set = set;
++		}
++		wf_a8_kinds[i].times++;
++		wf_a8_kinds[i].answered += err == 0;
++		if (err) {
++			wf_a8_kinds[i].last_error = err;
++		}
++	}
++	lck_mtx_unlock(&wf_a8_lock);
++}
++
++static void
++wf_a8_summary(void)
++{
++	printf("USB> wifi: A8: power %u, joined %u, last scan %u networks, last join result %u, thread %d\n", wf_a8_power,
++	    wf_cur_ok, wf_bss_n, wf_a8_result, wf_a8_started);
++	for (uint32_t i = 0; i < wf_a8_nkinds; i++) {
++		printf("USB> wifi: A8: %s %d (%s) %u times, answered %u, last error %d\n", wf_a8_kinds[i].set ? "set" : "get",
++		    wf_a8_kinds[i].type, wf_a8_name(wf_a8_kinds[i].type), wf_a8_kinds[i].times, wf_a8_kinds[i].answered,
++		    wf_a8_kinds[i].last_error);
++	}
++}
++
++static errno_t
++wf_a8_ioctl(unsigned long cmd, void *data)
++{
++	static uint32_t said;
++	struct apple80211req *r = data;
++	char who[32] = "?", what[160] = "";
++	bool set = cmd == SIOCSA80211;
++	int err;
++
++	if (cmd != SIOCSA80211 && cmd != SIOCGA80211) {
++		return EOPNOTSUPP;
++	}
++	proc_selfname(who, sizeof(who));
++	err = set ? wf_a8_set(r, what, sizeof(what)) : wf_a8_get(r);
++	wf_a8_note(r, set, err);
++	/* a request asked for ever is told some hundred times; SCAN_RESULT only when it fails other than at the end */
++	if (said < 600 && !(r->req_type == 11 && (err == 0 || err == EIO))) {
++		said++;
++		char res[24];
++		snprintf(res, sizeof(res), err == 0 ? "ok" : err == EOPNOTSUPP ? "REFUSED" : "error %d", err);
++		printf("USB> wifi: A8: %s %s %d (%s), value %d, %u bytes%s: %s\n", who, set ? "sets" : "gets", r->req_type,
++		    wf_a8_name(r->req_type), r->req_val, r->req_len, what, res);
++	}
++	return err;
++}
++
+ static void
+ wf_cmd_locked(const char *arg)
+ {
+@@ -3724,6 +4691,8 @@
+ 		printf("USB> wifi: AUTO: %d\n", wf_auto());
+ 	} else if (!strcmp(arg, "net")) {
+ 		wf_net_cmd();
++	} else if (!strcmp(arg, "a8")) {
++		wf_a8_summary();
+ 	} else if (!strcmp(arg, "dhcp")) {
+ 		if (wf_net_link) {
+ 			wf_dhcp_start();
+@@ -3747,7 +4716,7 @@
+ 	} else if (!strncmp(arg, "cr ", 3)) {
+ 		wf_rd_cmd(arg + 3, true);
+ 	} else {
+-		printf("USB> wifi: probe [keep] | off | st | fw | fw1 | ver | mac | scan | join SSIDHEX PASSHEX|- [save] | forget | saved | auto | link | net | dhcp | dm HEX|keep | con | fifo 0-3 | div N | rd ADDR [N] | wr ADDR VAL | cr FN ADDR\n");
++		printf("USB> wifi: probe [keep] | off | st | fw | fw1 | ver | mac | scan | join SSIDHEX PASSHEX|- [save] | forget | saved | auto | link | net | a8 | dhcp | dm HEX|keep | con | fifo 0-3 | div N | rd ADDR [N] | wr ADDR VAL | cr FN ADDR\n");
+ 	}
+ }
+ 
+@@ -3846,6 +4815,24 @@
+ 	return SYSCTL_OUT(req, &l, sizeof(l));
+ }
+ 
++/*
++ * 0179: en0 (subfamily Wi-Fi) and the Apple80211 thread, before wifid runs: a5xelte_exec_denied() calls this when
++ * wifid is exec'd (wifid looks for its interface when it starts). Nothing of the chip is touched.
++ */
++void on7xelte_wifi_early(void);
++void
++on7xelte_wifi_early(void)
++{
++	lck_mtx_lock(&wf_bus);
++	bool had = wf_ifp != NULL;
++	wf_net_attach();
++	lck_mtx_unlock(&wf_bus);
++	wf_a8_start();
++	if (!had) {
++		printf("USB> wifi: A8: en0 made for wifid\n");
++	}
++}
++
+ SYSCTL_PROC(_kern, OID_AUTO, on7xelte_wifi_lease, CTLTYPE_OPAQUE | CTLFLAG_RD | CTLFLAG_LOCKED, 0, 0, wf_sysctl_lease,
+     "S,on7_wifi_lease", "on7xelte Wi-Fi: the DHCP lease");
+ 
+--- a/bsd/dev/a5xelte_usb.c
++++ b/bsd/dev/a5xelte_usb.c
+@@ -961,7 +961,8 @@
+ static const char ud_deny_default[] =
+     "mediaserverd,audioclocksyncd,audiomxd,UARPUpdaterServiceLegacyAudio,"
+     "bluetoothd,bluetoothuserd,BlueTool,BTLEServer,"
+-    "wifid,wifip2pd,wifianalyticsd,wifivelocityd,WiFiCloudAssetsClient,"
++    /* 0179: wifid runs (on7xelte_wifi.c answers its Apple80211 requests) */
++    "wifip2pd,wifianalyticsd,wifivelocityd,WiFiCloudAssetsClient,"
+     "CommCenter,CommCenterMobileHelper,CommCenterRootHelper,WirelessRadioManagerd,"
+     "nfcd,carkitd,"
+     /* 0145: background services */
+@@ -1040,6 +1041,7 @@
+ 
+ /* 0 = run it, 1 = refuse the exec (EACCES), 2 = parked (exec goes on) */
+ int a5xelte_exec_denied(const char *name, int pid);
++extern void on7xelte_wifi_early(void);
+ 
+ int
+ a5xelte_exec_denied(const char *name, int pid)
+@@ -1056,6 +1058,9 @@
+ 		    strcmp(mode, "refuse") == 0;
+ 		__atomic_store_n(&ud_deny_state, st, __ATOMIC_RELEASE);
+ 	}
++	if (name != NULL && ud_name_in("wifid", name)) {
++		on7xelte_wifi_early();          /* 0179: en0 (Wi-Fi) before wifid looks for it */
++	}
+ 	if (st == 3 || name == NULL) {
+ 		return 0;
+ 	}
