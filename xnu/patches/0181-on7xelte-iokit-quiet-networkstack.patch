@@ -1,0 +1,191 @@
+--- a/bsd/dev/a5xelte_usb.c
++++ b/bsd/dev/a5xelte_usb.c
+@@ -1058,8 +1058,8 @@
+ 		    strcmp(mode, "refuse") == 0;
+ 		__atomic_store_n(&ud_deny_state, st, __ATOMIC_RELEASE);
+ 	}
+-	if (name != NULL && ud_name_in("wifid", name)) {
+-		on7xelte_wifi_early();          /* 0179: en0 (Wi-Fi) before wifid looks for it */
++	if (name != NULL && ud_name_in("wifid,configd", name)) {
++		on7xelte_wifi_early();          /* 0179: en0 (Wi-Fi) before wifid looks for it; 0181: and before configd (InterfaceNamer) */
+ 	}
+ 	if (st == 3 || name == NULL) {
+ 		return 0;
+--- a/bsd/dev/on7xelte_wifi.c
++++ b/bsd/dev/on7xelte_wifi.c
+@@ -4693,6 +4693,9 @@
+ 		wf_net_cmd();
+ 	} else if (!strcmp(arg, "a8")) {
+ 		wf_a8_summary();
++	} else if (!strcmp(arg, "busy")) {
++		extern void On7IOKitBusy(void);
++		On7IOKitBusy();                 /* 0181: IOKit services still busy (configd waits for quiet) */
+ 	} else if (!strcmp(arg, "dhcp")) {
+ 		if (wf_net_link) {
+ 			wf_dhcp_start();
+@@ -4716,7 +4719,7 @@
+ 	} else if (!strncmp(arg, "cr ", 3)) {
+ 		wf_rd_cmd(arg + 3, true);
+ 	} else {
+-		printf("USB> wifi: probe [keep] | off | st | fw | fw1 | ver | mac | scan | join SSIDHEX PASSHEX|- [save] | forget | saved | auto | link | net | a8 | dhcp | dm HEX|keep | con | fifo 0-3 | div N | rd ADDR [N] | wr ADDR VAL | cr FN ADDR\n");
++		printf("USB> wifi: probe [keep] | off | st | fw | fw1 | ver | mac | scan | join SSIDHEX PASSHEX|- [save] | forget | saved | auto | link | net | a8 | busy | dhcp | dm HEX|keep | con | fifo 0-3 | div N | rd ADDR [N] | wr ADDR VAL | cr FN ADDR\n");
+ 	}
+ }
+ 
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -952,6 +952,86 @@
+ 	return kIOReturnUnsupported;
+ }
+ 
++/*
++ * 0181: configd's InterfaceNamer opens the IONetworkStack (IONetworkingFamily) before anything else and gives up
++ * without it: then it never posts "*QUIET*" or "*TIMEOUT*" under Plugin:InterfaceNamer, and SCNetworkInterfaceCopyAll()
++ * (wifid) waits for one of them for good. Its user client names interfaces that have no BSD name yet; en0 has one,
++ * so every command is only logged and answered with success.
++ */
++class IONetworkStack : public IOService
++{
++	OSDeclareDefaultStructors(IONetworkStack);
++public:
++	virtual IOReturn newUserClient(task_t owningTask, void *securityID, UInt32 type, OSDictionary *properties,
++	    IOUserClient **handler) APPLE_KEXT_OVERRIDE;
++};
++OSDefineMetaClassAndStructors(IONetworkStack, IOService);
++
++class IONetworkStackUserClient : public IOUserClient
++{
++	OSDeclareDefaultStructors(IONetworkStackUserClient);
++public:
++	IOReturn clientClose(void) APPLE_KEXT_OVERRIDE;
++	IOReturn externalMethod(uint32_t selector, IOExternalMethodArguments *args,
++	    IOExternalMethodDispatch *dispatch, OSObject *target,
++	    void *reference) APPLE_KEXT_OVERRIDE;
++};
++OSDefineMetaClassAndStructors(IONetworkStackUserClient, IOUserClient);
++
++IOReturn
++IONetworkStack::newUserClient(task_t owningTask, void *securityID, UInt32 type, OSDictionary *properties,
++    IOUserClient **handler)
++{
++	char name[32];
++	proc_selfname(name, sizeof(name));
++	IONetworkStackUserClient *uc = OSTypeAlloc(IONetworkStackUserClient);
++	if (uc == NULL || !uc->initWithTask(owningTask, securityID, type)) {
++		OSSafeReleaseNULL(uc);
++		return kIOReturnNoMemory;
++	}
++	if (!uc->attach(this)) {
++		uc->release();
++		return kIOReturnError;
++	}
++	if (!uc->start(this)) {
++		uc->detach(this);
++		uc->release();
++		return kIOReturnError;
++	}
++	*handler = uc;
++	IOLog("USB> wifi: A8: %s opened the IONetworkStack (type %u)\n", name, (unsigned)type);
++	return kIOReturnSuccess;
++}
++
++IOReturn
++IONetworkStackUserClient::clientClose(void)
++{
++	terminate();
++	return kIOReturnSuccess;
++}
++
++IOReturn
++IONetworkStackUserClient::externalMethod(uint32_t selector, IOExternalMethodArguments *args,
++    __unused IOExternalMethodDispatch *dispatch, __unused OSObject *target, __unused void *reference)
++{
++	static unsigned said;
++	if (said++ < 16) {
++		char name[32];
++		proc_selfname(name, sizeof(name));
++		IOLog("USB> wifi: A8: %s asks the IONetworkStack %u (in %u/%u): ok\n", name, selector,
++		    args ? args->scalarInputCount : 0, args ? args->structureInputSize : 0);
++	}
++	if (args != NULL) {
++		for (uint32_t i = 0; i < args->scalarOutputCount; i++) {
++			args->scalarOutput[i] = 0;
++		}
++		if (args->structureOutputDescriptor == NULL && args->structureOutput != NULL) {
++			bzero(args->structureOutput, args->structureOutputSize);
++		}
++	}
++	return kIOReturnSuccess;
++}
++
+ static IOService *
+ on7_wlan_publish(IOService *service, IOService *provider, const char *name)
+ {
+@@ -984,6 +1064,12 @@
+ 		IOLog("USB> wifi: A8: cannot create the registry services\n");
+ 		return;
+ 	}
++	IONetworkStack *stack = OSTypeAlloc(IONetworkStack);       /* 0181: for configd's InterfaceNamer */
++	if (stack != NULL && stack->init() && (stack = (IONetworkStack *)on7_wlan_publish(stack, platform, "IONetworkStack")) != NULL) {
++		stack->release();
++	} else {
++		IOLog("USB> wifi: A8: the IONetworkStack did not start\n");
++	}
+ 	if ((data = OSData::withBytes(mac, 6)) != NULL) {
+ 		controller->setProperty("IOMACAddress", data);
+ 		data->release();
+@@ -1015,6 +1101,54 @@
+ 		IOLog("USB> wifi: A8: registry: IO80211Controller + IONetworkInterface %s (Infrastructure) published\n", ifname);
+ 	}
+ 	controller->release();
++
++	/*
++	 * 0181: IOKit is never quiet on this port. StartIOKit() keeps the service root busy until the IOKit daemon
++	 * (kernelmanagerd) reports in, and iOS has none, so IOService::iokitDaemonLaunched() never runs. configd's
++	 * InterfaceNamer posts "*QUIET*" only when the root is not busy, and SCNetworkInterfaceCopyAll() waits for that:
++	 * wifid hung there for good after its first Apple80211 requests. Done here, once, as kernelmanagerd would.
++	 */
++	static bool launched;
++	if (!launched) {
++		launched = true;
++		IOService::iokitDaemonLaunched();
++		IOLog("USB> wifi: A8: IOKit daemon marked launched (root busy %u)\n",
++		    (unsigned)IOService::getServiceRoot()->getBusyState());
++	}
+ }
+ #endif /* A5XELTE: 0180 */
++#if defined(ARM64_BOARD_CONFIG_A5XELTE)
++/* 0181: 'wifi busy': which services keep IOKit from being quiet (configd's InterfaceNamer waits for quiet) */
++#include <IOKit/IORegistryEntry.h>
++extern "C" void On7IOKitBusy(void);
++void
++On7IOKitBusy(void)
++{
++	IORegistryEntry *root = IORegistryEntry::getRegistryRoot();
++	IOService *rs = OSDynamicCast(IOService, root);
++	IOLog("USB> wifi: busy: root %s busy %u\n", root ? root->getName() : "?", rs ? (unsigned)rs->getBusyState() : 999u);
++	IORegistryIterator *it = IORegistryIterator::iterateOver(gIOServicePlane, kIORegistryIterateRecursively);
++	unsigned n = 0, shown = 0;
++	if (it == NULL) {
++		IOLog("USB> wifi: busy: no iterator\n");
++		return;
++	}
++	IORegistryEntry *e;
++	while ((e = it->getNextObject()) != NULL) {
++		IOService *sv = OSDynamicCast(IOService, e);
++		n++;
++		if (sv == NULL || sv->getBusyState() == 0) {
++			continue;
++		}
++		if (shown++ < 40) {
++			IORegistryEntry *p = sv->getParentEntry(gIOServicePlane);
++			IOLog("USB> wifi: busy: %s (%s) busy %u, state %s%s, parent %s\n", sv->getName(),
++			    sv->getMetaClass()->getClassName(), (unsigned)sv->getBusyState(),
++			    sv->isInactive() ? "inactive " : "", sv->isOpen() ? "open" : "", p ? p->getName() : "-");
++		}
++	}
++	it->release();
++	IOLog("USB> wifi: busy: %u services, %u busy\n", n, shown);
++}
++#endif /* A5XELTE: 0181 */
+ #endif /* SWEET || A5XELTE */
