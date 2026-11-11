@@ -1,0 +1,162 @@
+--- a/bsd/dev/on7xelte_wifi.c
++++ b/bsd/dev/on7xelte_wifi.c
+@@ -2851,7 +2851,7 @@
+ 		struct ifmediareq *ifmr = (struct ifmediareq *)data;
+ 		user_addr_t list = (cmd == SIOCGIFMEDIA64) ? ((struct ifmediareq64 *)ifmr)->ifmu_ulist :
+ 		    CAST_USER_ADDR_T(((struct ifmediareq32 *)ifmr)->ifmu_ulist);
+-		int media = IFM_ETHER | IFM_AUTO;
++		int media = IFM_IEEE80211 | IFM_AUTO;   /* 0180: a radio (IO80211.framework lists 802.11 media only) */
+ 		ifmr->ifm_current = media;
+ 		ifmr->ifm_active = media;
+ 		ifmr->ifm_mask = 0;
+@@ -4820,17 +4820,27 @@
+  * wifid is exec'd (wifid looks for its interface when it starts). Nothing of the chip is touched.
+  */
+ void on7xelte_wifi_early(void);
++extern void On7WLANStart(const char *ifname, const uint8_t *mac);      /* iokit/Kernel/arm/SweetFramebuffer.cpp */
+ void
+ on7xelte_wifi_early(void)
+ {
++	static bool published;
++	uint8_t mac[6];
+ 	lck_mtx_lock(&wf_bus);
+ 	bool had = wf_ifp != NULL;
+ 	wf_net_attach();
++	bool have = wf_ifp != NULL;
++	memcpy(mac, wf_mac, 6);
+ 	lck_mtx_unlock(&wf_bus);
+ 	wf_a8_start();
+ 	if (!had) {
+ 		printf("USB> wifi: A8: en0 made for wifid\n");
+ 	}
++	if (have && !published) {
++		/* 0180: the registry services wifid and configd find a Wi-Fi interface by (once) */
++		published = true;
++		On7WLANStart("en0", mac);
++	}
+ }
+ 
+ SYSCTL_PROC(_kern, OID_AUTO, on7xelte_wifi_lease, CTLTYPE_OPAQUE | CTLFLAG_RD | CTLFLAG_LOCKED, 0, 0, wf_sysctl_lease,
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -901,4 +901,120 @@
+ 	}
+ 	return ret;
+ }
++#if defined(ARM64_BOARD_CONFIG_A5XELTE)
++/*
++ * 0180: the J7 Prime's Wi-Fi in the registry (after y2sios iokit/Kernel/RedwoodWLAN.cpp, MIT).
++ * en0 is made with the BSD interface KPI (bsd/dev/on7xelte_wifi.c); iOS looks for IOKit objects:
++ *  - wifid's device is the service with IO80211InterfaceRole = "Infrastructure"; IO80211.framework binds through the
++ *    service whose IOInterfaceName is the interface's name. It has no user client: the framework falls back to
++ *    ioctls (SIOCGA80211/SIOCSA80211), which on7xelte_wifi.c answers.
++ *  - SystemConfiguration lists IONetworkInterface objects and calls one Wi-Fi when its parent is an
++ *    IO80211Controller; configd then makes a network service for it.
++ * Both classes only carry properties.
++ */
++#include <IOKit/IOPlatformExpert.h>
++#include <libkern/c++/OSData.h>
++#include <libkern/c++/OSNumber.h>
++
++extern "C" void On7WLANStart(const char *ifname, const uint8_t *mac);
++
++class IO80211Controller : public IOService
++{
++	OSDeclareDefaultStructors(IO80211Controller);
++};
++OSDefineMetaClassAndStructors(IO80211Controller, IOService);
++
++class IONetworkInterface : public IOService
++{
++	OSDeclareDefaultStructors(IONetworkInterface);
++};
++OSDefineMetaClassAndStructors(IONetworkInterface, IOService);
++
++class On7WLAN : public IONetworkInterface
++{
++	OSDeclareDefaultStructors(On7WLAN);
++public:
++	virtual IOReturn newUserClient(task_t owningTask, void *securityID, UInt32 type, OSDictionary *properties,
++	    IOUserClient **handler) APPLE_KEXT_OVERRIDE;
++};
++OSDefineMetaClassAndStructors(On7WLAN, IONetworkInterface);
++
++/* there is none (see above); that someone asked shows the service was found */
++IOReturn
++On7WLAN::newUserClient(task_t owningTask, void *securityID, UInt32 type, OSDictionary *properties, IOUserClient **handler)
++{
++	static unsigned said;
++	if (said++ < 8) {
++		char name[32];
++		proc_selfname(name, sizeof(name));
++		IOLog("USB> wifi: A8: %s asks On7WLAN for a user client (type %u): none, ioctls instead\n", name, (unsigned)type);
++	}
++	return kIOReturnUnsupported;
++}
++
++static IOService *
++on7_wlan_publish(IOService *service, IOService *provider, const char *name)
++{
++	if (service == NULL || !service->attach(provider)) {
++		OSSafeReleaseNULL(service);
++		return NULL;
++	}
++	service->setName(name);
++	if (!service->start(provider)) {
++		service->detach(provider);
++		service->release();
++		return NULL;
++	}
++	service->registerService();
++	return service;
++}
++
++void
++On7WLANStart(const char *ifname, const uint8_t *mac)
++{
++	IOService *platform = IOService::getPlatform();
++	IO80211Controller *controller = OSTypeAlloc(IO80211Controller);
++	On7WLAN *wlan = OSTypeAlloc(On7WLAN);
++	OSData *data;
++	OSNumber *num;
++
++	if (platform == NULL || controller == NULL || wlan == NULL || !controller->init() || !wlan->init()) {
++		OSSafeReleaseNULL(controller);
++		OSSafeReleaseNULL(wlan);
++		IOLog("USB> wifi: A8: cannot create the registry services\n");
++		return;
++	}
++	if ((data = OSData::withBytes(mac, 6)) != NULL) {
++		controller->setProperty("IOMACAddress", data);
++		data->release();
++	}
++	controller->setProperty("IOBuiltin", true);
++	if ((controller = (IO80211Controller *)on7_wlan_publish(controller, platform, "On7WLANController")) == NULL) {
++		wlan->release();
++		IOLog("USB> wifi: A8: the controller did not start\n");
++		return;
++	}
++	wlan->setProperty("IOInterfaceName", ifname);
++	wlan->setProperty("BSD Name", ifname);
++	wlan->setProperty("IOInterfaceNamePrefix", "en");
++	if ((num = OSNumber::withNumber(6ULL, 32)) != NULL) {   /* IFT_ETHER */
++		wlan->setProperty("IOInterfaceType", num);
++		num->release();
++	}
++	if ((num = OSNumber::withNumber((unsigned long long)(ifname[2] - '0'), 32)) != NULL) {
++		wlan->setProperty("IOInterfaceUnit", num);
++		num->release();
++	}
++	wlan->setProperty("IOBuiltin", true);
++	wlan->setProperty("IOPrimaryInterface", true);
++	wlan->setProperty("IO80211InterfaceRole", "Infrastructure");
++	if (on7_wlan_publish(wlan, controller, "On7WLAN") == NULL) {
++		IOLog("USB> wifi: A8: the interface service did not start\n");
++	} else {
++		wlan->release();
++		IOLog("USB> wifi: A8: registry: IO80211Controller + IONetworkInterface %s (Infrastructure) published\n", ifname);
++	}
++	controller->release();
++}
++#endif /* A5XELTE: 0180 */
+ #endif /* SWEET || A5XELTE */
