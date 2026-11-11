@@ -91,6 +91,12 @@ def build():
         ('canvas-width', mkadt.u32(1080)),
         ('canvas-height', mkadt.u32(1920)),
     ]))
+    # Wi-Fi (xnu 0179, bsd/dev/on7xelte_wifi.c answers Apple80211 on en0): launchd starts wifid
+    # only if the tree has a node named wlan (its job's _LimitLoadToDeviceTree); nothing matches it.
+    arm_io.children.append(mkadt.node('wlan', [
+        ('device_type', mkadt.cstr('wlan')),
+        ('compatible', mkadt.cstr('wlan-sdio,on7xelte')),
+    ]))
     root.children = [n for n in root.children if n.prop('name') not in
                      (mkadt.cstr('sweet-fbcon'), mkadt.cstr('sweet-ufs'))]
     root.children.append(mkadt.node('a5xelte-fbcon', [
