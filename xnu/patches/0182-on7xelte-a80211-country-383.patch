@@ -1,0 +1,12 @@
+--- a/bsd/dev/on7xelte_wifi.c
++++ b/bsd/dev/on7xelte_wifi.c
+@@ -4510,6 +4510,9 @@
+ wf_a8_set(const struct apple80211req *r, char *said, size_t n)
+ {
+ 	switch (r->req_type) {
++	case 51:                                /* 0182: COUNTRY_CODE: the firmware keeps its own (ccode) */
++	case 383:                               /* 0182: a 4104-byte set wifid repeats; taken, not acted on */
++		return 0;
+ 	case 20:
+ 		return wf_a8_set_join(r, said, n);
+ 	case 22:
