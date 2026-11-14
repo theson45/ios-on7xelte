@@ -1,0 +1,162 @@
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -81,9 +81,23 @@
+  * presented as the iPhone X panel, 1125x2436 (375x812 points @3x), and the
+  * centered 1080x2400 part of it is shown on the 1080x2400 panel.
+  * Boot-arg sweetfb_native=1 presents the real panel size instead.
++ *
++ * The J7 Prime panel is 1080x1920, i.e. 360x640 points @3x, which is no
++ * iPhone either: the keyboard used a 375 point layout (its right edge off
++ * the screen) and its "123" key did nothing. It is presented as the
++ * iPhone 8 Plus, 1242x2208 (414x736 points @3x), and scaled down by 20/23
++ * to the 1080x1920 panel like a real 8 Plus does (2x2 box filter on the
++ * CPU). Touches stay panel-normalized (SweetHID.cpp), which is the same
++ * fraction of the scaled display.
+  */
++#if defined(ARM64_BOARD_CONFIG_A5XELTE)
++#define SWEET_FB_LOGICAL_W              1242
++#define SWEET_FB_LOGICAL_H              2208
++#define SWEET_FB_SCALE                  1
++#else
+ #define SWEET_FB_LOGICAL_W              1125
+ #define SWEET_FB_LOGICAL_H              2436
++#endif
+ #define SWEET_FB_FORMAT_BGRA            0x42475241
+ 
+ class IOMobileFramebuffer : public IOService {
+@@ -121,6 +135,8 @@
+ 	uint32_t      fFlushTicks;    /* vsync ticks between panel copies */
+ 	bool          fPowerOff;      /* RequestPowerChange(0) */
+ 	uint32_t      fFadeStep;      /* fade-out steps done while off */
++	bool          fScaled;        /* logical size scaled down to the panel */
++	uint32_t     *fScaleX;        /* panel column -> logical column */
+ 	AppleARMBacklight *fBL;        /* 0154: panel backlight, NULL without DSI */
+ 
+ 	bool start(IOService *provider) APPLE_KEXT_OVERRIDE;
+@@ -128,6 +144,8 @@
+ 	void removeClient(IOMobileFramebufferUserClient *client);
+ 	void swap(const uint8_t *rec);
+ 	void present(const uint8_t *rec);
++	void presentScaled(SweetSurface *s, uintptr_t src, int32_t sx, int32_t sy,
++	    int32_t dx, int32_t dy, int32_t w, int32_t h);
+ };
+ 
+ OSDefineMetaClassAndStructors(AppleCLCD, IOMobileFramebuffer);
+@@ -458,14 +476,34 @@
+ 	PE_parse_boot_argn("sweetfb_native", &native, sizeof(native));
+ 	fLogicalW = fWidth;
+ 	fLogicalH = fHeight;
+-#if !defined(ARM64_BOARD_CONFIG_A5XELTE)
+ 	if (!native && fWidth <= SWEET_FB_LOGICAL_W && fHeight <= SWEET_FB_LOGICAL_H) {
+ 		fLogicalW = SWEET_FB_LOGICAL_W;
+ 		fLogicalH = SWEET_FB_LOGICAL_H;
+ 	}
+-#endif
+ 	fOffX = (int32_t)(fLogicalW - fWidth) / 2;
+ 	fOffY = (int32_t)(fLogicalH - fHeight) / 2;
++#if defined(SWEET_FB_SCALE)
++	if (fLogicalW != fWidth || fLogicalH != fHeight) {
++		fScaleX = (uint32_t *)IOMallocData(fWidth * sizeof(uint32_t));
++		if (fScaleX != NULL) {
++			for (uint32_t x = 0; x < fWidth; x++) {
++				fScaleX[x] = (uint32_t)(((uint64_t)x * fLogicalW) / fWidth);
++			}
++			fScaled = true;
++			fOffX = fOffY = 0;
++		}
++		/*
++		 * IOMobileFramebuffer.framework sizes the CoreAnimation canvas from
++		 * the nub's canvas-width/canvas-height (the ADT has the panel size).
++		 * With a different presented size backboardd renders into a
++		 * canvas-sized buffer and swaps an empty display-sized one: the
++		 * screen stays black.
++		 */
++		uint32_t cw = fLogicalW, ch = fLogicalH;
++		provider->setProperty("canvas-width", &cw, sizeof(cw));
++		provider->setProperty("canvas-height", &ch, sizeof(ch));
++	}
++#endif
+ 	fLock = IOLockAlloc();
+ 	fClients = OSArray::withCapacity(4);
+ 	fSurface = sweet_surface_create_physical(fPhys, fWidth, fHeight, fRowBytes, SWEET_FB_FORMAT_BGRA);
+@@ -602,6 +640,66 @@
+ }
+ 
+ static uint32_t sweet_fb_swaps_logged;
++
++/* Per-channel average of two BGRA pixels. */
++static inline uint32_t
++sweet_fb_avg(uint32_t a, uint32_t b)
++{
++	return (a & b) + (((a ^ b) & 0xfefefefeu) >> 1);
++}
++
++/*
++ * Scale the logical rect (dx,dy w x h, read from the surface at sx,sy)
++ * down to the panel: each panel pixel is the 2x2 average around the
++ * logical pixel it covers (fScaleX for columns, same ratio for rows).
++ */
++void
++AppleCLCD::presentScaled(SweetSurface *s, uintptr_t src, int32_t sx, int32_t sy,
++    int32_t dx, int32_t dy, int32_t w, int32_t h)
++{
++	if (w > (int32_t)s->width - sx) {
++		w = (int32_t)s->width - sx;
++	}
++	if (h > (int32_t)s->height - sy) {
++		h = (int32_t)s->height - sy;
++	}
++	if (w > (int32_t)fLogicalW - dx) {
++		w = (int32_t)fLogicalW - dx;
++	}
++	if (h > (int32_t)fLogicalH - dy) {
++		h = (int32_t)fLogicalH - dy;
++	}
++	if (w <= 0 || h <= 0 || s->elementWidth != 1 || s->elementHeight != 1 ||
++	    s->memory == NULL || (s->bytesPerElement != 0 && s->bytesPerElement != 4)) {
++		return;
++	}
++	uint64_t last = (uint64_t)s->offset + (uint64_t)(sy + h - 1) * s->bytesPerRow +
++	    (uint64_t)(sx + w) * 4;
++	if (last > s->memory->getLength()) {
++		return;
++	}
++	uint32_t px0 = (uint32_t)(((uint64_t)dx * fWidth + fLogicalW - 1) / fLogicalW);
++	uint32_t px1 = (uint32_t)(((uint64_t)(dx + w) * fWidth + fLogicalW - 1) / fLogicalW);
++	uint32_t py0 = (uint32_t)(((uint64_t)dy * fHeight + fLogicalH - 1) / fLogicalH);
++	uint32_t py1 = (uint32_t)(((uint64_t)(dy + h) * fHeight + fLogicalH - 1) / fLogicalH);
++	px1 = px1 > fWidth ? fWidth : px1;
++	py1 = py1 > fHeight ? fHeight : py1;
++	const uint8_t *base = (const uint8_t *)(src + s->offset);
++	for (uint32_t py = py0; py < py1; py++) {
++		int32_t ly = (int32_t)(((uint64_t)py * fLogicalH) / fHeight);
++		int32_t ly2 = ly + 1 < dy + h ? ly + 1 : dy + h - 1;
++		const uint32_t *r0 = (const uint32_t *)(base + (uint64_t)(sy + ly - dy) * s->bytesPerRow);
++		const uint32_t *r1 = (const uint32_t *)(base + (uint64_t)(sy + ly2 - dy) * s->bytesPerRow);
++		uint32_t *out = (uint32_t *)(fPixels + (uint64_t)py * fRowBytes);
++		for (uint32_t px = px0; px < px1; px++) {
++			int32_t lx = (int32_t)fScaleX[px];
++			int32_t c0 = sx + lx - dx;
++			int32_t c1 = lx + 1 < dx + w ? c0 + 1 : c0;
++			out[px] = sweet_fb_avg(sweet_fb_avg(r0[c0], r0[c1]), sweet_fb_avg(r1[c0], r1[c1]));
++		}
++	}
++}
++
+ static uint64_t sweet_fb_swap_count;
+ 
+ /* Copy each enabled layer's surface into the panel memory (no scaling). */
+@@ -678,6 +776,13 @@
+ 		if (dx < 0 || dy < 0) {
+ 			dx = dy = 0;
+ 		}
++		if (fScaled) {
++			if (src != 0) {
++				presentScaled(s, src, sx, sy, dx, dy, w, h);
++			}
++			s->release();
++			continue;
++		}
+ 		/* Logical (presented) display coordinates -> panel coordinates. */
+ 		dx -= fOffX;
+ 		dy -= fOffY;
