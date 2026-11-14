@@ -24,7 +24,8 @@
   Forget -> tap network -> ASSOCIATE (WPA2-PSK) -> 4-way ok -> JOIN DONE ->
   DHCP ACK, no wifid crash. (That MobileGestalt reads local-mac-address is
   inferred from the fix working; libMobileGestalt not disassembled.)
-- 0186 (xnu79 local build, phone runs it): A8 gets answered: 5 POWERSAVE (0),
+- 0186 (commit 113172a, CI run 43606124701 success; phone runs xnu79 = same
+  code, local build): A8 gets answered: 5 POWERSAVE (0),
   18 INT_MIT (0), 6 PROTMODE {1, auto, 0}, 14 PHY_MODE {1, b|g|n, active from the
   joined network's elements}. Layouts after itlwm's apple80211 structs (sizes
   match: 12 bytes). Observed: wifid asks them after the boot auto-join, all ok,
