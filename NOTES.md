@@ -11,7 +11,8 @@
   scaled xnu75 -> user confirmed keyboard fits and "123" works.
   Touch mapping (SweetHID.cpp) unchanged: panel-normalized = scaled.
 - Settings join FIXED by 0185 (commit 9faabad, CI run 43604405706; user
-  confirmed connected). Phone runs xnu78 = that CI kernel, no extra boot-args:
+  confirmed connected; Safari browses the internet fine, user-confirmed
+  2026-11-14). Phone runs xnu78 = that CI kernel, no extra boot-args:
   boot auto-join + DHCP + on7wifid publish ok, no wifid crash (driverkitd sig 9
   at ~21 s is old, seen 75x in earlier logs). Cause (heap scan):
   `-[__NSDictionaryM __setObject:forKey:]: object cannot be nil (key:
