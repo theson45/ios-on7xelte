@@ -1,0 +1,31 @@
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -1018,6 +1018,7 @@
+  * Both classes only carry properties.
+  */
+ #include <IOKit/IOPlatformExpert.h>
++#include <IOKit/IODeviceTreeSupport.h>
+ #include <libkern/c++/OSData.h>
+ #include <libkern/c++/OSNumber.h>
+ 
+@@ -1177,6 +1178,20 @@
+ 	}
+ 	if ((data = OSData::withBytes(mac, 6)) != NULL) {
+ 		controller->setProperty("IOMACAddress", data);
++		/*
++		 * 0185: MobileGestalt's WifiAddressData is the wlan node's local-mac-address (the ADT has none, the MAC
++		 * is only known now). wifid copies it at start as the hardware MAC and sets it as a network's
++		 * PRIVATE_MAC_ADDRESS_VALUE when it joins one: with nil it threw (NSDictionary nil object) and aborted
++		 * on every join from Settings.
++		 */
++		IORegistryEntry *dt = IORegistryEntry::fromPath("/arm-io/wlan", gIODTPlane);
++		if (dt != NULL) {
++			dt->setProperty("local-mac-address", data);
++			dt->release();
++			IOLog("USB> wifi: A8: /arm-io/wlan local-mac-address set\n");
++		} else {
++			IOLog("USB> wifi: A8: no /arm-io/wlan node for local-mac-address\n");
++		}
+ 		data->release();
+ 	}
+ 	controller->setProperty("IOBuiltin", true);
