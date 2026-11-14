@@ -1,5 +1,22 @@
 # iOS 16 on sweet (Redmi Note 10 Pro, SM7150) - working notes
 
+## >>> J7 PRIME (on7xelte) - active handoff 2026-11-14 <<<
+
+- Full handoff: `candidates/HANDOFF-2026-11-14.md` (outside the repo).
+- 0184 (commit 90572cd, CI run 43599651915): the display is presented as
+  iPhone 8 Plus 1242x2208 (414x736 pt @3x) and CPU-scaled 20/23 to the
+  1080x1920 panel (2x2 box filter); canvas-width/height on the disp0 nub
+  are set to the presented size. Observed: crop-only (xnu71-73) gave a
+  black screen until the canvas fix (xnu74), then cut edges hid "123";
+  scaled xnu75 -> user confirmed keyboard fits and "123" works.
+  Touch mapping (SweetHID.cpp) unchanged: panel-normalized = scaled.
+- Phone runs xnu76 (local build, same code as 0184).
+- Settings join with a password (xnu76): "Forget" works (A8 DISASSOCIATE),
+  but tapping a network makes wifid abort (uncaught ObjC exception in a
+  dispatch block, symbolicate run 43601168580); no ASSOCIATE arrives. The
+  kernel's saved PMK rejoins the forgotten network 120 s later by itself.
+  Next: read the exception text (heap scan of wifid).
+
 ## >>> A10 PORT (Samsung Galaxy A10, SM-A105F) - active work 2026-11-08 <<<
 
 The A10 bring-up lives in `C:\Users\User\iOS-Port`; its consolidated handoff is
