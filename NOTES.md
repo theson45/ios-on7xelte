@@ -10,12 +10,18 @@
   black screen until the canvas fix (xnu74), then cut edges hid "123";
   scaled xnu75 -> user confirmed keyboard fits and "123" works.
   Touch mapping (SweetHID.cpp) unchanged: panel-normalized = scaled.
-- Phone runs xnu76 (local build, same code as 0184).
-- Settings join with a password (xnu76): "Forget" works (A8 DISASSOCIATE),
-  but tapping a network makes wifid abort (uncaught ObjC exception in a
-  dispatch block, symbolicate run 43601168580); no ASSOCIATE arrives. The
-  kernel's saved PMK rejoins the forgotten network 120 s later by itself.
-  Next: read the exception text (heap scan of wifid).
+- Settings join FIXED by 0185 (commit 9faabad; phone runs xnu77 = 0184 +
+  0185, local build, boot-arg sweetscan=wifid still on). Cause (heap scan):
+  `-[__NSDictionaryM __setObject:forKey:]: object cannot be nil (key:
+  PRIVATE_MAC_ADDRESS_VALUE)`. wifid (/usr/sbin/wifid, __WiFiManagerUpdatePrivateMac
+  0x1000930d0) puts manager+0x1e0 there, which its init fills from
+  MGCopyAnswer("WifiAddressData") (0x100062da4) = nil on this port.
+  0185 sets `local-mac-address` (the chip MAC) on the ADT /arm-io/wlan node in
+  On7WLANStart (before wifid execs: 12.35 s vs 12.58 s). Observed on xnu77:
+  Forget -> tap network -> ASSOCIATE (WPA2-PSK) -> 4-way ok -> JOIN DONE ->
+  DHCP ACK, no wifid crash. (That MobileGestalt reads local-mac-address is
+  inferred from the fix working; libMobileGestalt not disassembled.)
+  Still REFUSED after a join: gets 346, 18, 5, 14, 8, 57; sets 422.
 
 ## >>> A10 PORT (Samsung Galaxy A10, SM-A105F) - active work 2026-11-08 <<<
 
