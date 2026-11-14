@@ -1,0 +1,67 @@
+--- a/bsd/dev/on7xelte_wifi.c
++++ b/bsd/dev/on7xelte_wifi.c
+@@ -4239,6 +4239,9 @@
+ 	case 1: return "SSID";
+ 	case 2: return "AUTH_TYPE";
+ 	case 4: return "CHANNEL";
++	case 5: return "POWERSAVE";
++	case 6: return "PROTMODE";
++	case 8: return "RATE";
+ 	case 9: return "BSSID";
+ 	case 10: return "SCAN_REQ";
+ 	case 11: return "SCAN_RESULT";
+@@ -4248,6 +4251,7 @@
+ 	case 15: return "OP_MODE";
+ 	case 16: return "RSSI";
+ 	case 17: return "NOISE";
++	case 18: return "INT_MIT";
+ 	case 19: return "POWER";
+ 	case 20: return "ASSOCIATE";
+ 	case 21: return "ASSOCIATE_RESULT";
+@@ -4257,6 +4261,7 @@
+ 	case 43: return "DRIVER_VERSION";
+ 	case 44: return "HARDWARE_VERSION";
+ 	case 51: return "COUNTRY_CODE";
++	case 57: return "MCS";
+ 	case 103: return "CURRENT_NETWORK";
+ 	case 207: return "CHANNELS_INFO";
+ 	case 254: return "HW_SUPPORTED_CHANNELS";
+@@ -4353,6 +4358,14 @@
+ 	case 15:
+ 		r->req_val = 1;                 /* a station */
+ 		return 0;
++	case 5:                                 /* 0186: POWERSAVE: off */
++	case 18:                                /* 0186: INT_MIT: off */
++		r->req_val = 0;
++		return 0;
++	case 6: {                               /* 0186: PROTMODE {version, mode, threshold}: auto */
++		static const uint32_t p[3] = { 1, 1, 0 };
++		return wf_a8_give(r, p, sizeof(p));
++	}
+ 	case 27:
+ 	case 254: {
+ 		struct apple80211_channels *c = kalloc_data(sizeof(*c), Z_WAITOK | Z_ZERO);
+@@ -4454,6 +4467,23 @@
+ 	case 103:
+ 		err = j ? wf_a8_give_bss(r, c) : ENXIO;
+ 		break;
++	case 14: {
++		/*
++		 * 0186: PHY_MODE {version, supported, active}: 802.11b/g/n (11B 0x4, 11G 0x8, 11N 0x10). Active is
++		 * what the joined network offers: HT capabilities (element 45) -> n, an ERP or extended rates element
++		 * (42, 50) -> g, else b; 0 while not joined.
++		 */
++		uint32_t p[3] = { 1, 0x4 | 0x8 | 0x10, 0 };
++		for (uint32_t at = 0; j && at + 2 <= c->iel && at + 2 + c->ie[at + 1] <= c->iel; at += 2 + c->ie[at + 1]) {
++			uint32_t m = c->ie[at] == 45 ? 0x10 : (c->ie[at] == 42 || c->ie[at] == 50) ? 0x8 : 0;
++			p[2] = m > p[2] ? m : p[2];
++		}
++		if (j && p[2] == 0) {
++			p[2] = 0x4;
++		}
++		err = wf_a8_give(r, p, sizeof(p));
++		break;
++	}
+ 	case 2: {
+ 		struct {
+ 			uint32_t version, lower, upper, extended;

@@ -24,7 +24,12 @@
   Forget -> tap network -> ASSOCIATE (WPA2-PSK) -> 4-way ok -> JOIN DONE ->
   DHCP ACK, no wifid crash. (That MobileGestalt reads local-mac-address is
   inferred from the fix working; libMobileGestalt not disassembled.)
-  Still REFUSED after a join: gets 346, 18, 5, 14, 8, 57; sets 422.
+- 0186 (xnu79 local build, phone runs it): A8 gets answered: 5 POWERSAVE (0),
+  18 INT_MIT (0), 6 PROTMODE {1, auto, 0}, 14 PHY_MODE {1, b|g|n, active from the
+  joined network's elements}. Layouts after itlwm's apple80211 structs (sizes
+  match: 12 bytes). Observed: wifid asks them after the boot auto-join, all ok,
+  no crash. Still REFUSED on purpose (no data / unknown): 8 RATE, 57 MCS, 96, 97,
+  106, 115, 346, 365, 423, sets 25, 422; configd 387.
 
 ## >>> A10 PORT (Samsung Galaxy A10, SM-A105F) - active work 2026-11-08 <<<
 
